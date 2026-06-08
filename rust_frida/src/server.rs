@@ -37,8 +37,23 @@ const SESSION_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptLoadState {
-    Loaded,
+    Loaded { needs_post_resume_java_worker: bool },
     Failed,
+}
+
+impl ScriptLoadState {
+    fn failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn needs_post_resume_java_worker(&self) -> bool {
+        match self {
+            Self::Loaded {
+                needs_post_resume_java_worker,
+            } => *needs_post_resume_java_worker,
+            Self::Failed => false,
+        }
+    }
 }
 
 // ────────────────────────── Server 命令补全 ──────────────────────────
@@ -156,7 +171,9 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
 
     if script.is_empty() {
         log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_path);
-        return ScriptLoadState::Loaded;
+        return ScriptLoadState::Loaded {
+            needs_post_resume_java_worker: false,
+        };
     }
 
     if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
@@ -242,7 +259,9 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
                     log_error!("[#{}] pre-resume Java executor hook 切断失败: {}", session.id, e);
                     return ScriptLoadState::Failed;
                 }
-                return ScriptLoadState::Loaded;
+                return ScriptLoadState::Loaded {
+                    needs_post_resume_java_worker: true,
+                };
             }
             match session
                 .eval_state
@@ -264,7 +283,9 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
         }
         Err(e) => log_error!("[#{}] 主线程加载脚本失败: {}", session.id, e),
     }
-    ScriptLoadState::Loaded
+    ScriptLoadState::Loaded {
+        needs_post_resume_java_worker: uses_java_api,
+    }
 }
 
 /// 发送 shutdown 并等待 agent 断连
@@ -323,19 +344,22 @@ fn do_spawn(
                     }
 
                     // 在子进程暂停期间加载脚本
+                    let mut post_resume_java_worker_needed = false;
                     if let Some(ref script_path) = script {
-                        if load_script_on_session(&session, script_path, true) == ScriptLoadState::Failed {
+                        let load_state = load_script_on_session(&session, script_path, true);
+                        if load_state.failed() {
                             session.failed.store(true, Ordering::Release);
                             spawn::abort_pending_children_and_cleanup_zygote_patches();
                             return;
                         }
+                        post_resume_java_worker_needed |= load_state.needs_post_resume_java_worker();
                     }
 
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
                     }
-                    if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
+                    if let Err(e) = ensure_java_worker_ready_after_resume(&session, post_resume_java_worker_needed) {
                         log_warn!(
                             "[#{}] Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}",
                             sid,
@@ -386,7 +410,7 @@ fn do_attach(
 
                     // 非 spawn 模式：先连接再加载脚本
                     if let Some(ref script_path) = script {
-                        if load_script_on_session(&session, script_path, false) == ScriptLoadState::Failed {
+                        if load_script_on_session(&session, script_path, false).failed() {
                             session.failed.store(true, Ordering::Release);
                             return;
                         }

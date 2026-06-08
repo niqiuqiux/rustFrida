@@ -28,6 +28,7 @@ pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PostResumeJavaWorkerMode {
+    Auto,
     Skip,
     Full,
 }
@@ -40,15 +41,16 @@ impl PostResumeJavaWorkerMode {
         let skip = std::env::var("RF_SKIP_POST_RESUME_JAVA_WORKER")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        Ok(if skip { Self::Skip } else { Self::Full })
+        Ok(if skip { Self::Skip } else { Self::Auto })
     }
 
     fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "full" | "start" | "worker" => Ok(Self::Full),
+            "" | "auto" | "lazy" | "on-demand" => Ok(Self::Auto),
+            "full" | "start" | "worker" => Ok(Self::Full),
             "skip" | "none" | "off" => Ok(Self::Skip),
             _ => Err(format!(
-                "未知 RF_POST_RESUME_JAVA_WORKER_MODE='{}'，可用值: skip|full",
+                "未知 RF_POST_RESUME_JAVA_WORKER_MODE='{}'，可用值: auto|skip|full",
                 raw
             )),
         }
@@ -124,15 +126,27 @@ pub(crate) fn cut_pre_resume_java_executor_hook(session: &Session) -> Result<(),
     }
 }
 
-pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session) -> Result<(), String> {
-    run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?)
+pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session, java_worker_needed: bool) -> Result<(), String> {
+    run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?, java_worker_needed)
 }
 
 pub(crate) fn run_post_resume_java_worker_mode(
     session: &Session,
     mode: PostResumeJavaWorkerMode,
+    java_worker_needed: bool,
 ) -> Result<(), String> {
     match mode {
+        PostResumeJavaWorkerMode::Auto => {
+            if !java_worker_needed {
+                log_info!("spawn 已恢复，未检测到 Java 操作，Java worker 延迟到首次 Java API 时启动");
+                return Ok(());
+            }
+            if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            log_info!("spawn 已恢复，检测到 Java 操作，启动 Java worker");
+            ensure_java_worker_ready(session)
+        }
         PostResumeJavaWorkerMode::Skip => {
             log_warn!("RF_POST_RESUME_JAVA_WORKER_MODE=skip，跳过 spawn 恢复后的 Java worker 启动");
             Ok(())
@@ -255,8 +269,17 @@ pub(crate) fn rewrite_jseval_for_agent(line: &str) -> Option<String> {
 }
 
 pub(crate) enum PreResumeLoad {
-    Loaded,
+    Loaded { uses_java_api: bool },
     DeferredEvalCompleted,
+}
+
+impl PreResumeLoad {
+    pub(crate) fn needs_post_resume_java_worker(&self) -> bool {
+        match self {
+            Self::Loaded { uses_java_api } => *uses_java_api,
+            Self::DeferredEvalCompleted => true,
+        }
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -650,7 +673,7 @@ fn load_script_file_with_mode(
 
     if script.is_empty() {
         log_info!("脚本为空，跳过加载: {}", script_path);
-        return Ok(PreResumeLoad::Loaded);
+        return Ok(PreResumeLoad::Loaded { uses_java_api: false });
     }
 
     preconfigure_java_stealth_if_declared(session, &script)?;
@@ -696,7 +719,7 @@ fn load_script_file_with_mode(
         send_command(sender, format!("java_loadjs [{}]\n{}", filename, script))
             .map_err(|e| format!("发送脚本到 Java worker 失败: {}", e))?;
         print_eval_result(session, LOAD_JAVA_TIMEOUT_SECS);
-        return Ok(PreResumeLoad::Loaded);
+        return Ok(PreResumeLoad::Loaded { uses_java_api });
     }
     send_command(sender, format!("loadjs_init [{}]\n{}", filename, script))
         .map_err(|e| format!("发送脚本到 raw clone TLS JS worker 失败: {}", e))?;
@@ -710,7 +733,7 @@ fn load_script_file_with_mode(
             LOAD_DEFAULT_TIMEOUT_SECS
         },
     );
-    Ok(PreResumeLoad::Loaded)
+    Ok(PreResumeLoad::Loaded { uses_java_api })
 }
 
 /// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。
