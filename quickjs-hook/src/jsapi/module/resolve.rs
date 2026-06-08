@@ -260,9 +260,45 @@ unsafe fn cstr_equals_in_ranges(ranges: &[MemoryRange], ptr: u64, expected: &str
     actual == bytes && std::ptr::read(ptr.wrapping_add(bytes.len() as u64) as *const u8) == 0
 }
 
-/// Load a shared object from disk via unrestricted linker API (no NOLOAD, fresh load).
-/// 走 linker64 的 __loader_dlopen, 绕过 namespace 限制; trusted_caller 用 linker 内部地址
-/// 避开 hide_soinfo 摘链后 caller 解析失败的问题。
+fn dlerror_message() -> Option<String> {
+    let err = unsafe { libc::dlerror() };
+    if err.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned() })
+    }
+}
+
+fn is_app_private_path(path: &str) -> bool {
+    path.starts_with("/data/user/") || path.starts_with("/data/data/")
+}
+
+fn select_app_namespace_caller() -> Option<(u64, String)> {
+    enumerate_modules_from_maps()
+        .into_iter()
+        .filter(|module| {
+            let path = module.path.as_str();
+            path.ends_with(".so")
+                && (path.starts_with("/data/app/")
+                    || path.starts_with("/mnt/expand/")
+                    || path.starts_with("/data/user/")
+                    || path.starts_with("/data/data/"))
+        })
+        .max_by_key(|module| {
+            let path = module.path.as_str();
+            let app_lib = path.starts_with("/data/app/") && path.contains("/lib/");
+            let private_lib = path.starts_with("/data/user/") || path.starts_with("/data/data/");
+            (app_lib as u8, private_lib as u8, module.base)
+        })
+        .map(|module| (module.base, module.path))
+}
+
+/// Load a shared object from disk.
+///
+/// For app-private files prefer the normal linker path first, then retry with a
+/// caller address from an already-loaded app module so Android chooses the app
+/// namespace. The unrestricted linker caller is kept as a final fallback for
+/// non-app paths that still need the historical Module.load behavior.
 pub(crate) unsafe fn module_dlopen_load(
     path: &str,
     flags: i32,
@@ -271,13 +307,75 @@ pub(crate) unsafe fn module_dlopen_load(
         Ok(c) => c,
         Err(_) => return std::ptr::null_mut(),
     };
+
+    let _ = libc::dlerror();
+    crate::jsapi::console::output_message(&format!(
+        "[module] dlopen_load: trying libc dlopen path={} flags=0x{:x}",
+        path, flags
+    ));
+    let handle = libc::dlopen(c_path.as_ptr(), flags);
+    crate::jsapi::console::output_message(&format!(
+        "[module] dlopen_load: libc dlopen returned {:?}",
+        handle
+    ));
+    if !handle.is_null() {
+        return handle;
+    }
+    if let Some(err) = dlerror_message() {
+        crate::jsapi::console::output_message(&format!(
+            "[module] dlopen_load: libc dlopen failed: {}",
+            err
+        ));
+    }
+
     let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
     if let Some(api) = api {
-        return (api.dlopen)(
+        if let Some((caller, caller_path)) = select_app_namespace_caller() {
+            crate::jsapi::console::output_message(&format!(
+                "[module] dlopen_load: retry app caller={:#x} ({})",
+                caller, caller_path
+            ));
+            let handle = (api.dlopen)(
+                c_path.as_ptr() as *const i8,
+                flags,
+                caller as *const std::ffi::c_void,
+            );
+            crate::jsapi::console::output_message(&format!(
+                "[module] dlopen_load: app caller returned {:?}",
+                handle
+            ));
+            if !handle.is_null() {
+                return handle;
+            }
+            if let Some(err) = dlerror_message() {
+                crate::jsapi::console::output_message(&format!(
+                    "[module] dlopen_load: app caller failed: {}",
+                    err
+                ));
+            }
+        }
+
+        if is_app_private_path(path) {
+            crate::jsapi::console::output_message(
+                "[module] dlopen_load: skip linker trusted_caller fallback for app-private path",
+            );
+            return std::ptr::null_mut();
+        }
+
+        crate::jsapi::console::output_message(&format!(
+            "[module] dlopen_load: path={} flags=0x{:x} caller={:?}",
+            path, flags, api.trusted_caller
+        ));
+        let handle = (api.dlopen)(
             c_path.as_ptr() as *const i8,
             flags,
             api.trusted_caller,
         );
+        crate::jsapi::console::output_message(&format!(
+            "[module] dlopen_load: returned {:?}",
+            handle
+        ));
+        return handle;
     }
     std::ptr::null_mut()
 }

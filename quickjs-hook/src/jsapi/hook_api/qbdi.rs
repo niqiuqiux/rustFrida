@@ -3,14 +3,15 @@
 use crate::ffi;
 use crate::jsapi::callback_util::{extract_pointer_address, throw_internal_error};
 use crate::jsapi::console::output_message;
-use crate::jsapi::module::{memfd_dlopen, module_dlsym};
+use crate::jsapi::module::{module_dlopen_load, module_dlsym};
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 use crate::{qbdi_helper_blob, qbdi_output_dir};
 use libc::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::io::Write;
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 type LastErrorFn = unsafe extern "C" fn() -> *const c_char;
@@ -89,6 +90,108 @@ struct HelperApi {
 
 static HELPER_API: OnceLock<HelperApi> = OnceLock::new();
 static QBDI_HELPER_HANDLE: OnceLock<usize> = OnceLock::new();
+
+fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+}
+
+fn current_process_name() -> Result<String, String> {
+    let raw = std::fs::read("/proc/self/cmdline").map_err(|e| format!("read /proc/self/cmdline failed: {}", e))?;
+    let name = raw
+        .split(|b| *b == 0)
+        .next()
+        .and_then(|s| std::str::from_utf8(s).ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "empty /proc/self/cmdline package name".to_string())?;
+    if name.contains('/') || name.contains('\0') {
+        return Err(format!("invalid process name from cmdline: {}", name));
+    }
+    Ok(name.to_string())
+}
+
+fn app_package_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(process_name) = current_process_name() {
+        let package = process_name
+            .split_once(':')
+            .map(|(base, _)| base)
+            .unwrap_or(&process_name);
+        if valid_package_name(package) {
+            candidates.push(package.to_string());
+        }
+    }
+
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for line in maps.lines() {
+            let Some(path) = line.split_whitespace().last() else {
+                continue;
+            };
+            let Some(rest) = path.strip_prefix("/data/app/") else {
+                continue;
+            };
+            let mut parts = rest.split('/');
+            let first = parts.next().unwrap_or("");
+            let package_segment = if first.starts_with("~~") {
+                parts.next().unwrap_or("")
+            } else {
+                first
+            };
+            let package = package_segment
+                .rsplit_once('-')
+                .map(|(pkg, _)| pkg)
+                .unwrap_or(package_segment);
+            if valid_package_name(package) && !candidates.iter().any(|p| p == package) {
+                candidates.push(package.to_string());
+            }
+        }
+    }
+
+    candidates
+}
+
+fn app_rustfrida_dir() -> Result<PathBuf, String> {
+    let candidates = app_package_candidates();
+    if candidates.is_empty() {
+        return Err("failed to infer app package for private files dir".to_string());
+    }
+
+    let mut errors = Vec::new();
+    for package in candidates {
+        let dir = PathBuf::from(format!("/data/user/0/{}/files/.rustfrida", package));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) => errors.push(format!("{}: {}", dir.display(), err)),
+        }
+    }
+
+    Err(format!(
+        "create app-private .rustfrida dir failed for all candidates: {}",
+        errors.join("; ")
+    ))
+}
+
+fn write_qbdi_helper_to_app_files(blob: &[u8]) -> Result<PathBuf, String> {
+    let dir = app_rustfrida_dir()?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+    let path = dir.join("libqbdi_helper.so");
+    let tmp_path = dir.join("libqbdi_helper.so.tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("create qbdi helper {} failed: {}", tmp_path.display(), e))?;
+        file.write_all(blob)
+            .map_err(|e| format!("write qbdi helper {} failed: {}", tmp_path.display(), e))?;
+        file.flush()
+            .map_err(|e| format!("flush qbdi helper {} failed: {}", tmp_path.display(), e))?;
+    }
+    let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    std::fs::rename(&tmp_path, &path).map_err(|e| format!("rename qbdi helper to {} failed: {}", path.display(), e))?;
+    Ok(path)
+}
 
 unsafe fn resolve_symbol(handle: *mut c_void, name: &str) -> *mut c_void {
     let ptr = module_dlsym("qbdi_helper.so", name);
@@ -216,41 +319,34 @@ fn load_qbdi_helper() -> Result<&'static HelperApi, String> {
     }
 
     let helper_blob = qbdi_helper_blob().ok_or_else(|| "qbdi helper blob not configured".to_string())?;
-    let memfd_name = CString::new("wwb_so").unwrap();
-    let fd = unsafe { libc::syscall(libc::SYS_memfd_create as libc::c_long, memfd_name.as_ptr(), 0) as c_int };
-    if fd < 0 {
-        return Err(format!(
-            "memfd_create(qbdi_helper) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    {
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.write_all(&helper_blob)
-            .map_err(|e| format!("write helper blob to memfd failed: {}", e))?;
-        file.flush()
-            .map_err(|e| format!("flush helper blob memfd failed: {}", e))?;
-        let _ = file.into_raw_fd();
-    }
-    let handle = unsafe { memfd_dlopen("qbdi_helper.so", fd) };
+    output_message(&format!("[qbdi] helper load: blob size={} bytes", helper_blob.len()));
+    let helper_path = write_qbdi_helper_to_app_files(&helper_blob)?;
+    let helper_path_string = helper_path.display().to_string();
+    output_message(&format!("[qbdi] helper load: wrote {}", helper_path_string));
+    output_message(&format!("[qbdi] helper load: calling dlopen({})", helper_path_string));
+    let handle = unsafe { module_dlopen_load(&helper_path_string, libc::RTLD_NOW) };
+    output_message(&format!("[qbdi] helper load: dlopen returned {:?}", handle));
     if handle.is_null() {
         let msg = unsafe {
             let err = libc::dlerror();
             if err.is_null() {
-                "android_dlopen_ext(qbdi helper) failed".to_string()
+                "dlopen(qbdi helper app files path) failed".to_string()
             } else {
                 CStr::from_ptr(err).to_string_lossy().into_owned()
             }
         };
-        unsafe { libc::close(fd) };
-        return Err(format!("failed to load qbdi helper from memfd: {}", msg));
+        return Err(format!(
+            "failed to load qbdi helper from {}: {}",
+            helper_path_string, msg
+        ));
     }
-    unsafe { libc::close(fd) };
 
     verify_qbdi_helper_hide_result(handle);
+    output_message("[qbdi] helper load: resolving exported symbols");
     let _ = QBDI_HELPER_HANDLE.set(handle as usize);
     let api = unsafe { build_helper_api(handle)? };
     let _ = HELPER_API.set(api);
+    output_message("[qbdi] helper load: ready");
     Ok(HELPER_API.get().expect("helper api set"))
 }
 

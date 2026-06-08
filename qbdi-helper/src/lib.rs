@@ -1,6 +1,7 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 mod data;
+#[cfg(feature = "pthread-shim")]
 mod pthread_shim;
 mod raw_thread;
 mod state;
