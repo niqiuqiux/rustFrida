@@ -292,6 +292,7 @@ static EXECUTOR_LOOP_HOOK_TARGET: std::sync::atomic::AtomicU64 = std::sync::atom
 static EXECUTOR_HANDLER_HOOK_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXECUTOR_NATIVE_WAKE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXECUTOR_LOOPER_WAKE_FD_OFFSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static EXECUTOR_MESSAGE_QUEUE_LOOPER_OFFSET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static EXECUTOR_MAIN_MESSAGE_QUEUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXECUTOR_LAST_MESSAGE_QUEUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXECUTOR_MAIN_EPOLL_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -424,15 +425,18 @@ fn wake_executor_drain_trigger() -> bool {
 }
 
 fn wake_executor_message_queue() -> bool {
-    let _wake_addr = EXECUTOR_NATIVE_WAKE.load(std::sync::atomic::Ordering::Acquire);
+    let wake_addr = EXECUTOR_NATIVE_WAKE.load(std::sync::atomic::Ordering::Acquire);
     let queue_ptr = selected_executor_message_queue();
     if queue_ptr == 0 {
         return false;
     }
-    if !is_valid_native_message_queue(queue_ptr) {
-        clear_executor_message_queue(queue_ptr);
-        log_invalid_message_queue(queue_ptr, "wake");
-        return false;
+    if wake_addr != 0 && queue_ptr >= 0x10000 && crate::jsapi::util::is_addr_accessible(queue_ptr, 8) {
+        type NativeWakeFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i64);
+        unsafe {
+            let native_wake: NativeWakeFn = std::mem::transmute(wake_addr as usize);
+            native_wake(std::ptr::null_mut(), std::ptr::null_mut(), queue_ptr as i64);
+        }
+        return true;
     }
     if let Some(woke) = safe_write_looper_wake_fd(queue_ptr) {
         if !woke {
@@ -674,36 +678,12 @@ fn log_invalid_message_queue(queue_ptr: u64, where_: &str) {
 }
 
 fn is_valid_native_message_queue(queue_ptr: u64) -> bool {
-    if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 16) {
-        return false;
-    }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
-    if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper, 8) {
-        return false;
-    }
-    let fd_offset = looper_wake_fd_offset();
-    if fd_offset == 0 {
-        return false;
-    }
-    if !crate::jsapi::util::is_addr_accessible(looper + fd_offset as u64, 4) {
-        return false;
-    }
-    let fd = unsafe { std::ptr::read_volatile((looper + fd_offset as u64) as *const i32) };
-    fd >= 0 && unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+    native_message_queue_looper(queue_ptr).is_some()
 }
 
 fn safe_write_looper_wake_fd(queue_ptr: u64) -> Option<bool> {
+    let looper = native_message_queue_looper(queue_ptr)?;
     let fd_offset = looper_wake_fd_offset();
-    if fd_offset == 0 {
-        return None;
-    }
-    if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 8) {
-        return Some(false);
-    }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
-    if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper + fd_offset as u64, 4) {
-        return Some(false);
-    }
     let fd = unsafe { std::ptr::read_volatile((looper + fd_offset as u64) as *const i32) };
     if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) < 0 } {
         return Some(false);
@@ -730,6 +710,58 @@ fn safe_write_looper_wake_fd(queue_ptr: u64) -> Option<bool> {
         }
         return Some(false);
     }
+}
+
+fn native_message_queue_looper(queue_ptr: u64) -> Option<u64> {
+    if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 32) {
+        return None;
+    }
+    let fd_offset = looper_wake_fd_offset();
+    if fd_offset == 0 {
+        return None;
+    }
+
+    let cached = EXECUTOR_MESSAGE_QUEUE_LOOPER_OFFSET.load(std::sync::atomic::Ordering::Acquire);
+    if cached != u32::MAX {
+        let looper = unsafe { std::ptr::read_volatile((queue_ptr + cached as u64) as *const u64) };
+        if is_valid_looper_with_wake_fd(looper, fd_offset) {
+            return Some(looper);
+        }
+    }
+
+    for off in (0..64u32).step_by(8) {
+        if !crate::jsapi::util::is_addr_accessible(queue_ptr + off as u64, 8) {
+            continue;
+        }
+        let looper = unsafe { std::ptr::read_volatile((queue_ptr + off as u64) as *const u64) };
+        if !is_valid_looper_with_wake_fd(looper, fd_offset) {
+            continue;
+        }
+        if EXECUTOR_MESSAGE_QUEUE_LOOPER_OFFSET
+            .compare_exchange(
+                u32::MAX,
+                off,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            crate::jsapi::console::output_verbose(&format!(
+                "[java executor] NativeMessageQueue looper offset = 0x{:x}",
+                off
+            ));
+        }
+        return Some(looper);
+    }
+    None
+}
+
+fn is_valid_looper_with_wake_fd(looper: u64, fd_offset: u32) -> bool {
+    if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper + fd_offset as u64, 4) {
+        return false;
+    }
+    let fd = unsafe { std::ptr::read_volatile((looper + fd_offset as u64) as *const i32) };
+    fd >= 0 && unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
 }
 
 fn looper_wake_fd_offset() -> u32 {
@@ -950,16 +982,8 @@ unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
         return false;
     }
 
-    let (hook_addr, sflag) = match super::art_controller::prepare_hook_target(poll_addr, std::ptr::null_mut()) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::jsapi::console::output_verbose(&format!(
-                "[java executor] MessageQueue.nativePollOnce prepare failed: target={:#x}, {}",
-                poll_addr, e
-            ));
-            return false;
-        }
-    };
+    let hook_addr = resolve_executor_internal_hook_target(poll_addr);
+    let sflag = 0;
 
     let ret = hook_ffi::hook_attach(
         hook_addr as *mut std::ffi::c_void,
@@ -975,10 +999,8 @@ unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
         ));
         return false;
     }
-    if !super::art_controller::try_fixup_trampoline_pub(
-        hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void),
-        poll_addr,
-    ) {
+    let trampoline = hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void);
+    if !super::art_controller::try_fixup_trampoline_pub(trampoline, poll_addr) {
         hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
         return false;
     }
@@ -990,6 +1012,15 @@ unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
         poll_addr, hook_addr, wake_addr
     ));
     true
+}
+
+unsafe fn resolve_executor_internal_hook_target(addr: u64) -> u64 {
+    let resolved = hook_ffi::resolve_art_trampoline(addr as *mut std::ffi::c_void, std::ptr::null_mut());
+    if !resolved.is_null() {
+        resolved as u64
+    } else {
+        addr
+    }
 }
 
 unsafe fn install_handler_dispatch_executor_hook(env: JniEnv) -> bool {
@@ -1247,18 +1278,18 @@ unsafe extern "C" fn on_message_queue_native_poll_once_enter(
     let env = ctx.x[0] as JniEnv;
     let queue_ptr = ctx.x[2];
     if queue_ptr != 0 {
+        let tid = libc::syscall(libc::SYS_gettid) as i32;
+        let pid = unsafe { libc::syscall(libc::SYS_getpid) as i32 };
+        if tid == pid && EXECUTOR_MAIN_MESSAGE_QUEUE.swap(queue_ptr, std::sync::atomic::Ordering::AcqRel) == 0 {
+            crate::jsapi::console::output_verbose(&format!(
+                "[java executor] main MessageQueue observed: {:#x}",
+                queue_ptr
+            ));
+        }
+        EXECUTOR_LAST_MESSAGE_QUEUE.store(queue_ptr, std::sync::atomic::Ordering::Release);
+
         if !is_valid_native_message_queue(queue_ptr) {
             log_invalid_message_queue(queue_ptr, "poll");
-        } else {
-            let tid = libc::syscall(libc::SYS_gettid) as i32;
-            let pid = unsafe { libc::syscall(libc::SYS_getpid) as i32 };
-            if tid == pid && EXECUTOR_MAIN_MESSAGE_QUEUE.swap(queue_ptr, std::sync::atomic::Ordering::AcqRel) == 0 {
-                crate::jsapi::console::output_verbose(&format!(
-                    "[java executor] main MessageQueue observed: {:#x}",
-                    queue_ptr
-                ));
-            }
-            EXECUTOR_LAST_MESSAGE_QUEUE.store(queue_ptr, std::sync::atomic::Ordering::Release);
         }
     }
     if env.is_null() || !executor_queue_has_pending() {

@@ -246,13 +246,11 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let is_native_method = (original_access_flags & K_ACC_NATIVE) != 0;
     let is_shared_jni_entry = original_entry_point == bridge.quick_generic_jni_trampoline
         || (bridge.resolved_jni_entrypoint != 0 && original_entry_point == bridge.resolved_jni_entrypoint);
-    let has_registered_native_entry = is_native_method
-        && original_data != 0
-        && is_registered_native_entry_candidate(original_data, bridge);
+    let has_registered_native_entry =
+        is_native_method && original_data != 0 && is_registered_native_entry_candidate(original_data, bridge);
     let shared_native_art_entry = is_native_method && !has_independent_code && !has_registered_native_entry;
     let native_entry_is_quick_entry = has_registered_native_entry && original_entry_point == original_data;
-    let route_has_independent_code =
-        (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
+    let route_has_independent_code = (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
     let shared_jni_native_router = is_native_method && shared_native_art_entry && !has_registered_native_entry;
     let mutate_original_method_flags = !shared_jni_native_router;
 
