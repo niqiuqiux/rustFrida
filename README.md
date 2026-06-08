@@ -8,6 +8,8 @@ ARM64 Android 动态插桩框架。
 - Rust toolchain + `aarch64-linux-android` target
 - Python 3（构建 loader shellcode）
 - `.cargo/config.toml` 已配置交叉编译（仓库自带）
+- 可选 QBDI Trace：`qbdi/libQBDI.a` 必须是真实 archive；若 clone 后只是 Git LFS pointer，需要先安装 `git-lfs` 并拉取，或手动替换为真实 `libQBDI.a`
+- 可选 `Hook.WXSHADOW` / `writeBytes(..., 1)`：设备侧需先通过 `/home/qiu/Android/kernel_hook/loader` 加载 `hook_module.ko` 和 `wxshadow_module.ko`
 
 首次 clone 后先拉取子仓库：
 
@@ -30,13 +32,13 @@ agent (libagent.so) ┘
 ### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
 
 ```bash
-python3 build_helpers.py
+python3 loader/build_helpers.py
 # 输出:
 #   loader/build/bootstrapper.bin
 #   loader/build/rustfrida-loader.bin
 ```
 
-loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。**修改 loader C 代码后需重新运行此步。**
+loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。`rust_frida/build.rs` 会在输入比输出新时自动重建；手动修改 loader C 代码后也可以直接运行此步确认输出。
 
 ### 2. 构建 agent（libagent.so）
 
@@ -68,11 +70,42 @@ cargo build -p agent --release --features qbdi  # agent 启用 qbdi feature
 cargo build -p rust_frida --release --features qbdi  # rustfrida 嵌入 qbdi-helper SO
 ```
 
+构建 `qbdi-helper` 时会校验 `qbdi/libQBDI.a`：如果文件仍是 LFS pointer 或不是 `ar` archive，会直接报错。NDK 路径按 `NDK_PATH`、`ANDROID_NDK_HOME`、`ANDROID_NDK_ROOT`、`ANDROID_HOME/ndk`、`ANDROID_SDK_ROOT/ndk` 的顺序推断。
+
+运行时 `rustfrida` 会把内嵌的 `libqbdi_helper.so` 发送给 agent；agent 会写入目标 App 私有目录：
+
+```text
+/data/user/0/<package>/files/.rustfrida/libqbdi_helper.so
+```
+
+这里故意不使用 `/data/local/tmp`，因为普通 App 进程在 SELinux Enforcing 下通常无法访问该目录里的 SO。
+
+QBDI trace 明文 dump 工具：
+
+```bash
+cargo build -p qbdi-trace-dump
+cargo run -p qbdi-trace-dump -- --limit 200 /path/to/trace_bundle.pb
+cargo run -p qbdi-trace-dump -- --summary-only /path/to/trace_bundle.pb
+```
+
 **eBPF SO 加载监控（`--watch-so`）：** ldmonitor 是 rustfrida 的编译依赖，默认构建已包含，`--watch-so` 无需额外步骤。如需独立使用 ldmonitor 命令行工具：
 
 ```bash
 cargo build -p ldmonitor --release    # → ldmonitor 独立二进制
 ```
+
+**WXSHADOW 内核后端：** stealth1 现在依赖 `/home/qiu/Android/kernel_hook` 下的普通 LKM，而不是旧 KPM。必须先加载 `hook_module.ko`，再加载 `wxshadow_module.ko`：
+
+```bash
+cd /home/qiu/Android/kernel_hook
+./build_module.sh
+
+cd /home/qiu/Android/kernel_hook/wxshadow
+./build_module.sh
+./load_with_loader.sh
+```
+
+`load_with_loader.sh` 会构建并使用 `/home/qiu/Android/kernel_hook/loader` 的 Rust loader。不要把 `insmod` 当成默认路径；loader 会在设备端解析 ELF、补未定义符号并调用 `init_module`。
 
 ### TinyCC 子仓库维护
 
@@ -723,10 +756,19 @@ Interceptor.flush();           // no-op，兼容脚本
 
 ```js
 hook(target, callback, Hook.NORMAL)     // 0: mprotect 直写（默认）
-hook(target, callback, Hook.WXSHADOW)   // 1: 内核 shadow 页，/proc/mem 不可见
+hook(target, callback, Hook.WXSHADOW)   // 1: wxshadow_module prctl 写入，需先加载内核模块
 hook(target, callback, Hook.RECOMP)     // 2: 代码页重编译，仅 4B patch
 hook(target, callback, 1)               // 数字也行
 hook(target, callback, true)            // true = WXSHADOW
+```
+
+`Hook.WXSHADOW` 通过 `prctl(PR_WXSHADOW_PATCH, pid, addr, buf, len)` 调用 `wxshadow_module.ko`。本地 hook engine 会保存原字节，`unhook()` / `listener.detach()` / cleanup 时再通过同一 prctl 路径恢复。失败不会降级到 `mprotect`，否则会破坏 stealth1 的检测边界。
+
+使用前确认内核模块已按顺序加载：
+
+```bash
+cd /home/qiu/Android/kernel_hook/wxshadow
+./load_with_loader.sh
 ```
 
 ### API 速查
@@ -1163,12 +1205,12 @@ var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
 
 ```js
 Java.setStealth(0);  // Normal: mprotect 直写
-Java.setStealth(1);  // WxShadow: shadow 页，CRC 校验不可见
+Java.setStealth(1);  // WxShadow: wxshadow_module prctl 后端
 Java.setStealth(2);  // Recomp: 代码页重编译
 Java.getStealth();   // 查询当前模式 (0/1/2)
 ```
 
-须在 `Java.use().impl` 之前设置。
+须在 `Java.use().impl` 之前设置。`Java.setStealth(1)` 同样要求设备端已加载 `hook_module.ko + wxshadow_module.ko`。
 
 ### Deopt API
 
@@ -1437,10 +1479,10 @@ Memory.flushCodeCache(code, 16);
 | --- | --- | --- | --- |
 | `Memory.protect(addr, size, "rwx")` | 任意 | — | 改页权限（页级 mprotect） |
 | `p.writeBytes(bytes, 0)` 默认 | 可写段 | 可见 | 覆盖 N 字节（数据/结构体） |
-| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，单页内） |
+| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow_module prctl 覆盖 N 字节（短 patch，最多跨 2 页） |
 | `p.writest(bytes)` | r-x | 不可见 | 1 条指令 → N 条指令替换（PC-rel 自动 relocate） |
 
-`unhook(addr)` 统一清理 hook / writest / writeBytes(1) 留下的 patch。
+`writeBytes(bytes, 1)` 会记录 patch 起始地址，`unhook(addr)` 统一清理 hook / writest / writeBytes(1) 留下的 patch。跨 4KB 边界时按“先第二页、再第一页”的顺序拆写，首段失败会回滚第二段；超过 2 页直接拒绝。
 
 ```js
 var addr = Module.findExportByName("libc.so", "getpid");
@@ -1493,7 +1535,7 @@ Module.enumerateImports("libart.so").filter(i => i.type === "function");
 
 ### Module.load — 运行时加载 SO
 
-默认走 unrestricted linker (`__loader_dlopen`)，绕开 namespace 限制 + `hide_soinfo` 的 caller 解析问题。加载成功后从 `/proc/self/maps` 解析 `{name, base, size, path}` 返回；失败抛带 `dlerror` 原始消息的 `InternalError`。
+默认先走 libc `dlopen()`。如果失败，再用 unrestricted linker (`__loader_dlopen`) 选择一个已加载 App SO 作为 caller，尽量进入 App namespace；非 App 私有路径才会继续回退到 linker trusted caller。加载成功后从 `/proc/self/maps` 解析 `{name, base, size, path}` 返回；失败抛带 `dlerror` 原始消息的 `InternalError`。
 
 第三个参数或第二个布尔参数为 `true` 时，先把 SO 读入 `memfd_create("wwb_<basename>")`，再用 `android_dlopen_ext` 的 `library_fd` 加载。这样 `/proc/<pid>/maps` 中会出现 `wwb_` 标记；默认或显式 `false` 保持普通路径加载。
 
@@ -1515,6 +1557,9 @@ Module.load("/data/local/tmp/mylib.so", false);
 Module.load("/data/local/tmp/mylib.so", true);
 Module.load("/data/local/tmp/mylib.so", 2, true);
 
+// App 私有目录路径推荐普通加载；这类路径不会回退到 linker trusted caller
+Module.load("/data/user/0/com.example.app/files/libcustom.so");
+
 // 错误处理
 try {
     Module.load("/does/not/exist.so");
@@ -1530,6 +1575,8 @@ var addr = Module.findExportByName(m.name, "my_func");
 
 **注意**：
 - tagged/memfd 加载会改变模块在 maps 和 `dladdr()` 等路径视角下的名字，适合需要 `wwb_` 标记的场景；依赖真实文件路径自检的 SO 建议用默认加载。
+- tagged 加载返回模块信息时优先匹配 `/memfd:wwb_*`，避免误返回原始磁盘路径模块。
+- `Module.findExportByName(null, symbol)` 会解析已加载模块的 ELF 动态符号；全局扫描只考虑真实 SO、App 路径 SO 和 `wwb_` memfd SO，避免误扫 `/memfd:jit-cache` 之类非 ELF 区域导致卡顿或断连。
 - 若模块被 `hide_soinfo` 隐藏或 maps 聚合失败，返回 `{name, path, base: <dlopen handle>, size: 0}` 作 fallback。
 - `Module.load` 不会重复加载同一个 SO — linker 对已加载模块返回现有 handle。
 
@@ -1627,6 +1674,7 @@ out.close();
 | `qbdi.run(vm, start, stop)` | `number, AddressLike, AddressLike` | `boolean` |
 | `qbdi.getGPR(vm, reg)` | `number, number` | `NativePointer` |
 | `qbdi.setGPR(vm, reg, value)` | `number, number, AddressLike` | `boolean` |
+| `qbdi.setTraceBundleMetadata(path, base)` | `string, AddressLike` | `boolean` |
 | `qbdi.registerTraceCallbacks(vm, target, outDir?)` | `number, AddressLike, string?` | `boolean` |
 | `qbdi.unregisterTraceCallbacks(vm)` | `number` | `boolean` |
 | `qbdi.lastError()` | — | `string` |
@@ -1645,7 +1693,35 @@ qbdi.unregisterTraceCallbacks(vm);
 qbdi.destroyVM(vm);
 ```
 
-Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi-replay + IDA 插件回放。
+`registerTraceCallbacks(vm, target, outDir?)` 会同步直写 `TRB1 + length-delimited TraceBundleEvent` 到：
+
+```text
+<outDir>/trace_bundle.pb
+```
+
+如果未传 `outDir`，默认使用注入字符串表里的 `output_path`。`--watch-so` 模式会按目标 uid 自动填 App data dir；普通 `--pid` / `--spawn` 场景需要稳定路径时建议直接传第三参数，或显式设置 `--string output_path=<dir>`。`-o` 只控制 host 侧日志文件，不等价于 QBDI 输出目录。
+
+```js
+qbdi.registerTraceCallbacks(vm, target, "/data/user/0/com.example.app/files");
+```
+
+QBDI helper 运行时会被写入 App 私有目录再加载：
+
+```text
+/data/user/0/<package>/files/.rustfrida/libqbdi_helper.so
+```
+
+这规避了 SELinux Enforcing 下普通 App 不能访问 `/data/local/tmp` SO 的问题。
+
+Host 侧可用 `qbdi-trace-dump` 直接输出明文：
+
+```bash
+adb pull /data/user/0/com.example.app/files/trace_bundle.pb .
+cargo run -p qbdi-trace-dump -- --limit 200 trace_bundle.pb
+cargo run -p qbdi-trace-dump -- --summary-only trace_bundle.pb
+```
+
+`qbdi.unregisterTraceCallbacks(vm)` 会 flush 并发布最终 `trace_bundle.pb`；`qbdi.call()` / `qbdi.switchStackAndCall()` 返回前也会 flush 当前线程 chunk。
 
 ---
 
