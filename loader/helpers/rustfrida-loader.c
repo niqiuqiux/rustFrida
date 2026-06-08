@@ -87,6 +87,9 @@
 #ifndef R_AARCH64_RELATIVE
 # define R_AARCH64_RELATIVE 1027
 #endif
+#ifndef R_AARCH64_TLSDESC
+# define R_AARCH64_TLSDESC 1031
+#endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
 #endif
@@ -198,6 +201,13 @@ typedef struct {
   ElfW(Addr) base;
   ElfW(Addr) load_start;
   ElfW(Addr) load_end;
+  ElfW(Addr) tls_vaddr;
+  ElfW(Addr) tls_block;
+  ElfW(Addr) tls_map_start;
+  size_t tls_mem_size;
+  size_t tls_file_size;
+  size_t tls_align;
+  size_t tls_map_size;
   ElfW(Dyn) * dynamic;
   const ElfW(Phdr) * phdrs;
   ElfW(Half) phdr_count;
@@ -239,6 +249,7 @@ static bool rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, con
     ElfW(Addr) libc_base, ElfW(Addr) linker_base);
 static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * message);
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
+static bool rustfrida_init_tls (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
 static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
 static bool rustfrida_address_is_executable (ElfW(Addr) address);
@@ -264,6 +275,7 @@ static int frida_memcmp (const void * a, const void * b, size_t n);
 static void * frida_memchr (const void * s, int c, size_t n);
 static char * frida_strchr (const char * s, int c);
 static bool rustfrida_resolve_builtin_symbol (const char * name, ElfW(Addr) * value);
+static ElfW(Addr) rustfrida_tlsdesc_resolver (ElfW(Addr) * desc);
 
 static pid_t frida_gettid (void);
 
@@ -989,6 +1001,52 @@ rustfrida_resolve_symbol (RustFridaLinkedModule * module, size_t sym_index, cons
 }
 
 static bool
+rustfrida_init_tls (RustFridaLinkedModule * module, const FridaLibcApi * libc)
+{
+  ElfW(Addr) allocation;
+  ElfW(Addr) aligned;
+  size_t align;
+
+  if (module->tls_mem_size == 0)
+    return true;
+
+  align = module->tls_align;
+  if (align < sizeof (ElfW(Addr)))
+    align = sizeof (ElfW(Addr));
+
+  module->tls_map_size = rustfrida_align_up (module->tls_mem_size + align, 4096);
+  allocation = (ElfW(Addr)) frida_raw_mmap (NULL, module->tls_map_size,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((void *) allocation == MAP_FAILED)
+  {
+    rustfrida_set_error (module, libc, "mmap agent TLS failed");
+    return false;
+  }
+
+  aligned = rustfrida_align_up (allocation, align);
+  module->tls_map_start = allocation;
+  module->tls_block = aligned;
+
+  if (module->tls_file_size != 0)
+    frida_memcpy ((void *) aligned, (const void *) (module->base + module->tls_vaddr), module->tls_file_size);
+  if (module->tls_mem_size > module->tls_file_size)
+    frida_memset ((void *) (aligned + module->tls_file_size), 0, module->tls_mem_size - module->tls_file_size);
+
+  return true;
+}
+
+static ElfW(Addr)
+rustfrida_tlsdesc_resolver (ElfW(Addr) * desc)
+{
+  ElfW(Addr) tls_address = desc[1];
+  ElfW(Addr) thread_pointer;
+
+  asm volatile ("mrs %0, tpidr_el0" : "=r" (thread_pointer));
+
+  return tls_address - thread_pointer;
+}
+
+static bool
 rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, size_t relasz, const FridaLibcApi * libc)
 {
   size_t count = relasz / sizeof (ElfW(Rela));
@@ -1014,6 +1072,44 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
           return false;
         *target = symbol_value + r->r_addend;
         break;
+      case R_AARCH64_TLSDESC:
+      {
+        ElfW(Addr) tls_address;
+
+        if (module->tls_block == 0)
+        {
+          rustfrida_set_error (module, libc, "TLSDESC without TLS block");
+          return false;
+        }
+
+        if (sym_index != 0)
+        {
+          const ElfW(Sym) * sym;
+
+          if (sym_index >= module->nsyms)
+          {
+            rustfrida_set_error (module, libc, "TLS symbol index out of range");
+            return false;
+          }
+
+          sym = &module->symtab[sym_index];
+          if (sym->st_shndx == SHN_UNDEF || ELF64_ST_TYPE (sym->st_info) != STT_TLS)
+          {
+            rustfrida_set_error (module, libc, "unsupported external TLS relocation");
+            return false;
+          }
+
+          tls_address = module->tls_block + sym->st_value + r->r_addend;
+        }
+        else
+        {
+          tls_address = module->tls_block + r->r_addend;
+        }
+
+        target[0] = (ElfW(Addr)) rustfrida_tlsdesc_resolver;
+        target[1] = tls_address;
+        break;
+      }
       default:
         if (libc->sprintf != NULL)
           libc->sprintf (module->error, "unsupported relocation type: %zu", type);
@@ -1289,6 +1385,13 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
 
     if (phdr->p_type == PT_DYNAMIC)
       module->dynamic = (ElfW(Dyn) *) (load_bias + phdr->p_vaddr);
+    else if (phdr->p_type == PT_TLS)
+    {
+      module->tls_vaddr = phdr->p_vaddr;
+      module->tls_file_size = phdr->p_filesz;
+      module->tls_mem_size = phdr->p_memsz;
+      module->tls_align = phdr->p_align;
+    }
 
     if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0)
       continue;
@@ -1362,6 +1465,10 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   if (!rustfrida_build_symbol_resolver (module, libc, libc_base, linker_base))
     goto fail;
   frida_send_log (diagfd, "link: resolver built", libc);
+
+  if (!rustfrida_init_tls (module, libc))
+    goto fail;
+  frida_send_log (diagfd, "link: tls initialized", libc);
 
   for (dyn = module->dynamic; dyn != NULL && dyn->d_tag != DT_NULL; dyn++)
   {
@@ -1455,6 +1562,18 @@ rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * lib
 static void
 rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc)
 {
+  if (module->tls_map_start != 0 && module->tls_map_size != 0)
+  {
+    frida_raw_munmap ((void *) module->tls_map_start, module->tls_map_size);
+    module->tls_vaddr = 0;
+    module->tls_block = 0;
+    module->tls_map_start = 0;
+    module->tls_mem_size = 0;
+    module->tls_file_size = 0;
+    module->tls_align = 0;
+    module->tls_map_size = 0;
+  }
+
   if (module->load_start != 0 && module->load_end > module->load_start)
   {
     frida_raw_munmap ((void *) module->load_start, module->load_end - module->load_start);
