@@ -517,12 +517,14 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(handle: u64, target: u64, out
 #[no_mangle]
 pub extern "C" fn qbdi_vm_unregister_trace_callbacks(handle: u64) -> i32 {
     clear_last_error();
-    match crate::state::with_vm(handle, |managed| {
+    let result = crate::state::with_vm(handle, |managed| {
         for id in managed.trace_callback_ids.drain(..) {
             let _ = managed.vm.delete_instrumentation(id);
         }
         Ok(())
-    }) {
+    });
+    finalize_trace_session_async();
+    match result {
         Ok(()) => 0,
         Err(err) => {
             set_last_error(err);

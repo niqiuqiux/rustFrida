@@ -3,7 +3,6 @@
 mod data;
 #[cfg(feature = "pthread-shim")]
 mod pthread_shim;
-mod raw_thread;
 mod state;
 mod trace_api;
 mod vm_api;

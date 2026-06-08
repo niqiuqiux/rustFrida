@@ -287,12 +287,14 @@ pub extern "C" fn qbdi_vm_call(
             .ok_or_else(|| format!("qbdi call({:#x}) failed", function))
     }) {
         Ok(value) => {
+            flush_thread_local_chunk();
             unsafe {
                 *result_out = value;
             }
             0
         }
         Err(err) => {
+            flush_thread_local_chunk();
             set_last_error(err);
             -1
         }
@@ -327,12 +329,14 @@ pub extern "C" fn qbdi_vm_switch_stack_and_call(
             .ok_or_else(|| format!("qbdi switchStackAndCall({:#x}) failed", function))
     }) {
         Ok(value) => {
+            flush_thread_local_chunk();
             unsafe {
                 *result_out = value;
             }
             0
         }
         Err(err) => {
+            flush_thread_local_chunk();
             set_last_error(err);
             -1
         }

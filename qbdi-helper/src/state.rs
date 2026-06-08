@@ -1,19 +1,15 @@
 use crate::data::TraceBundleMetadata;
-use crate::raw_thread::RawThreadHandle;
-use crossbeam_channel::Sender;
 use lazy_static::lazy_static;
 use qbdi::{VirtualStack, VM};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 pub(crate) const TRACE_BUNDLE_MAGIC: &[u8; 4] = b"TRB1";
 pub(crate) const DYNAMIC_EXEC_CHUNK_SIZE: usize = 1024 * 1024;
-pub(crate) const TRACE_MAX_PENDING_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) const TRACE_PROGRESS_EVERY: u64 = 1_000;
 pub(crate) const TRACE_CHUNK_SIZE: usize = 1024 * 1024;
-pub(crate) const TRACE_SHARDS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecMap {
@@ -25,20 +21,9 @@ pub(crate) struct ExecMap {
 
 pub(crate) struct TraceWriter {
     pub(crate) session_id: u64,
-    pub(crate) shard_senders: Vec<Sender<TraceChunk>>,
-    pub(crate) dynamic_senders: Vec<Sender<TraceChunk>>,
-    pub(crate) joins: Vec<RawThreadHandle>,
+    pub(crate) writer: std::io::BufWriter<std::fs::File>,
+    pub(crate) tmp_path: String,
     pub(crate) base: String,
-}
-
-pub(crate) struct TraceChunk {
-    pub(crate) seq: u64,
-    pub(crate) payload: Vec<u8>,
-}
-
-pub(crate) struct TraceQueueBudget {
-    pub(crate) pending_bytes: Mutex<usize>,
-    pub(crate) condvar: Condvar,
 }
 
 pub(crate) struct ManagedVm {
@@ -49,27 +34,10 @@ pub(crate) struct ManagedVm {
 
 unsafe impl Send for ManagedVm {}
 
-impl TraceQueueBudget {
-    pub(crate) fn reserve(&self, bytes: usize) {
-        let mut pending = self.pending_bytes.lock().unwrap_or_else(|e| e.into_inner());
-        while *pending != 0 && pending.saturating_add(bytes) > TRACE_MAX_PENDING_BYTES {
-            pending = self.condvar.wait(pending).unwrap_or_else(|e| e.into_inner());
-        }
-        *pending = pending.saturating_add(bytes);
-    }
-
-    pub(crate) fn release(&self, bytes: usize) {
-        let mut pending = self.pending_bytes.lock().unwrap_or_else(|e| e.into_inner());
-        *pending = pending.saturating_sub(bytes);
-        self.condvar.notify_all();
-    }
-}
-
 pub(crate) static TRACE_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 pub(crate) static LAST_ERROR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 pub(crate) static TRACE_BUNDLE_METADATA: Mutex<Option<TraceBundleMetadata>> = Mutex::new(None);
 pub(crate) static TRACE_WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
-pub(crate) static TRACE_FINALIZERS: Mutex<Vec<RawThreadHandle>> = Mutex::new(Vec::new());
 pub(crate) static TRACE_NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRACE_SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRACE_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -93,10 +61,6 @@ pub(crate) static TRACE_EXECUTED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NEXT_VM_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 lazy_static! {
-    pub(crate) static ref TRACE_QUEUE_BUDGET: TraceQueueBudget = TraceQueueBudget {
-        pending_bytes: Mutex::new(0),
-        condvar: Condvar::new(),
-    };
     pub(crate) static ref VM_REGISTRY: Mutex<HashMap<u64, ManagedVm>> = Mutex::new(HashMap::new());
     pub(crate) static ref ADDED_DYNAMIC_RANGES: Mutex<std::collections::HashSet<(u64, u64)>> =
         Mutex::new(std::collections::HashSet::new());
