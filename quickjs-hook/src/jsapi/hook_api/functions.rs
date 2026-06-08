@@ -220,7 +220,7 @@ pub(crate) unsafe extern "C" fn js_unhook(
 
     // registry 中不存在, 可能是:
     //  1) writest 留下的 slot (无 HookData) — try_revert_slot_patch 恢复 recomp 页字节
-    //  2) writeBytes(bytes, 1) 留下的 wxshadow patch — wxshadow_release 清 shadow 页
+    //  2) writeBytes(bytes, 1) 留下的 stealth1 patch — wxshadow_release 通过 kernel_hook 恢复
     //  3) 普通 stealth=0 hook 未登记但 hook engine 已 attach — hook_remove 恢复
     // 三路都静默尝试; 全不命中才报错.
     let slot_cleared = crate::recomp::try_revert_slot_patch(addr as usize);

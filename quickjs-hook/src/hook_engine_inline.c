@@ -504,11 +504,8 @@ int hook_remove(void* target) {
     while (entry) {
         if (entry->target == target) {
             if (entry->stealth == 1) {
-                /* Stealth 1 (wxshadow): release the kernel shadow mapping.
-                 * wxshadow patches CANNOT be removed via mprotect+memcpy —
-                 * the shadow mapping is a kernel-level instruction-view overlay;
-                 * data-view writes do not affect it.
-                 * 跨页 patch 有两个 shadow entry (first+second segment), 需分别 release. */
+                /* Stealth 1: restore bytes through wxshadow_module prctl.
+                 * 跨页 patch 有两个 tracked segment (first+second), 需分别 release. */
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
                     hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);

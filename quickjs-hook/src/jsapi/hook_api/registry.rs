@@ -25,7 +25,9 @@ pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
         HOOK_ERROR_MPROTECT_FAILED => b"mprotect failed: cannot change memory protection\0",
         HOOK_ERROR_NOT_FOUND => b"hook not found at address\0",
         HOOK_ERROR_BUFFER_TOO_SMALL => b"buffer too small for jump instruction\0",
-        HOOK_ERROR_WXSHADOW_FAILED => b"wxshadow prctl failed: kernel may not support shadow pages\0",
+        HOOK_ERROR_WXSHADOW_FAILED => {
+            b"wxshadow prctl write failed: load hook_module.ko + wxshadow_module.ko with kernel_hook/loader\0"
+        }
         _ => b"unknown hook error\0",
     }
 }
@@ -35,7 +37,7 @@ pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
 pub enum StealthMode {
     /// 普通 inline hook（直接 patch 原始代码）
     Normal = 0,
-    /// wxshadow stealth（内核 shadow page patch）
+    /// stealth1（hook_module-backed wxshadow_module prctl 后端）
     WxShadow = 1,
     /// recomp stealth（页级重编译，在重编译页上 hook）
     Recomp = 2,

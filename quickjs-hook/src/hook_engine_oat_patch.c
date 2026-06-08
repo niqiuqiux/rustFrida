@@ -668,8 +668,8 @@ static int apply_oat_inline_patch(
     Arm64Reg scratch_reg = (Arm64Reg)(ARM64_REG_X0 + scratch);
 
     /* 确定 exec_pc：stealth2 (recomp) 代码在 recomp 页执行，ADRP 偏移必须基于 recomp 地址。
-     * stealth0/1 代码在 patch_addr 执行（wxshadow 保持虚拟地址不变）。
-     * aligned(32) 防止 buf 跨页 (wxshadow copy_from_user_via_pte 限制)。 */
+     * stealth0/1 代码在 patch_addr 执行。
+     * aligned(32) 保持 stealth1 跳转 buffer 的历史布局。 */
     size_t page_size = g_engine.exec_mem_page_size;
     uintptr_t page_start = patch_addr & ~(page_size - 1);
 
@@ -723,9 +723,9 @@ static int apply_oat_inline_patch(
         hook_log("[oat_patch] applied via recomp at %#lx → %#lx",
                  (unsigned long)patch_addr, (unsigned long)recomp_addr);
     } else if (g_stealth_mode == 1) {
-        /* WxShadow 模式 — stealth1 严格: wxshadow 失败拒绝降级 mprotect */
+        /* Stealth1 模式 — 严格依赖 wxshadow_module prctl, 失败拒绝降级 mprotect */
         if (wxshadow_patch((void*)patch_addr, redirect, overwrite) != 0) {
-            hook_log("\033[31m[STEALTH] oat_patch wxshadow 失败 %#lx，拒绝降级 mprotect\033[0m",
+            hook_log("\033[31m[STEALTH] oat_patch kernel_hook write 失败 %#lx，拒绝降级 mprotect\033[0m",
                      (unsigned long)patch_addr);
             return -1;
         }
@@ -902,9 +902,8 @@ int hook_restore_inlined_oat_header_patches(void) {
              * cleanup can fault, so just discard the patch record. */
         } else if (entry->stealth_mode == 1) {
             if (wxshadow_release((void*)entry->original_addr) != 0) {
-                /* stealth1: wxshadow release 失败不降级 mprotect。
-                 * shadow 页随进程退出由内核自动释放，不影响稳定性。 */
-                hook_log("[oat_patch] wxshadow_release failed for %#lx, shadow will be released on exit",
+                /* stealth1: kernel_hook restore 失败不降级 mprotect。 */
+                hook_log("[oat_patch] kernel_hook restore failed for %#lx",
                          (unsigned long)entry->original_addr);
             } else {
                 hook_flush_cache((void*)entry->original_addr, entry->patch_size);

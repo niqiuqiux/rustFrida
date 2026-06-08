@@ -8,7 +8,7 @@ use crate::value::JSValue;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-/// 追踪 writeBytes(bytes, 1) 装过的 wxshadow patch 地址, 供 cleanup 批量
+/// 追踪 writeBytes(bytes, 1) 装过的 stealth1 patch 地址, 供 cleanup 批量
 /// wxshadow_release. 这些 patch 不走 hook_engine, 不在 g_engine.hooks 链表上,
 /// hook_engine_cleanup 看不到它们.
 static WXSHADOW_PATCH_ADDRS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
@@ -25,9 +25,9 @@ pub(crate) fn untrack_wxshadow_addr(addr: u64) {
     }
 }
 
-/// 清理所有 writeBytes(bytes, 1) 装过的 wxshadow patch. cleanup 时在
-/// hook_engine_cleanup 之后调用, 释放内核 shadow 页, 防止 --pid 场景下
-/// agent dlclose 后 patch 残留.
+/// 清理所有 writeBytes(bytes, 1) 装过的 stealth1 patch. cleanup 时在
+/// hook_engine_cleanup 之后调用, 通过 kernel_hook 恢复原字节, 防止 --pid
+/// 场景下 agent dlclose 后 patch 残留.
 pub fn cleanup_wxshadow_patches() {
     let addrs = {
         let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
@@ -112,7 +112,7 @@ pub(super) unsafe extern "C" fn memory_write_pointer(
 ///
 /// Multi-byte write with an optional stealth flag:
 ///   - `stealth=0` or omitted: classic mprotect RWX → memcpy → restore
-///   - `stealth=1`: kernel wxshadow PATCH (shadow page visible only to I-fetch)
+///   - `stealth=1`: wxshadow_module prctl write with local restore tracking
 ///
 /// For the "1 instruction → N instruction" replacement semantics (PC-rel
 /// aware, atomic B→slot in recomp page), use `writest()` (stealth-2) instead.
@@ -165,14 +165,14 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
             JSValue::undefined().raw()
         }
         1 => {
-            // wxshadow_patch 走 KPM copy_from_user_via_pte，单次只能写一页。
-            // bytes 跨 4KB 边界时手工拆成两段：先写第二段 (jump 尾部，未含取指首
-            // 字节)，再写第一段；首段失败回滚第二段。> 2 页直接拒绝。
+            // wxshadow backend writes through prctl. Keep the
+            // historical split order so hook jump installation remains safe
+            // when bytes cross a 4KB boundary.
             let len = bytes.len();
             let page_off = (addr & 0xFFF) as usize;
             if page_off + len > 0x2000 {
                 let msg = format!(
-                    "writeBytes(stealth=1): bytes len={} 跨 >2 页 (page_off=0x{:x})，wxshadow 不支持\0",
+                    "writeBytes(stealth=1): bytes len={} 跨 >2 页 (page_off=0x{:x})，kernel_hook backend 不支持\0",
                     len, page_off
                 );
                 return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
@@ -187,7 +187,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     second_len,
                 );
                 if rc2 != 0 {
-                    let msg = format!("writeBytes(stealth=1): wxshadow_patch second-page rc={}\0", rc2);
+                    let msg = format!("writeBytes(stealth=1): kernel_hook second-page write rc={}\0", rc2);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 let rc1 = ffi::hook::wxshadow_patch(
@@ -197,7 +197,10 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                 );
                 if rc1 != 0 {
                     ffi::hook::wxshadow_release(second_addr as *mut std::ffi::c_void);
-                    let msg = format!("writeBytes(stealth=1): first-page rc={}, second 已回滚\0", rc1);
+                    let msg = format!(
+                        "writeBytes(stealth=1): kernel_hook first-page rc={}, second 已回滚\0",
+                        rc1
+                    );
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 ffi::hook::hook_flush_cache(addr as *mut _, len);
@@ -210,7 +213,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     len,
                 );
                 if rc != 0 {
-                    let msg = format!("writeBytes(stealth=1): wxshadow_patch rc={}\0", rc);
+                    let msg = format!("writeBytes(stealth=1): kernel_hook write rc={}\0", rc);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 ffi::hook::hook_flush_cache(addr as *mut _, len);

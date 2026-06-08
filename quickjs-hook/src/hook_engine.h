@@ -692,18 +692,17 @@ void hook_set_recomp_reverse_translate(recomp_reverse_translate_fn fn);
 void hook_set_stealth_mode(int mode);
 
 /*
- * Stealth-write `len` bytes of `buf` to `addr` via the kernel wxshadow
- * facility. Creates a shadow page, writes the bytes, and activates it as
- * --x without ever exposing the target page as writable in /proc/self/maps.
- * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure (kernel does
- * not support wxshadow, target VMA is not 4KB-mapped after PMD-split COW
- * retry, etc.).
+ * Stealth-write `len` bytes of `buf` to `addr` via wxshadow_module's prctl
+ * ABI. The original bytes are tracked locally so wxshadow_release() can
+ * restore them through the same kernel module path. Returns 0 on success,
+ * HOOK_ERROR_WXSHADOW_FAILED on failure (module not loaded, prctl failed, or
+ * original bytes could not be saved).
  */
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 
 /*
- * Release a wxshadow patch by its exact patch start address (must match the
- * `addr` previously passed to wxshadow_patch). Returns 0 on success.
+ * Release a kernel_hook-backed patch by its exact patch start address (must
+ * match the `addr` previously passed to wxshadow_patch). Returns 0 on success.
  */
 int wxshadow_release(void* addr);
 

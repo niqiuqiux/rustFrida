@@ -225,7 +225,7 @@ void hook_flush_cache(void* start, size_t size) {
     __builtin___clear_cache((char*)start, (char*)start + size);
 }
 
-/* --- wxshadow (two-step shadow page patching) --- */
+/* --- stealth write backend (hook_module-backed wxshadow prctl ABI) --- */
 
 /*
  * Find the VMA containing addr by parsing /proc/self/maps.
@@ -254,14 +254,12 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
 }
 
 /*
- * Split PMD block / contiguous PTE group by mprotect on the ENTIRE
- * containing VMA + COW write.  Operating on the full VMA boundary
- * avoids VMA fragmentation in /proc/self/maps.
+ * Best-effort split of a PMD block / contiguous PTE group by mprotect on the
+ * ENTIRE containing VMA + COW write. Operating on the full VMA boundary avoids
+ * VMA fragmentation in /proc/self/maps.
  *
- * The transient RWX window is unavoidable but:
- *   - wxshadow itself causes VMA splits (more detectable than RWX)
- *   - The window is microseconds (single volatile write)
- *   - Without this, wxshadow fails on contiguous PTE pages
+ * This is retained as a fallback for kernel_hook WRITE paths that still depend
+ * on kernel writeability/GUP behavior for unusual mappings.
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -294,73 +292,176 @@ static int pmd_split_cow(void* addr) {
     return 0;
 }
 
+typedef struct WxshadowPatchRecord {
+    uintptr_t addr;
+    size_t len;
+    uint8_t* original;
+    struct WxshadowPatchRecord* next;
+} WxshadowPatchRecord;
+
+static HookLock g_wxshadow_records_lock;
+static int g_wxshadow_records_lock_init;
+static WxshadowPatchRecord* g_wxshadow_records;
+
+static void wxshadow_records_lock_init_once(void) {
+    if (!g_wxshadow_records_lock_init) {
+        hook_lock_init(&g_wxshadow_records_lock);
+        __atomic_store_n(&g_wxshadow_records_lock_init, 1, __ATOMIC_RELEASE);
+    }
+}
+
+static int wxshadow_prctl_patch_current(void* addr, const void* buf, size_t len) {
+    int rc = prctl(PR_WXSHADOW_PATCH,
+                   (unsigned long)getpid(),
+                   (unsigned long)(uintptr_t)addr,
+                   (unsigned long)(uintptr_t)buf,
+                   (unsigned long)len);
+    int saved_errno = errno;
+    if (rc != 0) {
+        hook_log("wxshadow prctl patch: addr=%p len=%zu failed errno=%d",
+                 addr, len, saved_errno);
+        errno = saved_errno;
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
+    return 0;
+}
+
+static WxshadowPatchRecord* wxshadow_find_record_locked(uintptr_t addr) {
+    WxshadowPatchRecord* rec = g_wxshadow_records;
+    while (rec) {
+        if (rec->addr == addr) return rec;
+        rec = rec->next;
+    }
+    return NULL;
+}
+
+static int wxshadow_save_record(uintptr_t addr, const void* original, size_t len) {
+    uint8_t* copy = (uint8_t*)malloc(len);
+    if (!copy) {
+        return -1;
+    }
+    memcpy(copy, original, len);
+
+    wxshadow_records_lock_init_once();
+    hook_lock(&g_wxshadow_records_lock);
+
+    WxshadowPatchRecord* rec = wxshadow_find_record_locked(addr);
+    if (!rec) {
+        rec = (WxshadowPatchRecord*)malloc(sizeof(WxshadowPatchRecord));
+        if (!rec) {
+            hook_unlock(&g_wxshadow_records_lock);
+            free(copy);
+            return -1;
+        }
+        memset(rec, 0, sizeof(*rec));
+        rec->addr = addr;
+        rec->next = g_wxshadow_records;
+        g_wxshadow_records = rec;
+    }
+
+    free(rec->original);
+    rec->len = len;
+    rec->original = copy;
+    hook_unlock(&g_wxshadow_records_lock);
+    return 0;
+}
+
+static int wxshadow_take_record(uintptr_t addr, uint8_t** original, size_t* len) {
+    wxshadow_records_lock_init_once();
+    hook_lock(&g_wxshadow_records_lock);
+
+    WxshadowPatchRecord* prev = NULL;
+    WxshadowPatchRecord* rec = g_wxshadow_records;
+    while (rec) {
+        if (rec->addr == addr) {
+            if (prev) prev->next = rec->next;
+            else g_wxshadow_records = rec->next;
+            *len = rec->len;
+            *original = rec->original;
+            free(rec);
+            hook_unlock(&g_wxshadow_records_lock);
+            return 0;
+        }
+        prev = rec;
+        rec = rec->next;
+    }
+
+    hook_unlock(&g_wxshadow_records_lock);
+    return -1;
+}
+
 /*
- * Stealth-patch target address using wxshadow shadow pages:
- *   PATCH — one-step: create shadow + write buf + activate (--x)
- *
- * prctl(PR_WXSHADOW_PATCH, pid, addr, buf, len)
- * Tries pid=0 first, then getpid() as fallback.
- * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
+ * Stealth-patch target address using wxshadow_module's prctl ABI.
+ * wxshadow_module.ko is loaded through kernel_hook/loader and depends on
+ * hook_module.ko exports for syscall and exception-dispatch hooks.
  */
 int wxshadow_patch(void* addr, const void* buf, size_t len) {
-    int ret;
+    uint8_t* original;
 
-    ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
-    if (ret != 0) {
-        ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
+    if (!addr || !buf || len == 0) {
+        return HOOK_ERROR_INVALID_PARAM;
     }
 
-    if (ret != 0) {
-        /* PATCH failed — likely 2MB section (PMD) mapping.
-         * wxshadow only supports 4KB PTE-mapped pages.
-         *
-         * Split the PMD by triggering COW on the target page.  We must
-         * mprotect the ENTIRE containing VMA (not just the target page)
-         * to avoid creating a VMA split visible in /proc/self/maps.
-         * V-OS detection scans /proc/self/maps for unexpected VMA splits
-         * in libart.so — mprotecting a sub-range would fragment the VMA. */
-        hook_log("wxshadow PATCH failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
+    original = (uint8_t*)malloc(len);
+    if (!original) {
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
 
-        if (pmd_split_cow(addr) == 0) {
-            ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
-            if (ret != 0) {
-                ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
-            }
-        }
+    if (read_target_safe(addr, original, len) != 0) {
+        hook_log("wxshadow patch: failed to save original bytes addr=%p len=%zu", addr, len);
+        free(original);
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
 
-        if (ret != 0) {
-            hook_log("wxshadow PATCH failed after COW: addr=%p errno=%d", addr, errno);
+    if (wxshadow_prctl_patch_current(addr, buf, len) != 0) {
+        if (pmd_split_cow(addr) != 0 || wxshadow_prctl_patch_current(addr, buf, len) != 0) {
+            hook_log("wxshadow patch: failed addr=%p len=%zu", addr, len);
+            free(original);
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
-        hook_log("wxshadow PATCH succeeded after PMD split: addr=%p", addr);
     }
 
-    hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
+    if (wxshadow_save_record((uintptr_t)addr, original, len) != 0) {
+        hook_log("wxshadow patch: failed to track original bytes addr=%p", addr);
+        wxshadow_prctl_patch_current(addr, original, len);
+        free(original);
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
+    free(original);
+
     return 0;
 }
 
 /*
- * Release a wxshadow patch by its exact patch start address.
- * The supplied address must match the addr argument previously passed to PATCH.
+ * Release a kernel_hook-backed patch by restoring the bytes saved for the exact
+ * patch start address through wxshadow_module's prctl ABI.
  */
 int wxshadow_release(void* addr) {
-    int ret = prctl(PR_WXSHADOW_RELEASE, 0, (uintptr_t)addr, 0, 0);
-    if (ret != 0) {
-        ret = prctl(PR_WXSHADOW_RELEASE, getpid(), (uintptr_t)addr, 0, 0);
-    }
-    if (ret != 0) {
-        hook_log("wxshadow_release: failed for addr=%p (errno=%d)", addr, errno);
+    uint8_t* original = NULL;
+    size_t len = 0;
+
+    if (!addr) return HOOK_ERROR_INVALID_PARAM;
+    if (wxshadow_take_record((uintptr_t)addr, &original, &len) != 0) {
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
+
+    if (wxshadow_prctl_patch_current(addr, original, len) != 0) {
+        hook_log("wxshadow release: restore failed addr=%p len=%zu", addr, len);
+        wxshadow_save_record((uintptr_t)addr, original, len);
+        free(original);
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
+
+    free(original);
     return 0;
 }
 
 /*
  * wxshadow 同页 LDR literal livelock 修复
  *
- * wxshadow 通过 R/X PTE 互斥保护页面。如果同页上有 PC-relative literal load
- * (LDR Rt, #imm)，该指令的 fetch(X) 和 data read(R) 都在同一保护页上，
- * 导致无限 page fault 循环 (livelock)。
+ * Historical wxshadow.kpm 通过 R/X PTE 互斥保护页面。如果同页上有 PC-relative
+ * literal load (LDR Rt, #imm)，该指令的 fetch(X) 和 data read(R) 都在同一
+ * 保护页上，会导致无限 page fault 循环 (livelock)。
  *
  * 修复: 将同页 LDR literal 替换为 B → trampoline，trampoline 里嵌入常量值。
  * B 指令只需 X(fetch)，不读数据，不触发 R/X 切换。
@@ -1293,8 +1394,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth == 1) {
-        /* wxshadow 模式: shadow 页写入.
-         * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
+        /* Stealth1 模式: wxshadow_module prctl 写入.
+         * 1. aligned(32) 保持历史 buffer 布局, 避免短跳转 patch 自身跨 cache line
          * 2. hook_write_jump_at 用 target 的 PC 算 ADRP，而非 buf 的栈地址，
          *    使 target↔thunk 在 ±4GB 时走 ADRP+ADD+BR (12B) 而非 MOVZ (16B) */
         uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
@@ -1307,7 +1408,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         int ok = 0;
 
         if ((t & 0xFFF) + (uintptr_t)jump_result > 0x1000) {
-            /* target 跨页: KPM copy_from_user_via_pte 单页限制. 分两段写, 顺序很关键:
+            /* target 跨页: 分两段写, 顺序很关键:
              *   1. 先写第二页 (jump 尾部): target 首指令未变, CPU 继续原流程, 安全
              *   2. 再写第一页 (含 target 首指令 ADRP): 首指令 4B 原子写, CPU 一旦取到 ADRP
              *      整条 jump 序列已就位 (第二页的 BR 已先写好), 无半 jump 执行窗口
@@ -1326,11 +1427,10 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 wxshadow_release(second_addr);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
-            /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
+            /* LDR literal relocate: 兼容历史 wxshadow.kpm 的同页 LDR 修复逻辑. */
             wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
             wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
             ok = 1;
-            hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
                 wxshadow_relocate_same_page_ldr_literals(target, jump_result);
@@ -1343,10 +1443,10 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             entry->original_size = jump_result;
             return 0;
         }
-        /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
+        /* stealth1 严格模式: kernel_hook 写入失败拒绝降级到 mprotect。
          * 降级会直接修改原始内存字节 + RWX 权限变更，
          * CRC 校验 / /proc/self/maps 扫描均可检测。 */
-        hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect\033[0m", target);
+        hook_log("\033[31m[STEALTH] kernel_hook write 失败 %p，拒绝降级 mprotect\033[0m", target);
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 

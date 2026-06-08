@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 
 static inline void hook_lock_init(HookLock* lock) {
     __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
@@ -41,13 +42,10 @@ static inline void hook_lock_destroy(HookLock* lock) {
     __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);
 }
 
-/* wxshadow prctl operations - two-step shadow page patching:
- *   1. PATCH: create shadow + write data + activate (--x) in one step
- *   2. RELEASE: restore the exact patch identified by its patch start address
+/* wxshadow_module prctl ABI.
  *
- * PATCH: prctl(op, pid, addr, buf, len) where pid=0 means current process.
- * RELEASE: prctl(op, pid, patch_addr) where patch_addr must exactly match the
- * address passed to PATCH.
+ * The module is loaded by kernel_hook/loader and installs its prctl handler
+ * through hook_module's exported syscall hook.
  */
 #ifndef PR_WXSHADOW_PATCH
 #define PR_WXSHADOW_PATCH   0x57580006  /* prctl(0x57580006, pid, addr, buf, len) — one-step patch */

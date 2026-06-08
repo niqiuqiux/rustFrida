@@ -38,7 +38,7 @@ use crate::jsapi::hook_api::StealthMode;
 
 /// 全局 stealth 模式。
 /// Normal=0  无 stealth
-/// WxShadow=1  内核 shadow page patch
+/// WxShadow=1  wxshadow_module prctl write 后端
 /// Recomp=2  页级重编译，在重编译页上 hook
 static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
 
