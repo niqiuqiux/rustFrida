@@ -119,13 +119,52 @@ pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::
     std::ptr::null_mut()
 }
 
+fn should_scan_module_for_global_export(module: &ModuleInfo) -> bool {
+    global_export_scan_priority(module).is_some()
+}
+
+fn is_probable_shared_object_path(path: &str) -> bool {
+    path.ends_with(".so") || path.contains(".so!")
+}
+
+fn is_app_module_path(path: &str) -> bool {
+    path.starts_with("/data/app/")
+        || path.starts_with("/mnt/expand/")
+        || path.starts_with("/data/user/")
+        || path.starts_with("/data/data/")
+}
+
+fn global_export_scan_priority(module: &ModuleInfo) -> Option<u8> {
+    let path = module.path.as_str();
+    if path.starts_with("/memfd:") {
+        return (path.starts_with("/memfd:wwb_") && is_probable_shared_object_path(path)).then_some(0);
+    }
+    if !is_probable_shared_object_path(path) {
+        return None;
+    }
+    if is_app_module_path(path) {
+        Some(0)
+    } else {
+        Some(1)
+    }
+}
+
 /// Resolve a symbol across all loaded modules by parsing each module's ELF.
 /// This is our RTLD_DEFAULT replacement for JS Module.findExportByName(null,...)
 /// and CModule unresolved imports.
 pub(crate) unsafe fn find_export_in_loaded_modules(symbol: &str) -> *mut std::ffi::c_void {
     let modules = enumerate_modules_from_maps();
+    let mut candidates = modules
+        .iter()
+        .filter_map(|module| global_export_scan_priority(module).map(|priority| (priority, module)))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(priority, module)| (*priority, module.base));
+
     let mut seen = HashSet::new();
-    for module in &modules {
+    for (_, module) in candidates {
+        if !should_scan_module_for_global_export(module) {
+            continue;
+        }
         if !seen.insert(module.path.clone()) {
             continue;
         }
@@ -472,12 +511,21 @@ pub(crate) unsafe fn memfd_dlopen_with_flags(name: &str, fd: i32, flags: i32) ->
                 library_fd_offset: 0,
                 library_namespace: 0,
             };
-            return android_dlopen_ext(
+            crate::jsapi::console::output_message(&format!(
+                "[module] memfd_dlopen: name={} fd={} flags=0x{:x} caller={:?}",
+                name, fd, flags, api.trusted_caller
+            ));
+            let handle = android_dlopen_ext(
                 c_name.as_ptr() as *const i8,
                 flags,
                 &extinfo as *const _ as *const std::ffi::c_void,
                 api.trusted_caller,
             );
+            crate::jsapi::console::output_message(&format!(
+                "[module] memfd_dlopen: android_dlopen_ext returned {:?}",
+                handle
+            ));
+            return handle;
         }
     }
 

@@ -469,16 +469,16 @@ unsafe extern "C" fn js_module_load(
 
     // 从 /proc/self/maps 找刚加载的模块 (path 精确匹配优先, tagged memfd 再按 wwb_ 名称匹配)
     let modules = enumerate_modules_from_maps();
-    for m in &modules {
-        if m.path == path {
-            return module_info_to_js(ctx, m);
-        }
-    }
     if let Some(name) = memfd_name.as_deref() {
         for m in &modules {
             if m.path.contains(name) || m.name.contains(name) {
                 return module_info_to_js(ctx, m);
             }
+        }
+    }
+    for m in &modules {
+        if m.path == path {
+            return module_info_to_js(ctx, m);
         }
     }
     for m in &modules {
