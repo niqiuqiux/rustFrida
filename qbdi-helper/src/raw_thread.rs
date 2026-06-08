@@ -32,6 +32,18 @@ impl RawThreadHandle {
         self.done.load(Ordering::Acquire)
     }
 
+    pub(crate) fn join_timeout_ms(&self, timeout_ms: u64) -> bool {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        while !self.done.load(Ordering::Acquire) {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            raw_sleep_ms(10);
+        }
+        true
+    }
+
     pub(crate) fn join(self) {
         while !self.done.load(Ordering::Acquire) {
             raw_sleep_ms(10);
