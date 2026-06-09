@@ -194,7 +194,7 @@ fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::ti
     }
 }
 
-/// 判断 maps 条目是否为 boot heap 区域（boot.art / dalvik-LinearAlloc）
+/// 判断 maps 条目是否为 boot heap 区域（boot image / dalvik-LinearAlloc）
 fn is_boot_heap(entry: &MapEntry) -> bool {
     entry.is_readable()
         && entry.is_writable()
@@ -202,6 +202,7 @@ fn is_boot_heap(entry: &MapEntry) -> bool {
         && !entry.is_shared()
         && (entry.path.contains("boot.art")
             || entry.path.contains("boot-framework.art")
+            || entry.path.contains("boot-image-methods.art")
             || entry.path.contains("dalvik-LinearAlloc"))
 }
 
@@ -216,6 +217,22 @@ fn is_private_rw_mapping(entry: &MapEntry) -> bool {
 
 fn is_readable_mapping(entry: &MapEntry) -> bool {
     entry.is_readable()
+}
+
+fn is_setargv0_rw_fallback_candidate(entry: &MapEntry) -> bool {
+    entry.path.contains("dalvik-")
+        || entry.path.contains("boot-image")
+        || entry.path.contains("boot.art")
+        || entry.path.contains("boot-framework")
+        || entry.path.contains("[anon:stack_and_tls:")
+}
+
+fn is_setargv0_readable_fallback_candidate(entry: &MapEntry) -> bool {
+    entry.path.contains("dalvik-")
+        || entry.path.contains("boot-image")
+        || entry.path.contains("boot.art")
+        || entry.path.contains("boot-framework")
+        || entry.path.contains("libandroid_runtime")
 }
 
 /// 在 ELF dynsyms 中查找符号地址
@@ -1499,7 +1516,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 2. 与 Frida 一致：提前检查 boot heap 候选区是否存在
     let has_heap_candidates = maps.iter().any(|e| is_boot_heap(e));
     if !has_heap_candidates {
-        return Err("未检测到 VM heap 候选区域（boot.art / dalvik-LinearAlloc）".to_string());
+        return Err("未检测到 VM heap 候选区域（boot image / dalvik-LinearAlloc）".to_string());
     }
 
     // 3. 解析 libc.so 获取函数地址
@@ -1548,7 +1565,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         ));
     }
 
-    // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → RW private → 全读）
+    // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → ART RW private → ART readable）
     //    None: 三层全 miss，启用 setcontext-only 降级阻塞（要求 setcontext GOT 可用）
     let mut payload_data = payload_data;
     let setargv0_search = if diag_no_setargv0 {
@@ -1568,7 +1585,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     } else {
         // 降级模式或诊断模式：要求 setcontext GOT 必须可用
         if !matches!(&setcontext_info, Some((_, Some(_)))) {
-            return Err("boot heap / RW private / 全读映射均未命中 setArgV0 指针，\
+            return Err("boot heap / ART RW private / ART readable 映射均未命中 setArgV0 指针，\
                  且 setcontext GOT 不可用 — 无法建立阻塞点，目标 Android 版本可能不兼容。"
                 .to_string());
         }
@@ -2019,9 +2036,9 @@ fn find_got_entry_for_import(maps: &[MapEntry], so_name: &str, import_name: &str
     None
 }
 
-/// 在 boot heap 中搜索 setArgV0 函数指针
+/// 在 boot image 相关映射中搜索 setArgV0 函数指针
 /// 与 Frida 一致：同时搜索原始指针和已被替换的指针（already-patched 检测）。
-/// 如果发现 boot heap 中指针已被替换（如另一个 rustFrida 实例），仍能正确定位 slot。
+/// 如果发现指针已被替换（如另一个 rustFrida 实例），仍能正确定位 slot。
 fn find_setargv0_pointer_in_heap(
     pid: u32,
     maps: &[MapEntry],
@@ -2127,7 +2144,7 @@ fn find_setargv0_pointer_in_heap(
         Ok(Some((addr, backup, already_patched)))
     };
 
-    // 搜索候选区域：boot.art / boot-framework.art / dalvik-LinearAlloc（R+W 非 X 非 shared）
+    // 搜索候选区域：boot image / dalvik-LinearAlloc（R+W 非 X 非 shared）
     // 与 Frida is_boot_heap() 一致
     let preferred: Vec<&MapEntry> = maps.iter().filter(|e| is_boot_heap(e)).collect();
     log_verbose!("搜索 {} 个 boot heap 区域查找 setArgV0 指针", preferred.len());
@@ -2136,14 +2153,15 @@ fn find_setargv0_pointer_in_heap(
     }
 
     // Android 16 / 新版本 ART 上，slot 可能不再落在传统 boot heap/LinearAlloc 区域。
-    // 回退到所有 RW private 映射，并要求唯一命中，避免误改。
+    // 回退只扫描 ART 相关 RW private 映射，并要求唯一命中，避免误扫 malloc/stack/random 残留值。
     let fallback: Vec<&MapEntry> = maps
         .iter()
         .filter(|e| is_private_rw_mapping(e))
         .filter(|e| !is_boot_heap(e))
+        .filter(|e| is_setargv0_rw_fallback_candidate(e))
         .collect();
     log_warn!(
-        "boot heap 中未命中 setArgV0 指针，回退扫描 {} 个 RW private 区域",
+        "boot heap 中未命中 setArgV0 指针，回退扫描 {} 个 ART 相关 RW private 区域",
         fallback.len()
     );
     if let Some(found) = search_candidates(&fallback)? {
@@ -2151,14 +2169,15 @@ fn find_setargv0_pointer_in_heap(
     }
 
     // 再退一层：某些新系统可能把 slot 放在只读或 shared 映射中。
-    // 这里扩大到所有可读映射，但仍要求唯一命中。
+    // 继续限制在 ART 相关可读映射，仍要求唯一命中。
     let final_fallback: Vec<&MapEntry> = maps
         .iter()
         .filter(|e| is_readable_mapping(e))
         .filter(|e| !is_private_rw_mapping(e))
+        .filter(|e| is_setargv0_readable_fallback_candidate(e))
         .collect();
     log_warn!(
-        "RW private 区域未命中 setArgV0 指针，继续扫描 {} 个其余可读区域",
+        "ART 相关 RW private 区域未命中 setArgV0 指针，继续扫描 {} 个 ART 相关可读区域",
         final_fallback.len()
     );
     if let Some(found) = search_candidates(&final_fallback)? {
@@ -2167,7 +2186,7 @@ fn find_setargv0_pointer_in_heap(
 
     // 所有层均未命中：返回 None，上层降级为 setcontext GOT 阻塞（最后的兼容路径）
     log_warn!(
-        "未在 boot heap、RW private 或其余可读区域中找到 setArgV0 指针 (0x{:x})，切换降级模式",
+        "未在 boot heap、ART 相关 RW private 或 ART 相关可读区域中找到 setArgV0 指针 (0x{:x})，切换降级模式",
         setargv0_addr
     );
     Ok(None)
