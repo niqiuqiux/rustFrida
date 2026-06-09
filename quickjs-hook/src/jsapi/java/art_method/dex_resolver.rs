@@ -13,6 +13,15 @@
 struct DexImage {
     base: u64,
     size: usize,
+    data_base: u64,
+    data_size: usize,
+    kind: DexImageKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DexImageKind {
+    Standard,
+    Compact,
 }
 
 pub(crate) struct DexFieldInfo {
@@ -24,8 +33,12 @@ pub(crate) struct DexFieldInfo {
 }
 
 const DEX_HEADER_SIZE: usize = 0x70;
+const DEX_V41_HEADER_SIZE: usize = 0x78;
 const DEX_MAGIC_DEX: &[u8; 4] = b"dex\n";
 const DEX_MAGIC_CDEX: &[u8; 4] = b"cdex";
+const VDEX_MAGIC: &[u8; 4] = b"vdex";
+const ART_IMAGE_MAGIC: &[u8; 4] = b"art\n";
+const OAT_MAGIC: &[u8; 4] = b"oat\n";
 const ART_METHOD_DEX_METHOD_INDEX_CANDIDATE_OFFSETS: [usize; 3] = [8, 4, 12];
 const ART_METHOD_ARRAY_FIRST_ELEMENT_OFFSETS: [usize; 2] = [0, 8];
 const ART_METHOD_SIZE_CANDIDATES: [usize; 6] = [40, 32, 48, 24, 56, 64];
@@ -33,6 +46,8 @@ const ART_FIELD_DEX_FIELD_INDEX_CANDIDATE_OFFSETS: [usize; 3] = [8, 16, 12];
 const K_ACC_STATIC: u32 = 0x0008;
 
 static CLASS_MIRROR_CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static CLASS_MIRROR_DEX_IMAGE_CACHE: OnceLock<Mutex<HashMap<u64, DexImage>>> = OnceLock::new();
+static LAST_DEX_RESOLVER_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static RAW_CLASS_MIRROR_SCAN_MISSES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 static RAW_FRAMEWORK_DEX_SCAN_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -41,6 +56,723 @@ static RAW_FRAMEWORK_DEX_SCAN_DISABLED: std::sync::atomic::AtomicBool =
 struct ClassMirrorScanRegion {
     start: u64,
     end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtImageSection {
+    offset: u32,
+    size: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ArtImage {
+    base: u64,
+    end: u64,
+    path: String,
+    image_size: u32,
+    header_sections_off: u32,
+    sections: Vec<ArtImageSection>,
+    class_tables: Vec<ArtClassTable>,
+}
+
+#[derive(Clone, Debug)]
+struct ArtClassTable {
+    section_index: usize,
+    start: u64,
+    size: usize,
+    entries: u64,
+    num_elements: u64,
+    num_buckets: u64,
+}
+
+#[derive(Clone, Debug)]
+struct VdexImage {
+    base: u64,
+    version: [u8; 4],
+    dex_count: Option<u32>,
+    dex_section: Option<ClassMirrorScanRegion>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OatImage {
+    base: u64,
+    end: u64,
+    version: [u8; 4],
+    dex_file_count: u32,
+    oat_dex_files_offset: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OatDexFileInfo {
+    location: String,
+    checksum: u32,
+    dex_file_offset: u32,
+    class_offsets_offset: u32,
+    lookup_table_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassMirrorSeedMode {
+    AdjacentIndices,
+    LooseIndex,
+}
+
+impl ArtImage {
+    fn from_mapping(start: u64, end: u64, path: &str) -> Option<Self> {
+        if end <= start || !super::safe_mem::is_readable(start, DEX_HEADER_SIZE) {
+            return None;
+        }
+        let magic = unsafe { std::slice::from_raw_parts(start as *const u8, 4) };
+        if magic != ART_IMAGE_MAGIC {
+            return None;
+        }
+
+        let mut best: Option<((u8, u8, u8, u8), Self)> = None;
+        for (layout_priority, image_size_off, sections_off, section_count) in
+            art_image_header_layout_candidates(start, end)
+        {
+            let Some(image_size) = read_u32(start + image_size_off) else {
+                continue;
+            };
+            if !(DEX_HEADER_SIZE as u32..=(1024 * 1024 * 1024)).contains(&image_size) {
+                continue;
+            }
+            let mapped_len = end.saturating_sub(start);
+            if mapped_len < image_size.min(DEX_HEADER_SIZE as u32) as u64 {
+                continue;
+            }
+
+            let Some(sections) = parse_art_image_sections(start, end, image_size, sections_off, section_count) else {
+                continue;
+            };
+            let class_tables = parse_art_class_tables(start, image_size, section_count, &sections);
+
+            let candidate = ArtImage {
+                base: start,
+                end,
+                path: path.to_string(),
+                image_size,
+                header_sections_off: sections_off,
+                sections,
+                class_tables,
+            };
+
+            let score = art_image_candidate_score(layout_priority, section_count, &candidate.class_tables);
+            if best.as_ref().is_none_or(|(best_score, _)| score < *best_score) {
+                best = Some((score, candidate));
+            }
+        }
+
+        best.map(|(_, candidate)| candidate)
+    }
+
+    fn object_region(&self) -> Option<ClassMirrorScanRegion> {
+        art_section_region(self.base, self.image_size, self.sections.first()?)
+            .filter(|region| region.end <= self.end)
+    }
+}
+
+fn art_image_header_layout_candidates(start: u64, end: u64) -> Vec<(u8, u64, u32, usize)> {
+    const HEADER_SCAN_LIMIT: u64 = 0x100;
+    const MIN_SECTION_COUNT: usize = 7;
+    const MAX_SECTION_COUNT: usize = 18;
+
+    let mut out = Vec::new();
+    for image_size_off in [0x14u64, 0x0c] {
+        for sections_off in [0x48u32, 0x40] {
+            for section_count in MIN_SECTION_COUNT..=MAX_SECTION_COUNT {
+                out.push((0, image_size_off, sections_off, section_count));
+            }
+        }
+    }
+
+    let max_header = end.saturating_sub(start).min(HEADER_SCAN_LIMIT);
+    for image_size_off in (0x0cu64..max_header).step_by(4) {
+        for sections_off in (0x30u32..max_header as u32).step_by(4) {
+            if sections_off as u64 <= image_size_off {
+                continue;
+            }
+            for section_count in MIN_SECTION_COUNT..=MAX_SECTION_COUNT {
+                if out.iter().any(|(_, known_size_off, known_sections_off, known_count)| {
+                    *known_size_off == image_size_off
+                        && *known_sections_off == sections_off
+                        && *known_count == section_count
+                }) {
+                    continue;
+                }
+                out.push((1, image_size_off, sections_off, section_count));
+            }
+        }
+    }
+
+    out
+}
+
+impl VdexImage {
+    fn from_mapping(start: u64, end: u64) -> Option<Self> {
+        if end <= start || !super::safe_mem::is_readable(start, 12) {
+            return None;
+        }
+        let magic = unsafe { std::slice::from_raw_parts(start as *const u8, 4) };
+        if magic != VDEX_MAGIC {
+            return None;
+        }
+        let mut version = [0u8; 4];
+        for (i, slot) in version.iter_mut().enumerate() {
+            *slot = read_u8(start + 4 + i as u64)?;
+        }
+
+        if let Some((dex_count, dex_section)) = parse_vdex_section_header_layout(start, end) {
+            return Some(VdexImage {
+                base: start,
+                version,
+                dex_count: Some(dex_count),
+                dex_section,
+            });
+        }
+
+        if let Some((dex_count, dex_section)) = parse_vdex_legacy_layout(start, end) {
+            return Some(VdexImage {
+                base: start,
+                version,
+                dex_count: Some(dex_count),
+                dex_section: Some(dex_section),
+            });
+        }
+
+        Some(VdexImage {
+            base: start,
+            version,
+            dex_count: None,
+            dex_section: Some(ClassMirrorScanRegion { start, end }),
+        })
+    }
+
+    fn dex_images(&self) -> Vec<DexImage> {
+        let Some(scan) = self.dex_section else {
+            return Vec::new();
+        };
+        scan_dex_images_in_range(scan.start, scan.end, self.dex_count.unwrap_or(128) as usize)
+    }
+}
+
+#[allow(dead_code)]
+impl OatImage {
+    fn from_mapping(start: u64, end: u64) -> Option<Self> {
+        let header = find_oat_header_in_mapping(start, end)?;
+        if !super::safe_mem::is_readable(header, 0x40) {
+            return None;
+        }
+        let mut version = [0u8; 4];
+        for (i, slot) in version.iter_mut().enumerate() {
+            *slot = read_u8(header + 4 + i as u64)?;
+        }
+        let dex_file_count = read_u32(header + 0x14)?;
+        let oat_dex_files_offset = read_u32(header + 0x18)?;
+        if dex_file_count == 0 || dex_file_count > 4096 {
+            return None;
+        }
+        if oat_dex_files_offset < 0x40 || header + oat_dex_files_offset as u64 >= end {
+            return None;
+        }
+        Some(OatImage {
+            base: header,
+            end,
+            version,
+            dex_file_count,
+            oat_dex_files_offset,
+        })
+    }
+
+    fn oat_dex_files(&self) -> Vec<OatDexFileInfo> {
+        let mut out = Vec::new();
+        let mut cursor = self.base + self.oat_dex_files_offset as u64;
+        let old_inline_class_offsets = self.version_number().is_some_and(|version| version < 75);
+        for index in 0..self.dex_file_count.min(512) {
+            let Some(location_size) = read_u32(cursor) else {
+                break;
+            };
+            cursor += 4;
+            if location_size == 0 || location_size > 4096 || cursor + location_size as u64 > self.end {
+                break;
+            }
+            let location = if super::safe_mem::is_readable(cursor, location_size as usize) {
+                let bytes = unsafe { std::slice::from_raw_parts(cursor as *const u8, location_size as usize) };
+                String::from_utf8_lossy(bytes).into_owned()
+            } else {
+                break;
+            };
+            cursor += location_size as u64;
+
+            let oat_version = self.version_number().unwrap_or(0);
+            let (checksum, dex_file_offset, data_bytes) = if oat_version >= 244 {
+                let Some(checksum) = read_u32(cursor + 8) else {
+                    break;
+                };
+                let Some(dex_file_offset) = read_u32(cursor + 32) else {
+                    break;
+                };
+                (checksum, dex_file_offset, 36u64)
+            } else {
+                let Some(checksum) = read_u32(cursor) else {
+                    break;
+                };
+                let Some(dex_file_offset) = read_u32(cursor + 4) else {
+                    break;
+                };
+                (checksum, dex_file_offset, 8u64)
+            };
+            if cursor + data_bytes > self.end {
+                break;
+            }
+            cursor += data_bytes;
+
+            if old_inline_class_offsets {
+                let class_offsets_offset = cursor.saturating_sub(self.base) as u32;
+                let class_defs_size = if dex_file_offset != 0 {
+                    read_u32(self.base + dex_file_offset as u64 + 0x60).unwrap_or(0)
+                } else {
+                    0
+                };
+                let class_offsets_bytes = class_defs_size as u64 * 4;
+                if cursor + class_offsets_bytes > self.end {
+                    break;
+                }
+                cursor += class_offsets_bytes;
+                out.push(OatDexFileInfo {
+                    location,
+                    checksum,
+                    dex_file_offset,
+                    class_offsets_offset,
+                    lookup_table_offset: 0,
+                });
+            } else {
+                let Some(class_offsets_offset) = read_u32(cursor) else {
+                    break;
+                };
+                let Some(lookup_table_offset) = read_u32(cursor + 4) else {
+                    break;
+                };
+                cursor += 8;
+                out.push(OatDexFileInfo {
+                    location,
+                    checksum,
+                    dex_file_offset,
+                    class_offsets_offset,
+                    lookup_table_offset,
+                });
+            }
+
+            if index + 1 < self.dex_file_count.min(512) {
+                if let Some(next_cursor) = find_next_oat_dex_file_entry(cursor, self.end) {
+                    cursor = next_cursor;
+                }
+            }
+        }
+        out
+    }
+
+    fn version_number(&self) -> Option<u32> {
+        let mut value = 0u32;
+        let mut seen_digit = false;
+        for byte in self.version {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            seen_digit = true;
+            value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+        }
+        seen_digit.then_some(value)
+    }
+}
+
+fn find_next_oat_dex_file_entry(cursor: u64, end: u64) -> Option<u64> {
+    for tail_bytes in [0u64, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 64] {
+        let candidate = cursor.checked_add(tail_bytes)?;
+        if looks_like_oat_dex_file_entry(candidate, end) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn looks_like_oat_dex_file_entry(addr: u64, end: u64) -> bool {
+    let Some(location_size) = read_u32(addr) else {
+        return false;
+    };
+    if location_size == 0 || location_size > 4096 {
+        return false;
+    }
+    let location_start = addr + 4;
+    let location_end = location_start + location_size as u64;
+    if location_end + 8 > end || !super::safe_mem::is_readable(location_start, location_size as usize) {
+        return false;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(location_start as *const u8, location_size as usize) };
+    bytes.iter().all(|byte| byte.is_ascii_graphic())
+}
+
+fn parse_art_image_sections(
+    base: u64,
+    end: u64,
+    image_size: u32,
+    sections_off: u32,
+    section_count: usize,
+) -> Option<Vec<ArtImageSection>> {
+    if !(7..=18).contains(&section_count) {
+        return None;
+    }
+    let mut sections = Vec::with_capacity(section_count);
+    for index in 0..section_count {
+        let addr = base + sections_off as u64 + (index * 8) as u64;
+        if addr + 8 > end || !super::safe_mem::is_readable(addr, 8) {
+            return None;
+        }
+        let offset = read_u32(addr)?;
+        let size = read_u32(addr + 4)?;
+        if offset > image_size
+            || (size != 0 && offset.checked_add(size).is_none_or(|section_end| section_end > image_size))
+        {
+            return None;
+        }
+        sections.push(ArtImageSection { offset, size });
+    }
+    Some(sections)
+}
+
+fn parse_art_class_tables(
+    image_base: u64,
+    image_size: u32,
+    _section_count: usize,
+    sections: &[ArtImageSection],
+) -> Vec<ArtClassTable> {
+    let Some(object_region) = sections
+        .first()
+        .and_then(|section| art_section_region(image_base, image_size, section))
+    else {
+        return Vec::new();
+    };
+
+    let mut tables = sections
+        .iter()
+        .enumerate()
+        .filter_map(|(section_index, section)| {
+            parse_art_class_table(image_base, image_size, object_region, section_index, section)
+                .map(|table| (class_table_scan_priority(&table), table))
+        })
+        .collect::<Vec<_>>();
+    tables.sort_by_key(|(priority, table)| (*priority, table.section_index, table.start));
+    tables.into_iter().map(|(_, table)| table).collect()
+}
+
+fn art_section_region(
+    image_base: u64,
+    image_size: u32,
+    section: &ArtImageSection,
+) -> Option<ClassMirrorScanRegion> {
+    if section.size == 0 {
+        return None;
+    }
+    if section
+        .offset
+        .checked_add(section.size)
+        .is_none_or(|section_end| section_end > image_size)
+    {
+        return None;
+    }
+    let start = image_base.checked_add(section.offset as u64)?;
+    let end = start.checked_add(section.size as u64)?;
+    super::safe_mem::is_readable(start, (end - start).min(DEX_HEADER_SIZE as u64) as usize)
+        .then_some(ClassMirrorScanRegion { start, end })
+}
+
+fn parse_art_class_table(
+    image_base: u64,
+    image_size: u32,
+    object_region: ClassMirrorScanRegion,
+    section_index: usize,
+    section: &ArtImageSection,
+) -> Option<ArtClassTable> {
+    const HASH_SET_PREFIX_SIZE: u64 = 40;
+    if section.size < HASH_SET_PREFIX_SIZE as u32 {
+        return None;
+    }
+    let start = image_base + section.offset as u64;
+    if !super::safe_mem::is_readable(start, HASH_SET_PREFIX_SIZE as usize) {
+        return None;
+    }
+    let num_elements = read_u64(start)?;
+    let num_buckets = read_u64(start + 8)?;
+    let elements_until_expand = read_u64(start + 16)?;
+    let min_load = read_f64(start + 24)?;
+    let max_load = read_f64(start + 32)?;
+    if num_elements == 0
+        || num_buckets == 0
+        || num_elements > num_buckets
+        || num_buckets > 4_000_000
+        || elements_until_expand < num_elements
+        || !(0.05..=0.95).contains(&min_load)
+        || !(0.10..=0.99).contains(&max_load)
+        || min_load >= max_load
+    {
+        return None;
+    }
+    let table_size = HASH_SET_PREFIX_SIZE.checked_add(num_buckets.checked_mul(4)?)?;
+    if table_size > section.size as u64 {
+        return None;
+    }
+    if section.offset.checked_add(table_size as u32).is_none_or(|end| end > image_size) {
+        return None;
+    }
+    let entries = start + HASH_SET_PREFIX_SIZE;
+    if !art_class_table_entries_look_plausible(entries, num_elements, num_buckets, object_region) {
+        return None;
+    }
+    Some(ArtClassTable {
+        section_index,
+        start,
+        size: table_size as usize,
+        entries,
+        num_elements,
+        num_buckets,
+    })
+}
+
+fn art_class_table_entries_look_plausible(
+    entries: u64,
+    num_elements: u64,
+    num_buckets: u64,
+    object_region: ClassMirrorScanRegion,
+) -> bool {
+    const MAX_LINEAR_SAMPLE_BUCKETS: u64 = 64 * 1024;
+    const MAX_STRIDED_SAMPLE_BUCKETS: u64 = 64 * 1024;
+
+    fn sample_bucket(
+        entries: u64,
+        index: u64,
+        object_region: ClassMirrorScanRegion,
+        non_zero: &mut u64,
+        object_like: &mut u64,
+    ) -> Option<()> {
+        let slot = read_u32(entries.checked_add(index.checked_mul(4)?)?)?;
+        if slot == 0 {
+            return Some(());
+        }
+        *non_zero += 1;
+        let object = (slot & !0x7) as u64;
+        if object >= object_region.start
+            && object + 4 <= object_region.end
+            && super::safe_mem::is_readable(object, 4)
+        {
+            *object_like += 1;
+        }
+        Some(())
+    }
+
+    let mut non_zero = 0u64;
+    let mut object_like = 0u64;
+    let linear = num_buckets.min(MAX_LINEAR_SAMPLE_BUCKETS);
+    for index in 0..linear {
+        if sample_bucket(entries, index, object_region, &mut non_zero, &mut object_like).is_none() {
+            return false;
+        }
+    }
+
+    if object_like == 0 && num_buckets > linear {
+        let stride = (num_buckets / MAX_STRIDED_SAMPLE_BUCKETS).max(1);
+        let mut index = 0u64;
+        let mut sampled = 0u64;
+        while index < num_buckets && sampled < MAX_STRIDED_SAMPLE_BUCKETS {
+            if sample_bucket(entries, index, object_region, &mut non_zero, &mut object_like).is_none() {
+                return false;
+            }
+            index = index.saturating_add(stride);
+            sampled += 1;
+        }
+    }
+
+    if object_like == 0 {
+        return false;
+    }
+
+    let required = num_elements.min(4).max(1);
+    if num_buckets <= MAX_LINEAR_SAMPLE_BUCKETS && object_like < required {
+        return false;
+    }
+
+    non_zero <= num_elements.saturating_mul(2).max(16) && object_like.saturating_mul(4) >= non_zero
+}
+
+fn class_table_scan_priority(table: &ArtClassTable) -> (u8, u64, u64) {
+    let load_distance = table.num_buckets.saturating_sub(table.num_elements);
+    (0, load_distance, table.num_buckets)
+}
+
+fn art_image_candidate_score(
+    layout_priority: u8,
+    section_count: usize,
+    class_tables: &[ArtClassTable],
+) -> (u8, u8, u8, u8) {
+    (
+        if class_tables.is_empty() { 1 } else { 0 },
+        layout_priority,
+        32u8.saturating_sub(class_tables.len().min(32) as u8),
+        32u8.saturating_sub(section_count.min(32) as u8),
+    )
+}
+
+fn parse_vdex_section_header_layout(start: u64, end: u64) -> Option<(u32, Option<ClassMirrorScanRegion>)> {
+    let number_of_sections = read_u32(start + 8)?;
+    if !(2..=16).contains(&number_of_sections) {
+        return None;
+    }
+    let section_table = start + 12;
+    if section_table + number_of_sections as u64 * 12 > end {
+        return None;
+    }
+    let mut dex_count = None;
+    let mut dex_section = None;
+    for i in 0..number_of_sections {
+        let entry = section_table + i as u64 * 12;
+        let kind = read_u32(entry)?;
+        let offset = read_u32(entry + 4)?;
+        let size = read_u32(entry + 8)?;
+        if offset as u64 + size as u64 > end - start {
+            return None;
+        }
+        match kind {
+            0 => dex_count = Some(size / 4),
+            1 if size != 0 => {
+                dex_section = Some(ClassMirrorScanRegion {
+                    start: start + offset as u64,
+                    end: start + offset as u64 + size as u64,
+                })
+            }
+            _ => {}
+        }
+    }
+    Some((dex_count.unwrap_or(0), dex_section))
+}
+
+fn parse_vdex_legacy_layout(start: u64, end: u64) -> Option<(u32, ClassMirrorScanRegion)> {
+    if end - start < 24 {
+        return None;
+    }
+    let number_of_dex_files = read_u32(start + 12)?;
+    if number_of_dex_files == 0 || number_of_dex_files > 4096 {
+        return None;
+    }
+
+    // Android 10/11 verifier deps header:
+    // magic, verifier_deps_version, dex_section_version, number, verifier_deps_size,
+    // bootclasspath checksum string size, class loader context size.
+    if end - start >= 40 {
+        let dex_section_version = [
+            read_u8(start + 8)?,
+            read_u8(start + 9)?,
+            read_u8(start + 10)?,
+            read_u8(start + 11)?,
+        ];
+        if dex_section_version != [b'0', b'0', b'0', 0] {
+            let dex_section_header = start + 28 + number_of_dex_files as u64 * 4;
+            if dex_section_header + 12 <= end {
+                let dex_size = read_u32(dex_section_header)?;
+                let dex_shared_data_size = read_u32(dex_section_header + 4)?;
+                let dex_start = dex_section_header + 12;
+                let dex_end = dex_start + dex_size as u64 + dex_shared_data_size as u64;
+                if dex_size != 0 && dex_end <= end {
+                    return Some((
+                        number_of_dex_files,
+                        ClassMirrorScanRegion {
+                            start: dex_start,
+                            end: dex_end,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Android 8/9 style header: magic, version, number, dex_size, verifier_deps_size,
+    // quickening_info_size; DEX data follows immediately.
+    let dex_size = read_u32(start + 16)?;
+    let checksums_size = number_of_dex_files as u64 * 4;
+    let dex_start = start + 24 + checksums_size;
+    let dex_end = dex_start + dex_size as u64;
+    if dex_size != 0 && dex_end <= end {
+        return Some((
+            number_of_dex_files,
+            ClassMirrorScanRegion {
+                start: dex_start,
+                end: dex_end,
+            },
+        ));
+    }
+
+    None
+}
+
+fn scan_dex_images_in_range(start: u64, end: u64, max_images: usize) -> Vec<DexImage> {
+    let mut out = Vec::new();
+    let mut addr = start;
+    let mut scanned = 0usize;
+    const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+    while addr + DEX_HEADER_SIZE as u64 <= end && addr - start <= MAX_SCAN_BYTES {
+        if !super::safe_mem::is_readable(addr, 4) {
+            addr += 4;
+            continue;
+        }
+        let word = unsafe { super::safe_mem::safe_read_u32(addr) };
+        if word == u32::from_le_bytes(*DEX_MAGIC_DEX) || word == u32::from_le_bytes(*DEX_MAGIC_CDEX) {
+            if let Some(image) = DexImage::from_base(addr) {
+                if image.base + image.size as u64 <= end || image.kind == DexImageKind::Compact {
+                    addr = align_up_u64(image.base + image.size.max(4) as u64, 4);
+                    out.push(image);
+                    if out.len() >= max_images {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        scanned += 1;
+        if scanned > 2_000_000 {
+            break;
+        }
+        addr += 4;
+    }
+    out
+}
+
+fn find_oat_header_in_mapping(start: u64, end: u64) -> Option<u64> {
+    let mut addr = start;
+    let scan_end = end.min(start.saturating_add(16 * 1024 * 1024));
+    while addr + 0x40 <= scan_end {
+        if super::safe_mem::is_readable(addr, 4)
+            && unsafe { std::slice::from_raw_parts(addr as *const u8, 4) } == OAT_MAGIC
+        {
+            return Some(addr);
+        }
+        addr += 4;
+    }
+    None
+}
+
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    if align == 0 {
+        value
+    } else {
+        (value + align - 1) & !(align - 1)
+    }
+}
+
+fn modified_utf8_hash(s: &str) -> u32 {
+    s.as_bytes()
+        .iter()
+        .fold(0u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(*byte as u32))
 }
 
 pub(super) unsafe fn resolve_art_method_by_dex(
@@ -53,6 +785,7 @@ pub(super) unsafe fn resolve_art_method_by_dex(
     if method_name.is_empty() || signature.is_empty() {
         return None;
     }
+    clear_dex_resolver_failure();
 
     refresh_mem_regions();
 
@@ -82,10 +815,11 @@ pub(crate) unsafe fn resolve_art_method_by_dex_from_mirror(
         let image = match dex_image_from_class(class_obj) {
             Some(image) => image,
             None => {
-                output_verbose(&format!(
+                let reason = format!(
                     "[dex resolver] no DexFile image from Class/DexCache for {}.{}{} depth={} class={:#x}",
                     class_name, method_name, signature, depth, class_obj
-                ));
+                );
+                set_dex_resolver_failure(reason);
                 return None;
             }
         };
@@ -300,6 +1034,45 @@ fn remember_class_mirror(class_name: &str, mirror: u64) {
         .insert(class_name.to_string(), mirror);
 }
 
+fn cached_dex_image_for_class(class_obj: u64) -> Option<DexImage> {
+    CLASS_MIRROR_DEX_IMAGE_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&class_obj)
+        .cloned()
+}
+
+fn remember_class_mirror_dex_image(class_obj: u64, image: &DexImage) {
+    if class_obj < 0x1000 || !super::safe_mem::is_readable(class_obj, 4) {
+        return;
+    }
+    CLASS_MIRROR_DEX_IMAGE_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(class_obj, image.clone());
+}
+
+fn clear_dex_resolver_failure() {
+    let failure = LAST_DEX_RESOLVER_FAILURE.get_or_init(|| Mutex::new(None));
+    *failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn set_dex_resolver_failure(reason: String) {
+    output_verbose(&reason);
+    let failure = LAST_DEX_RESOLVER_FAILURE.get_or_init(|| Mutex::new(None));
+    *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+}
+
+pub(super) fn last_dex_resolver_failure() -> Option<String> {
+    LAST_DEX_RESOLVER_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 fn remember_raw_class_mirror_scan_miss(class_name: &str) {
     let misses = RAW_CLASS_MIRROR_SCAN_MISSES.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     misses
@@ -327,20 +1100,43 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
     let started = std::time::Instant::now();
     const SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
 
-    let Some(image) = find_framework_dex_image_for_descriptor(&descriptor, started, SCAN_BUDGET) else {
-        remember_raw_class_mirror_scan_miss(class_name);
+    let seed_image = find_framework_dex_image_for_descriptor(&descriptor, started, SCAN_BUDGET);
+    let seed = seed_image.as_ref().and_then(|image| {
+        image
+            .class_def_and_type_idx_by_descriptor(&descriptor)
+            .map(|(class_def_idx, class_idx)| (image, class_def_idx, class_idx))
+    });
+
+    if let Some((image, class_def_idx, class_idx)) = seed {
         output_verbose(&format!(
-            "[dex resolver] raw clone framework class mirror scan miss for {}: dex image unavailable",
+            "[dex resolver] raw clone framework class mirror resolve {}: dex={:#x} class_def_idx={} type_idx={}",
+            class_name, image.base, class_def_idx, class_idx
+        ));
+    } else if let Some(image) = seed_image.as_ref() {
+        output_verbose(&format!(
+            "[dex resolver] raw clone framework class mirror seed unavailable for {}: class_def unavailable in dex {:#x}; trying self-described boot ClassTable",
+            class_name, image.base
+        ));
+    } else {
+        output_verbose(&format!(
+            "[dex resolver] raw clone framework class mirror seed unavailable for {}; trying self-described boot ClassTable",
             class_name
         ));
-        return None;
-    };
+    }
 
-    let Some((class_def_idx, class_idx)) = image.class_def_and_type_idx_by_descriptor(&descriptor) else {
-        remember_raw_class_mirror_scan_miss(class_name);
+    if let Some(mirror) = scan_boot_class_table_for_descriptor(&descriptor, seed) {
         output_verbose(&format!(
-            "[dex resolver] raw clone framework class mirror scan miss for {}: class_def unavailable in dex {:#x}",
-            class_name, image.base
+            "[dex resolver] raw clone boot image class table hit {} -> {:#x}",
+            class_name, mirror
+        ));
+        return Some(mirror);
+    }
+
+    let Some((image, class_def_idx, class_idx)) = seed else {
+        remember_raw_class_mirror_scan_miss(class_name);
+        set_dex_resolver_failure(format!(
+            "[dex resolver] raw clone framework class mirror scan miss for {}: boot class table miss and no dex/index seed",
+            class_name
         ));
         return None;
     };
@@ -349,65 +1145,89 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
     if regions.is_empty() {
         remember_raw_class_mirror_scan_miss(class_name);
         output_verbose(&format!(
-            "[dex resolver] raw clone framework class mirror scan miss for {}: no boot class regions",
+            "[dex resolver] raw clone framework class mirror scan miss for {}: boot class table miss and no object regions",
             class_name
         ));
         return None;
     }
+
     output_verbose(&format!(
-        "[dex resolver] raw clone framework class mirror scan {}: dex={:#x} class_def_idx={} type_idx={} regions={}",
+        "[dex resolver] raw clone boot class table miss for {}; falling back to bounded object scan regions={}",
         class_name,
-        image.base,
-        class_def_idx,
-        class_idx,
         regions.len()
     ));
 
-    const MAX_CANDIDATES: usize = 2;
+    const MAX_CANDIDATES: usize = 4;
 
     let mut candidates = Vec::new();
     let mut checked = 0usize;
-    'outer: for region in &regions {
-        let mut field_addr = region.start;
-        while field_addr + 8 <= region.end {
-            checked += 1;
-            if (checked & 0xfff) == 0 && started.elapsed() >= SCAN_BUDGET {
-                output_verbose(&format!(
-                    "[dex resolver] raw clone class mirror scan timeout for {} after {} words",
-                    class_name, checked
-                ));
-                break 'outer;
-            }
+    let mut hit_mode = None;
+    for mode in [ClassMirrorSeedMode::AdjacentIndices, ClassMirrorSeedMode::LooseIndex] {
+        let before = candidates.len();
+        'outer: for region in &regions {
+            let mut field_addr = region.start;
+            while field_addr + 8 <= region.end {
+                checked += 1;
+                if (checked & 0xfff) == 0 && started.elapsed() >= SCAN_BUDGET {
+                    output_verbose(&format!(
+                        "[dex resolver] raw clone class mirror scan timeout for {} after {} words",
+                        class_name, checked
+                    ));
+                    break 'outer;
+                }
 
-            let candidate_class_def = unsafe { std::ptr::read_unaligned(field_addr as *const u32) };
-            if candidate_class_def == class_def_idx {
-                let candidate_type = unsafe { std::ptr::read_unaligned((field_addr + 4) as *const u32) };
-                if candidate_type == class_idx {
-                    for object_offset in (0..0x100u64).step_by(4) {
-                        let Some(class_obj) = field_addr.checked_sub(object_offset) else {
-                            continue;
-                        };
-                        if (class_obj & 0x7) != 0 || class_obj < region.start || class_obj + 0x40 > region.end {
-                            continue;
-                        }
-                        if class_mirror_candidate_matches(class_obj, &image, class_def_idx, class_idx) {
-                            candidates.push(class_obj);
-                            if candidates.len() >= MAX_CANDIDATES {
-                                break 'outer;
-                            }
+                if !class_mirror_seed_matches(field_addr, class_def_idx, class_idx, mode) {
+                    field_addr += 4;
+                    continue;
+                }
+
+                for object_offset in (0..0x100u64).step_by(4) {
+                    let Some(class_obj) = field_addr.checked_sub(object_offset) else {
+                        continue;
+                    };
+                    if (class_obj & 0x7) != 0 || class_obj < region.start || class_obj + 0x40 > region.end {
+                        continue;
+                    }
+                    if candidates.contains(&class_obj) {
+                        continue;
+                    }
+                    if class_mirror_candidate_matches(class_obj, &descriptor, Some((image, class_def_idx, class_idx))) {
+                        candidates.push(class_obj);
+                        if candidates.len() >= MAX_CANDIDATES {
+                            break 'outer;
                         }
                     }
                 }
+
+                field_addr += 4;
             }
-            field_addr += 4;
+        }
+
+        if candidates.len() != before {
+            hit_mode = Some(mode);
+            break;
+        }
+        if mode == ClassMirrorSeedMode::AdjacentIndices {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework class mirror adjacent-index seed miss for {}; trying loose-index scan",
+                class_name
+            ));
         }
     }
 
     match candidates.as_slice() {
-        [one] => Some(*one),
+        [one] => {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework class mirror scan hit {} mode={:?} -> {:#x}",
+                class_name,
+                hit_mode.unwrap_or(ClassMirrorSeedMode::LooseIndex),
+                one
+            ));
+            Some(*one)
+        }
         [] => {
             remember_raw_class_mirror_scan_miss(class_name);
-            output_verbose(&format!(
+            set_dex_resolver_failure(format!(
                 "[dex resolver] raw clone framework class mirror scan miss for {} (checked {} words)",
                 class_name, checked
             ));
@@ -415,13 +1235,25 @@ fn scan_framework_class_mirror_for_name(class_name: &str) -> Option<u64> {
         }
         many => {
             output_verbose(&format!(
-                "[dex resolver] raw clone framework class mirror scan ambiguous for {}: {} candidates, using first {:#x}",
+                "[dex resolver] raw clone framework class mirror scan ambiguous for {} mode={:?}: {} candidates, using first {:#x}",
                 class_name,
+                hit_mode.unwrap_or(ClassMirrorSeedMode::LooseIndex),
                 many.len(),
                 many[0]
             ));
             Some(many[0])
         }
+    }
+}
+
+fn class_mirror_seed_matches(field_addr: u64, class_def_idx: u32, type_idx: u32, mode: ClassMirrorSeedMode) -> bool {
+    let first = unsafe { std::ptr::read_unaligned(field_addr as *const u32) };
+    match mode {
+        ClassMirrorSeedMode::AdjacentIndices => {
+            let second = unsafe { std::ptr::read_unaligned((field_addr + 4) as *const u32) };
+            (first == class_def_idx && second == type_idx) || (first == type_idx && second == class_def_idx)
+        }
+        ClassMirrorSeedMode::LooseIndex => first == class_def_idx || first == type_idx,
     }
 }
 
@@ -434,25 +1266,28 @@ fn find_framework_dex_image_for_descriptor(
         return None;
     }
 
+    if let Some(image) = find_framework_vdex_image_for_descriptor(descriptor, started, budget) {
+        return Some(image);
+    }
+
     let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
         return None;
     };
 
-    let mut map_entries: Vec<(u8, u64, u64, &str)> = Vec::new();
+    let mut map_entries: Vec<(u8, u64, u64, u64, &str)> = Vec::new();
     for line in maps.lines() {
-        let Some((start, end, perms, path)) = parse_maps_line_for_class_scan(line) else {
+        let Some((start, end, perms, file_offset, path)) = parse_maps_line_for_class_scan(line) else {
             continue;
         };
         if !perms.starts_with('r') || end <= start || !is_framework_dex_region_name(path) {
             continue;
         }
-        map_entries.push((framework_dex_region_priority(path, descriptor), start, end, path));
+        map_entries.push((framework_dex_region_priority(path, descriptor), file_offset, start, end, path));
     }
-    map_entries.sort_by_key(|(priority, start, _, _)| (*priority, *start));
+    map_entries.sort_by_key(|(priority, file_offset, start, _, _)| (*priority, *file_offset, *start));
 
     let mut checked_candidates = 0usize;
-    const DEX_SCAN_WINDOW: u64 = 256 * 1024;
-    for (_priority, start, end, _path) in map_entries {
+    for (_priority, file_offset, start, end, path) in &map_entries {
         if started.elapsed() >= budget {
             output_verbose(&format!(
                 "[dex resolver] raw clone framework dex image scan timeout for {} after {} candidates",
@@ -460,58 +1295,509 @@ fn find_framework_dex_image_for_descriptor(
             ));
             return None;
         }
-        let mut addr = start;
-        let scan_end = end.min(start.saturating_add(DEX_SCAN_WINDOW));
-        while addr + DEX_HEADER_SIZE as u64 <= scan_end {
-            if started.elapsed() >= budget {
-                output_verbose(&format!(
-                    "[dex resolver] raw clone framework dex image scan timeout for {} after {} candidates",
-                    descriptor, checked_candidates
-                ));
-                return None;
-            }
 
-            let word = if super::safe_mem::is_readable(addr, 4) {
-                unsafe { super::safe_mem::safe_read_u32(addr) }
-            } else {
-                0
-            };
-            if word == u32::from_le_bytes(*DEX_MAGIC_DEX) {
-                checked_candidates += 1;
-                if let Some(image) = DexImage::from_base(addr) {
-                    if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
-                        output_verbose(&format!(
-                            "[dex resolver] raw clone framework dex image hit {} -> base={:#x}",
-                            descriptor, image.base
-                        ));
-                        return Some(image);
-                    }
-                    break;
-                }
-            } else if word == u32::from_le_bytes(*DEX_MAGIC_CDEX) {
-                checked_candidates += 1;
-                output_verbose(&format!(
-                    "[dex resolver] raw clone framework dex image candidate {} -> compact dex at {:#x}; cdex parsing not implemented yet",
-                    descriptor, addr
-                ));
-                break;
-            }
+        if let Some(image) = find_framework_dex_image_by_magic_in_mapping(
+            *start,
+            *end,
+            path,
+            descriptor,
+            started,
+            budget,
+            &mut checked_candidates,
+        ) {
+            return Some(image);
+        }
 
-            addr += 4;
+        if *file_offset != 0 {
+            continue;
+        }
+
+        if let Some(image) = find_framework_dex_image_in_jar_mapping(
+            *start,
+            *end,
+            path,
+            descriptor,
+            started,
+            budget,
+            &mut checked_candidates,
+        ) {
+            return Some(image);
+        }
+    }
+
+    output_verbose(&format!(
+        "[dex resolver] raw clone framework structured dex sources miss for {}; trying bounded magic fallback",
+        descriptor
+    ));
+
+    for (_priority, _file_offset, start, end, path) in &map_entries {
+        if let Some(image) = find_framework_dex_image_by_magic_in_mapping(
+            *start,
+            *end,
+            path,
+            descriptor,
+            started,
+            budget,
+            &mut checked_candidates,
+        ) {
+            return Some(image);
         }
     }
 
     None
 }
 
+fn find_framework_dex_image_by_magic_in_mapping(
+    start: u64,
+    end: u64,
+    path: &str,
+    descriptor: &str,
+    started: std::time::Instant,
+    budget: std::time::Duration,
+    checked_candidates: &mut usize,
+) -> Option<DexImage> {
+    const DEX_SCAN_WINDOW: u64 = 256 * 1024;
+
+    let mut addr = start;
+    let scan_end = end.min(start.saturating_add(DEX_SCAN_WINDOW));
+    while addr + DEX_HEADER_SIZE as u64 <= scan_end {
+        if started.elapsed() >= budget {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework dex image scan timeout for {} after {} candidates",
+                descriptor, checked_candidates
+            ));
+            return None;
+        }
+
+        let word = if super::safe_mem::is_readable(addr, 4) {
+            unsafe { super::safe_mem::safe_read_u32(addr) }
+        } else {
+            0
+        };
+        if word == u32::from_le_bytes(*DEX_MAGIC_DEX) || word == u32::from_le_bytes(*DEX_MAGIC_CDEX) {
+            *checked_candidates += 1;
+            if let Some(image) = DexImage::from_base(addr) {
+                if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
+                    output_verbose(&format!(
+                        "[dex resolver] raw clone framework dex magic fallback hit {} -> base={:#x} path={}",
+                        descriptor, image.base, path
+                    ));
+                    return Some(image);
+                }
+                addr = align_up_u64(image.base + image.size.max(4) as u64, 4);
+                continue;
+            }
+        }
+
+        addr += 1;
+    }
+
+    None
+}
+
+fn find_framework_dex_image_in_jar_mapping(
+    start: u64,
+    end: u64,
+    path: &str,
+    descriptor: &str,
+    started: std::time::Instant,
+    budget: std::time::Duration,
+    checked_candidates: &mut usize,
+) -> Option<DexImage> {
+    const ZIP_END_OF_CENTRAL_DIRECTORY_MAGIC: u32 = 0x0605_4b50;
+    const ZIP_CENTRAL_DIRECTORY_FILE_HEADER_MAGIC: u32 = 0x0201_4b50;
+    const ZIP_LOCAL_FILE_HEADER_MAGIC: u32 = 0x0403_4b50;
+    const ZIP_END_OF_CENTRAL_DIRECTORY_SIZE: u64 = 22;
+    const ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIZE: u64 = 46;
+    const ZIP_LOCAL_FILE_HEADER_SIZE: u64 = 30;
+    const ZIP_FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+    const MAX_ZIP_ENTRIES: usize = 4096;
+    const MAX_ZIP_SCAN_BYTES: u64 = 96 * 1024 * 1024;
+
+    if end <= start + ZIP_END_OF_CENTRAL_DIRECTORY_SIZE {
+        return None;
+    }
+
+    let eocd_scan_start = end.saturating_sub(start).saturating_sub(66 * 1024);
+    let mut eocd = None;
+    let mut cursor = end.saturating_sub(ZIP_END_OF_CENTRAL_DIRECTORY_SIZE);
+    while cursor >= start + eocd_scan_start {
+        if read_u32(cursor) == Some(ZIP_END_OF_CENTRAL_DIRECTORY_MAGIC) {
+            eocd = Some(cursor);
+            break;
+        }
+        if cursor == start {
+            break;
+        }
+        cursor -= 1;
+    }
+
+    if let Some(eocd) = eocd {
+        let entry_count = read_u16(eocd + 10)? as usize;
+        let central_directory_size = read_u32(eocd + 12)? as u64;
+        let central_directory_off = read_u32(eocd + 16)? as u64;
+        if entry_count != 0
+            && entry_count <= MAX_ZIP_ENTRIES
+            && central_directory_size != u32::MAX as u64
+            && central_directory_off != u32::MAX as u64
+        {
+            let mut entry = start.checked_add(central_directory_off)?;
+            let central_directory_end = entry.checked_add(central_directory_size)?;
+            let mut index = 0usize;
+            while index < entry_count && entry + ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIZE <= central_directory_end {
+                if started.elapsed() >= budget {
+                    output_verbose(&format!(
+                        "[dex resolver] raw clone framework jar dex scan timeout for {} after {} candidates",
+                        descriptor, checked_candidates
+                    ));
+                    return None;
+                }
+                if entry + ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIZE > end
+                    || read_u32(entry) != Some(ZIP_CENTRAL_DIRECTORY_FILE_HEADER_MAGIC)
+                {
+                    break;
+                }
+
+                let compression_method = read_u16(entry + 10)?;
+                let file_name_len = read_u16(entry + 28)? as u64;
+                let extra_len = read_u16(entry + 30)? as u64;
+                let comment_len = read_u16(entry + 32)? as u64;
+                let local_header_off = read_u32(entry + 42)? as u64;
+                if file_name_len == 0 || file_name_len > 4096 {
+                    break;
+                }
+                let name_start = entry.checked_add(ZIP_CENTRAL_DIRECTORY_FILE_HEADER_SIZE)?;
+                if name_start + file_name_len > end || !super::safe_mem::is_readable(name_start, file_name_len as usize)
+                {
+                    break;
+                }
+
+                let file_name =
+                    unsafe { std::slice::from_raw_parts(name_start as *const u8, file_name_len as usize) };
+                if file_name.ends_with(b".dex") && compression_method == 0 {
+                    let local_header = start.checked_add(local_header_off)?;
+                    if local_header + ZIP_LOCAL_FILE_HEADER_SIZE <= end
+                        && read_u32(local_header) == Some(ZIP_LOCAL_FILE_HEADER_MAGIC)
+                    {
+                        let local_name_len = read_u16(local_header + 26)? as u64;
+                        let local_extra_len = read_u16(local_header + 28)? as u64;
+                        let data_start = local_header
+                            .checked_add(ZIP_LOCAL_FILE_HEADER_SIZE)?
+                            .checked_add(local_name_len)?
+                            .checked_add(local_extra_len)?;
+                        if data_start + DEX_HEADER_SIZE as u64 <= end {
+                            *checked_candidates += 1;
+                            if let Some(image) = DexImage::from_base(data_start) {
+                                if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
+                                    output_verbose(&format!(
+                                        "[dex resolver] raw clone framework jar dex image hit {} -> base={:#x} path={} entry={}",
+                                        descriptor,
+                                        image.base,
+                                        path,
+                                        String::from_utf8_lossy(file_name)
+                                    ));
+                                    return Some(image);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                entry = name_start
+                    .checked_add(file_name_len)?
+                    .checked_add(extra_len)?
+                    .checked_add(comment_len)?;
+                index += 1;
+            }
+        }
+    }
+
+    if read_u32(start) != Some(ZIP_LOCAL_FILE_HEADER_MAGIC) {
+        return None;
+    }
+
+    let mut cursor = start;
+    for _ in 0..MAX_ZIP_ENTRIES {
+        if started.elapsed() >= budget {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework jar dex scan timeout for {} after {} candidates",
+                descriptor, checked_candidates
+            ));
+            return None;
+        }
+        if cursor < start || cursor - start > MAX_ZIP_SCAN_BYTES || cursor + ZIP_LOCAL_FILE_HEADER_SIZE > end {
+            break;
+        }
+        if read_u32(cursor) != Some(ZIP_LOCAL_FILE_HEADER_MAGIC) {
+            break;
+        }
+
+        let flags = read_u16(cursor + 6)?;
+        let compression_method = read_u16(cursor + 8)?;
+        let compressed_size = read_u32(cursor + 18)? as u64;
+        let file_name_len = read_u16(cursor + 26)? as u64;
+        let extra_len = read_u16(cursor + 28)? as u64;
+        if file_name_len == 0 || file_name_len > 4096 {
+            break;
+        }
+
+        let name_start = cursor.checked_add(ZIP_LOCAL_FILE_HEADER_SIZE)?;
+        let data_start = name_start.checked_add(file_name_len)?.checked_add(extra_len)?;
+        if data_start > end || !super::safe_mem::is_readable(name_start, file_name_len as usize) {
+            break;
+        }
+
+        let file_name = unsafe { std::slice::from_raw_parts(name_start as *const u8, file_name_len as usize) };
+        let is_dex_entry = file_name.ends_with(b".dex");
+        if is_dex_entry && compression_method == 0 && data_start + DEX_HEADER_SIZE as u64 <= end {
+            *checked_candidates += 1;
+            if let Some(image) = DexImage::from_base(data_start) {
+                if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
+                    output_verbose(&format!(
+                        "[dex resolver] raw clone framework jar dex image hit {} -> base={:#x} path={} entry={}",
+                        descriptor,
+                        image.base,
+                        path,
+                        String::from_utf8_lossy(file_name)
+                    ));
+                    return Some(image);
+                }
+            }
+        }
+
+        if flags & ZIP_FLAG_DATA_DESCRIPTOR != 0 || compressed_size == u32::MAX as u64 {
+            break;
+        }
+        let next = data_start.checked_add(compressed_size)?;
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+
+    None
+}
+
+fn find_framework_vdex_image_for_descriptor(
+    descriptor: &str,
+    started: std::time::Instant,
+    budget: std::time::Duration,
+) -> Option<DexImage> {
+    let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
+        return None;
+    };
+
+    let mut map_entries: Vec<(u8, u64, u64, &str)> = Vec::new();
+    for line in maps.lines() {
+        let Some((start, end, perms, _file_offset, path)) = parse_maps_line_for_class_scan(line) else {
+            continue;
+        };
+        if !perms.starts_with('r') || end <= start || !is_framework_vdex_region_name(path) {
+            continue;
+        }
+        map_entries.push((framework_vdex_region_priority(path, descriptor), start, end, path));
+    }
+    map_entries.sort_by_key(|(priority, start, _, _)| (*priority, *start));
+
+    let mut checked = 0usize;
+    for (_priority, start, end, path) in map_entries {
+        if started.elapsed() >= budget {
+            output_verbose(&format!(
+                "[dex resolver] raw clone framework vdex scan timeout for {} after {} candidates",
+                descriptor, checked
+            ));
+            return None;
+        }
+
+        let Some(vdex) = VdexImage::from_mapping(start, end) else {
+            continue;
+        };
+        let version = String::from_utf8_lossy(&vdex.version).trim_end_matches('\0').to_string();
+        for image in vdex.dex_images() {
+            checked += 1;
+            if image.class_def_and_type_idx_by_descriptor(descriptor).is_some() {
+                output_verbose(&format!(
+                    "[dex resolver] raw clone framework vdex hit {} -> dex={:#x} kind={:?} vdex={:#x} version={} path={}",
+                    descriptor, image.base, image.kind, vdex.base, version, path
+                ));
+                return Some(image);
+            }
+        }
+    }
+
+    None
+}
+
+fn scan_boot_class_table_for_descriptor(descriptor: &str, seed: Option<(&DexImage, u32, u32)>) -> Option<u64> {
+    let descriptor_hash = modified_utf8_hash(descriptor);
+    let art_images = enumerate_boot_art_images();
+    if art_images.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    'images: for art_image in art_images.iter().filter(|img| !img.class_tables.is_empty()) {
+        for table in &art_image.class_tables {
+            let before = candidates.len();
+            scan_art_class_table_probe_candidates(table, descriptor_hash, descriptor, seed, &mut candidates);
+            if candidates.len() != before {
+                output_verbose(&format!(
+                    "[dex resolver] boot image class table hash probe hit {} section={}",
+                    descriptor, table.section_index
+                ));
+                output_verbose(&format!(
+                    "[dex resolver] boot image class table {} section={} entries={} buckets={} image={} sections_off={:#x} class_table={:#x}+{}",
+                    art_image.path,
+                    table.section_index,
+                    table.num_elements,
+                    table.num_buckets,
+                    art_image.image_size,
+                    art_image.header_sections_off,
+                    table.start,
+                    table.size
+                ));
+                break 'images;
+            }
+
+            for tag_filter in [Some(descriptor_hash & 0x7), None] {
+                let before = candidates.len();
+                scan_art_class_table_candidates(table, tag_filter, descriptor, seed, &mut candidates);
+                if candidates.len() != before {
+                    if tag_filter.is_none() {
+                        output_verbose(&format!(
+                            "[dex resolver] boot image class table tag fallback hit {} section={}",
+                            descriptor, table.section_index
+                        ));
+                    }
+                    break;
+                }
+            }
+            if !candidates.is_empty() {
+                output_verbose(&format!(
+                    "[dex resolver] boot image class table {} section={} entries={} buckets={} image={} sections_off={:#x} class_table={:#x}+{}",
+                    art_image.path,
+                    table.section_index,
+                    table.num_elements,
+                    table.num_buckets,
+                    art_image.image_size,
+                    art_image.header_sections_off,
+                    table.start,
+                    table.size
+                ));
+                break 'images;
+            }
+        }
+    }
+
+    match candidates.as_slice() {
+        [one] => Some(*one),
+        [] => None,
+        many => {
+            output_verbose(&format!(
+                "[dex resolver] boot image class table ambiguous for {}: {} candidates, using first {:#x}",
+                descriptor,
+                many.len(),
+                many[0]
+            ));
+            Some(many[0])
+        }
+    }
+}
+
+fn scan_art_class_table_probe_candidates(
+    table: &ArtClassTable,
+    descriptor_hash: u32,
+    descriptor: &str,
+    seed: Option<(&DexImage, u32, u32)>,
+    candidates: &mut Vec<u64>,
+) {
+    if table.num_buckets == 0 {
+        return;
+    }
+
+    const MAX_LINEAR_PROBE: u64 = 1024;
+    let start = descriptor_hash as u64 % table.num_buckets;
+    let limit = table.num_buckets.min(MAX_LINEAR_PROBE);
+    for step in 0..limit {
+        let index = (start + step) % table.num_buckets;
+        let slot_addr = table.entries + index * 4;
+        let Some(slot) = read_u32(slot_addr) else {
+            break;
+        };
+        if slot == 0 {
+            break;
+        }
+        let class_obj = (slot & !0x7) as u64;
+        if class_obj < 0x1000 || candidates.contains(&class_obj) {
+            continue;
+        }
+        if class_mirror_candidate_matches(class_obj, descriptor, seed) {
+            candidates.push(class_obj);
+            break;
+        }
+    }
+}
+
+fn scan_art_class_table_candidates(
+    table: &ArtClassTable,
+    tag_filter: Option<u32>,
+    descriptor: &str,
+    seed: Option<(&DexImage, u32, u32)>,
+    candidates: &mut Vec<u64>,
+) {
+    const MAX_VALIDATED_CANDIDATES: u64 = 256;
+    let mut seen_non_zero = 0u64;
+    let mut validated_candidates = 0u64;
+    for index in 0..table.num_buckets {
+        let slot_addr = table.entries + index * 4;
+        let Some(slot) = read_u32(slot_addr) else {
+            continue;
+        };
+        if slot == 0 {
+            continue;
+        }
+        seen_non_zero += 1;
+        if tag_filter.is_some_and(|tag| (slot & 0x7) != tag) {
+            continue;
+        }
+        validated_candidates += 1;
+        if validated_candidates > MAX_VALIDATED_CANDIDATES {
+            break;
+        }
+        let class_obj = (slot & !0x7) as u64;
+        if class_obj < 0x1000 || candidates.contains(&class_obj) {
+            continue;
+        }
+        if class_mirror_candidate_matches(class_obj, descriptor, seed) {
+            candidates.push(class_obj);
+            break;
+        }
+        if seen_non_zero > table.num_elements.saturating_mul(2).max(4096) {
+            break;
+        }
+    }
+}
+
 fn enumerate_framework_class_regions() -> Vec<ClassMirrorScanRegion> {
+    let art_regions: Vec<ClassMirrorScanRegion> = enumerate_boot_art_images()
+        .into_iter()
+        .filter_map(|image| image.object_region())
+        .collect();
+    if !art_regions.is_empty() {
+        output_verbose(&format!(
+            "[dex resolver] boot image object sections available: {} regions",
+            art_regions.len()
+        ));
+        return art_regions;
+    }
+
     let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
         return Vec::new();
     };
 
     let mut regions = Vec::new();
     for line in maps.lines() {
-        let Some((start, end, perms, path)) = parse_maps_line_for_class_scan(line) else {
+        let Some((start, end, perms, _file_offset, path)) = parse_maps_line_for_class_scan(line) else {
             continue;
         };
         if !perms.starts_with('r') || end <= start {
@@ -526,7 +1812,47 @@ fn enumerate_framework_class_regions() -> Vec<ClassMirrorScanRegion> {
     regions
 }
 
-fn parse_maps_line_for_class_scan(line: &str) -> Option<(u64, u64, &str, &str)> {
+fn enumerate_boot_art_images() -> Vec<ArtImage> {
+    let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+    for line in maps.lines() {
+        let Some((start, end, perms, _file_offset, path)) = parse_maps_line_for_class_scan(line) else {
+            continue;
+        };
+        if !perms.starts_with('r') || end <= start || !is_framework_art_region_name(path) {
+            continue;
+        }
+        if let Some(image) = ArtImage::from_mapping(start, end, path) {
+            images.push((framework_art_region_priority(path), image));
+        }
+    }
+    images.sort_by_key(|(priority, image)| (*priority, image.base));
+    images.into_iter().map(|(_, image)| image).collect()
+}
+
+#[allow(dead_code)]
+fn enumerate_framework_oat_images() -> Vec<OatImage> {
+    let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+    for line in maps.lines() {
+        let Some((start, end, perms, _file_offset, path)) = parse_maps_line_for_class_scan(line) else {
+            continue;
+        };
+        if !perms.starts_with('r') || end <= start || !is_framework_oat_region_name(path) {
+            continue;
+        }
+        if let Some(image) = OatImage::from_mapping(start, end) {
+            images.push(image);
+        }
+    }
+    images
+}
+
+fn parse_maps_line_for_class_scan(line: &str) -> Option<(u64, u64, &str, u64, &str)> {
     let mut rest = line.trim_start();
     let sp1 = rest.find(' ')?;
     let range = &rest[..sp1];
@@ -535,6 +1861,7 @@ fn parse_maps_line_for_class_scan(line: &str) -> Option<(u64, u64, &str, &str)> 
     let perms = &rest[..sp2];
     rest = rest[sp2..].trim_start();
     let sp3 = rest.find(' ')?;
+    let file_offset = u64::from_str_radix(&rest[..sp3], 16).ok()?;
     rest = rest[sp3..].trim_start();
     let sp4 = rest.find(' ')?;
     rest = rest[sp4..].trim_start();
@@ -545,38 +1872,87 @@ fn parse_maps_line_for_class_scan(line: &str) -> Option<(u64, u64, &str, &str)> 
     let mut parts = range.splitn(2, '-');
     let start = u64::from_str_radix(parts.next()?, 16).ok()?;
     let end = u64::from_str_radix(parts.next()?, 16).ok()?;
-    Some((start, end, perms, path))
+    Some((start, end, perms, file_offset, path))
 }
 
 fn is_framework_class_region_name(path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
+    if is_framework_art_region_name(path) {
+        return true;
+    }
+    let path = normalized_framework_map_path(path);
     path.starts_with("[anon:dalvik-/system/framework/")
         || path.starts_with("[anon:dalvik-/apex/")
         || path.starts_with("[anon:dalvik-/system_ext/framework/")
         || path.starts_with("[anon:dalvik-/product/framework/")
         || path.starts_with("[anon:dalvik-/vendor/framework/")
-        || ((path.starts_with("/data/dalvik-cache/") || path.starts_with("/data/misc/apexdata/"))
-            && path.ends_with(".art"))
 }
 
 fn framework_class_region_priority(path: &str) -> u8 {
-    if path.contains("boot-framework.art") {
+    framework_art_region_priority(path)
+}
+
+fn is_framework_art_region_name(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let path = normalized_framework_map_path(path);
+    path.contains(".art") && is_framework_runtime_image_path(path)
+}
+
+fn framework_art_region_priority(path: &str) -> u8 {
+    let path = normalized_framework_map_path(path);
+    if path.ends_with("/boot-framework.art") {
         0
-    } else if path.contains("boot.art") {
+    } else if path.ends_with("/boot.art") {
         1
-    } else if path.contains("boot-core-libart.art") {
+    } else if path.ends_with("/boot-core-libart.art") {
         2
     } else {
         3
     }
 }
 
+fn is_framework_vdex_region_name(path: &str) -> bool {
+    let path = normalized_framework_map_path(path);
+    if path.is_empty() || !path.contains(".vdex") {
+        return false;
+    }
+    is_framework_runtime_image_path(path)
+}
+
+fn framework_vdex_region_priority(path: &str, descriptor: &str) -> u8 {
+    let path = normalized_framework_map_path(path);
+    if descriptor.starts_with("Landroid/") && path.contains("boot-framework.vdex") {
+        0
+    } else if (descriptor.starts_with("Ljava/") || descriptor.starts_with("Ljavax/"))
+        && (path.contains("boot-core-oj.vdex") || path.contains("boot.vdex"))
+    {
+        0
+    } else if path.contains("boot-framework.vdex") {
+        1
+    } else if path.contains("boot-core-oj.vdex") || path.contains("boot.vdex") {
+        2
+    } else {
+        3
+    }
+}
+
+fn is_framework_oat_region_name(path: &str) -> bool {
+    let path = normalized_framework_map_path(path);
+    if path.is_empty() || !(path.contains(".oat") || path.contains(".odex") || path.ends_with(".art")) {
+        return false;
+    }
+    is_framework_runtime_image_path(path)
+}
+
 fn is_framework_dex_region_name(path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
+    let path = normalized_framework_map_path(path);
     if !path.ends_with(".jar") {
         return false;
     }
@@ -588,6 +1964,7 @@ fn is_framework_dex_region_name(path: &str) -> bool {
 }
 
 fn framework_dex_region_priority(path: &str, descriptor: &str) -> u8 {
+    let path = normalized_framework_map_path(path);
     if descriptor.starts_with("Landroid/") && path.ends_with("/framework.jar") {
         0
     } else if (descriptor.starts_with("Ljava/") || descriptor.starts_with("Ljavax/")) && path.ends_with("/core-oj.jar") {
@@ -601,18 +1978,63 @@ fn framework_dex_region_priority(path: &str, descriptor: &str) -> u8 {
     }
 }
 
-fn class_mirror_candidate_matches(class_obj: u64, image: &DexImage, class_def_idx: u32, class_idx: u32) -> bool {
+fn normalized_framework_map_path(path: &str) -> &str {
+    let path = path.trim_end();
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    path.strip_suffix(']').unwrap_or(path)
+}
+
+fn is_framework_runtime_image_path(path: &str) -> bool {
+    path.starts_with("[anon:dalvik-/system/framework/")
+        || path.starts_with("[anon:dalvik-/apex/")
+        || path.starts_with("[anon:dalvik-/system_ext/framework/")
+        || path.starts_with("[anon:dalvik-/product/framework/")
+        || path.starts_with("[anon:dalvik-/vendor/framework/")
+        || path.contains("/system/framework/")
+        || path.contains("/system_ext/framework/")
+        || path.contains("/product/framework/")
+        || path.contains("/vendor/framework/")
+        || path.contains("/apex/")
+        || path.contains("/data/dalvik-cache/")
+        || path.contains("/data/misc/apexdata/")
+}
+
+fn class_mirror_candidate_matches(
+    class_obj: u64,
+    descriptor: &str,
+    seed: Option<(&DexImage, u32, u32)>,
+) -> bool {
     if class_obj < 0x1000 || !super::safe_mem::is_readable(class_obj, 0x40) {
         return false;
     }
 
-    let Some(candidate_image) = dex_image_from_class_with_logging(class_obj, false) else {
+    if let Some(candidate_image) = dex_image_from_class_with_logging(class_obj, false) {
+        if candidate_image.class_object_matches_descriptor(class_obj, descriptor) {
+            let seed_base = seed.map(|(image, _, _)| image.base);
+            output_verbose(&format!(
+                "[dex resolver] Class {:#x} validated by own DexFile base={:#x} kind={:?}{}",
+                class_obj,
+                candidate_image.base,
+                candidate_image.kind,
+                seed_base.map_or_else(String::new, |base| format!("; seed dex={:#x}", base))
+            ));
+            remember_class_mirror_dex_image(class_obj, &candidate_image);
+            return true;
+        }
+
+        if seed.is_some_and(|(image, _, _)| candidate_image.base == image.base) {
+            return false;
+        }
+    }
+
+    let Some((image, class_def_idx, class_idx)) = seed else {
         return false;
     };
-    if candidate_image.base != image.base {
+    if !image.class_object_matches_descriptor_by_indices(class_obj, class_def_idx, class_idx) {
         return false;
     }
-    image.class_object_matches_descriptor_by_indices(class_obj, class_def_idx, class_idx)
+    remember_class_mirror_dex_image(class_obj, image);
+    true
 }
 
 fn resolve_super_class_mirror(class_obj: u64, expected_descriptor: &str) -> Option<u64> {
@@ -1297,6 +2719,15 @@ fn dex_image_from_class_with_logging(class_obj: u64, log: bool) -> Option<DexIma
             return Some(image);
         }
     }
+    if let Some(image) = cached_dex_image_for_class(class_obj) {
+        if log {
+            output_verbose(&format!(
+                "[dex resolver] Class {:#x} -> cached framework DexImage base={:#x}",
+                class_obj, image.base
+            ));
+        }
+        return Some(image);
+    }
     None
 }
 
@@ -1347,11 +2778,14 @@ unsafe fn dex_image_from_dex_file_with_logging(dex_file: u64, log: bool) -> Opti
                 return Some(image);
             }
         } else if magic == DEX_MAGIC_CDEX {
-            if log {
-                output_verbose(&format!(
-                    "[dex resolver] DexFile+{:#x} Begin={:#x} is compact dex; cdex parsing not implemented yet",
-                    begin_off, begin
-                ));
+            if let Some(image) = DexImage::from_base(begin) {
+                if log {
+                    output_verbose(&format!(
+                        "[dex resolver] DexFile+{:#x} Begin={:#x} compact dex",
+                        begin_off, begin
+                    ));
+                }
+                return Some(image);
             }
         }
     }
@@ -1375,10 +2809,19 @@ impl DexImage {
         if !super::safe_mem::is_readable(base, DEX_HEADER_SIZE) {
             return None;
         }
+        let magic = unsafe { std::slice::from_raw_parts(base as *const u8, 4) };
+        let kind = if magic == DEX_MAGIC_DEX {
+            DexImageKind::Standard
+        } else if magic == DEX_MAGIC_CDEX {
+            DexImageKind::Compact
+        } else {
+            return None;
+        };
+
         let file_size = read_u32(base + 0x20)? as usize;
         let header_size = read_u32(base + 0x24)? as usize;
         let endian_tag = read_u32(base + 0x28)?;
-        if header_size != DEX_HEADER_SIZE || endian_tag != 0x1234_5678 {
+        if endian_tag != 0x1234_5678 {
             return None;
         }
         if !(DEX_HEADER_SIZE..=(512 << 20)).contains(&file_size) {
@@ -1388,7 +2831,34 @@ impl DexImage {
             return None;
         }
 
-        let image = DexImage { base, size: file_size };
+        let (data_base, data_size) = match kind {
+            DexImageKind::Standard => {
+                if header_size != DEX_HEADER_SIZE && header_size != DEX_V41_HEADER_SIZE {
+                    return None;
+                }
+                (base, file_size)
+            }
+            DexImageKind::Compact => {
+                let data_size = read_u32(base + 0x68)? as usize;
+                let data_off = read_u32(base + 0x6c)? as usize;
+                if data_size == 0 || data_size > (512 << 20) || data_off > (1024 << 20) {
+                    return None;
+                }
+                let data_base = base.checked_add(data_off as u64)?;
+                if !super::safe_mem::is_readable(data_base, data_size.min(DEX_HEADER_SIZE)) {
+                    return None;
+                }
+                (data_base, data_size)
+            }
+        };
+
+        let image = DexImage {
+            base,
+            size: file_size,
+            data_base,
+            data_size,
+            kind,
+        };
         if image.validate_header() {
             Some(image)
         } else {
@@ -1832,28 +3302,28 @@ impl DexImage {
     }
 
     fn class_data_declared_methods(&self, class_data_off: usize) -> Option<Vec<MethodInfo>> {
-        if class_data_off >= self.size {
+        if class_data_off >= self.data_size {
             return None;
         }
 
-        let mut cursor = self.base + class_data_off as u64;
-        let static_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let instance_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let direct_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let virtual_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
+        let mut cursor = self.data_base + class_data_off as u64;
+        let static_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let instance_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let direct_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let virtual_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
 
         for _ in 0..static_fields_size + instance_fields_size {
-            let _field_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
+            let _field_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
         }
 
         let mut out = Vec::with_capacity((direct_methods_size + virtual_methods_size) as usize);
         let mut direct_idx = 0u32;
         for _ in 0..direct_methods_size {
-            let method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             direct_idx = direct_idx.checked_add(method_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             if let Some(method) = self.method_info(direct_idx, access_flags) {
                 out.push(method);
             }
@@ -1861,10 +3331,10 @@ impl DexImage {
 
         let mut virtual_idx = 0u32;
         for _ in 0..virtual_methods_size {
-            let method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             virtual_idx = virtual_idx.checked_add(method_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             if let Some(method) = self.method_info(virtual_idx, access_flags) {
                 out.push(method);
             }
@@ -1874,37 +3344,37 @@ impl DexImage {
     }
 
     fn class_data_declared_method_indices(&self, class_data_off: usize) -> Option<Vec<(u32, u32)>> {
-        if class_data_off >= self.size {
+        if class_data_off >= self.data_size {
             return None;
         }
 
-        let mut cursor = self.base + class_data_off as u64;
-        let static_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let instance_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let direct_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let virtual_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
+        let mut cursor = self.data_base + class_data_off as u64;
+        let static_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let instance_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let direct_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let virtual_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
 
         for _ in 0..static_fields_size + instance_fields_size {
-            let _field_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
+            let _field_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
         }
 
         let mut out = Vec::with_capacity((direct_methods_size + virtual_methods_size) as usize);
         let mut direct_idx = 0u32;
         for _ in 0..direct_methods_size {
-            let method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             direct_idx = direct_idx.checked_add(method_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             out.push((direct_idx, access_flags));
         }
 
         let mut virtual_idx = 0u32;
         for _ in 0..virtual_methods_size {
-            let method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             virtual_idx = virtual_idx.checked_add(method_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             out.push((virtual_idx, access_flags));
         }
 
@@ -1912,22 +3382,22 @@ impl DexImage {
     }
 
     fn class_data_declared_fields(&self, class_data_off: usize) -> Option<Vec<DexDeclaredField>> {
-        if class_data_off >= self.size {
+        if class_data_off >= self.data_size {
             return None;
         }
 
-        let mut cursor = self.base + class_data_off as u64;
-        let static_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let instance_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let direct_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let virtual_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
+        let mut cursor = self.data_base + class_data_off as u64;
+        let static_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let instance_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let direct_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let virtual_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
 
         let mut out = Vec::with_capacity((static_fields_size + instance_fields_size) as usize);
         let mut static_idx = 0u32;
         for _ in 0..static_fields_size {
-            let field_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let field_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             static_idx = static_idx.checked_add(field_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)? | K_ACC_STATIC;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)? | K_ACC_STATIC;
             if let Some(field) = self.field_info(static_idx, access_flags) {
                 out.push(field);
             }
@@ -1935,18 +3405,18 @@ impl DexImage {
 
         let mut instance_idx = 0u32;
         for _ in 0..instance_fields_size {
-            let field_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let field_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             instance_idx = instance_idx.checked_add(field_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             if let Some(field) = self.field_info(instance_idx, access_flags & !K_ACC_STATIC) {
                 out.push(field);
             }
         }
 
         for _ in 0..direct_methods_size + virtual_methods_size {
-            let _method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let _method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
         }
 
         Some(out)
@@ -1997,27 +3467,27 @@ impl DexImage {
     }
 
     fn class_data_method_access_flags(&self, class_data_off: usize, dex_method_index: u32) -> Option<u32> {
-        if class_data_off >= self.size {
+        if class_data_off >= self.data_size {
             return None;
         }
 
-        let mut cursor = self.base + class_data_off as u64;
-        let static_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let instance_fields_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let direct_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
-        let virtual_methods_size = read_uleb128(self.base, self.size, &mut cursor)?;
+        let mut cursor = self.data_base + class_data_off as u64;
+        let static_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let instance_fields_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let direct_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+        let virtual_methods_size = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
 
         for _ in 0..static_fields_size + instance_fields_size {
-            let _field_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
+            let _field_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
         }
 
         let mut method_idx = 0u32;
         for _ in 0..direct_methods_size + virtual_methods_size {
-            let method_idx_diff = read_uleb128(self.base, self.size, &mut cursor)?;
+            let method_idx_diff = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             method_idx = method_idx.checked_add(method_idx_diff)?;
-            let access_flags = read_uleb128(self.base, self.size, &mut cursor)?;
-            let _code_off = read_uleb128(self.base, self.size, &mut cursor)?;
+            let access_flags = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
+            let _code_off = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
             if method_idx == dex_method_index {
                 return Some(access_flags);
             }
@@ -2038,16 +3508,16 @@ impl DexImage {
 
         let mut out = String::from("(");
         if parameters_off != 0 {
-            if parameters_off as usize + 4 > self.size {
+            if parameters_off as usize + 4 > self.data_size {
                 return None;
             }
-            let size = self.read_u32(parameters_off as u64)?;
+            let size = self.read_data_u32(parameters_off as u64)?;
             let list_bytes = 4usize.checked_add(size as usize * 2)?;
-            if parameters_off as usize + list_bytes > self.size {
+            if parameters_off as usize + list_bytes > self.data_size {
                 return None;
             }
             for i in 0..size {
-                let type_idx = self.read_u16(parameters_off as u64 + 4 + i as u64 * 2)?;
+                let type_idx = self.read_data_u16(parameters_off as u64 + 4 + i as u64 * 2)?;
                 out.push_str(&self.type_descriptor(type_idx as u32)?);
             }
         }
@@ -2073,15 +3543,15 @@ impl DexImage {
             return None;
         }
         let data_off = self.read_u32(string_ids_off as u64 + string_idx as u64 * 4)? as usize;
-        if data_off >= self.size {
+        if data_off >= self.data_size {
             return None;
         }
 
-        let mut cursor = self.base + data_off as u64;
-        let _utf16_len = read_uleb128(self.base, self.size, &mut cursor)?;
+        let mut cursor = self.data_base + data_off as u64;
+        let _utf16_len = read_uleb128(self.data_base, self.data_size, &mut cursor)?;
         let start = cursor;
         let mut end = start;
-        while (end - self.base) < self.size as u64 {
+        while (end - self.data_base) < self.data_size as u64 {
             let b = read_u8(end)?;
             if b == 0 {
                 let len = (end - start) as usize;
@@ -2108,6 +3578,20 @@ impl DexImage {
             return None;
         }
         read_u32(self.base + off)
+    }
+
+    fn read_data_u16(&self, off: u64) -> Option<u16> {
+        if off as usize + 2 > self.data_size {
+            return None;
+        }
+        read_u16(self.data_base + off)
+    }
+
+    fn read_data_u32(&self, off: u64) -> Option<u32> {
+        if off as usize + 4 > self.data_size {
+            return None;
+        }
+        read_u32(self.data_base + off)
     }
 }
 
@@ -2153,6 +3637,19 @@ fn read_u32(addr: u64) -> Option<u32> {
     Some(u32::from_le(unsafe {
         std::ptr::read_unaligned(addr as *const u32)
     }))
+}
+
+fn read_u64(addr: u64) -> Option<u64> {
+    if !super::safe_mem::is_readable(addr, 8) {
+        return None;
+    }
+    Some(u64::from_le(unsafe {
+        std::ptr::read_unaligned(addr as *const u64)
+    }))
+}
+
+fn read_f64(addr: u64) -> Option<f64> {
+    Some(f64::from_bits(read_u64(addr)?))
 }
 
 fn read_uleb128(base: u64, size: usize, cursor: &mut u64) -> Option<u32> {

@@ -60,9 +60,12 @@ pub(crate) fn resolve_art_method(
             return Ok(resolved);
         }
         if crate::is_raw_clone_js_thread() && !raw_clone_executor_jni_scope_active() {
+            let detail = last_dex_resolver_failure()
+                .map(|reason| format!("; last resolver failure: {}", reason))
+                .unwrap_or_default();
             return Err(format!(
-                "dex self-resolver failed on raw clone thread; refusing JNI GetMethodID fallback for {}.{}{}",
-                class_name, method_name, signature
+                "dex self-resolver failed on raw clone thread; refusing JNI GetMethodID fallback for {}.{}{}{}",
+                class_name, method_name, signature, detail
             ));
         }
         output_verbose(&format!(
