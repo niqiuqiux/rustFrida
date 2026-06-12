@@ -273,18 +273,18 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         )
     };
 
-    // Dispatch based on return type using CallNonvirtual*MethodA (avoids needing all Call*MethodA indices)
+    // Dispatch normal JS-side instance calls with virtual JNI calls, matching Java semantics.
+    // callOriginal/orig paths keep their nonvirtual handling in original_call.rs.
     let result = match return_type {
         b'V' => {
             type F = unsafe extern "C" fn(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             );
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_VOID_METHOD_A);
-            f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_VOID_METHOD_A);
+            f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -301,11 +301,10 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> u8;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A);
-            let ret = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_BOOLEAN_METHOD_A);
+            let ret = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -322,11 +321,10 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> i32;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_INT_METHOD_A);
-            let ret = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_INT_METHOD_A);
+            let ret = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -352,11 +350,10 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> i64;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_LONG_METHOD_A);
-            let ret = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_LONG_METHOD_A);
+            let ret = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -373,11 +370,10 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> f32;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A);
-            let ret = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_FLOAT_METHOD_A);
+            let ret = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -394,11 +390,10 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> f64;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A);
-            let ret = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_DOUBLE_METHOD_A);
+            let ret = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
@@ -411,16 +406,15 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             JSValue::float(ret).raw()
         }
         b'L' | b'[' => {
-            // Object/array return — use CallNonvirtualObjectMethodA, then wrap result.
+            // Object/array return — use virtual CallObjectMethodA, then wrap result.
             type F = unsafe extern "C" fn(
                 JniEnv,
                 *mut std::ffi::c_void,
                 *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
                 *const std::ffi::c_void,
             ) -> *mut std::ffi::c_void;
-            let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A);
-            let obj = f(env, local_obj, cls, mid, jargs_ptr);
+            let f: F = jni_fn!(env, F, JNI_CALL_OBJECT_METHOD_A);
+            let obj = f(env, local_obj, mid, jargs_ptr);
             if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 if !obj.is_null() {
                     delete_local_ref(env, obj);
