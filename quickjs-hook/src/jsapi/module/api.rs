@@ -467,7 +467,8 @@ unsafe extern "C" fn js_module_load(
         return crate::jsapi::callback_util::throw_internal_error(ctx, err_msg);
     }
 
-    // 从 /proc/self/maps 找刚加载的模块 (path 精确匹配优先, tagged memfd 再按 wwb_ 名称匹配)
+    // 从 /proc/self/maps 找刚加载的模块。tagged=true 时优先返回 memfd 映射，
+    // 避免原始 so 已加载时误返回同路径的旧模块。
     let modules = enumerate_modules_from_maps();
     if let Some(name) = memfd_name.as_deref() {
         for m in &modules {

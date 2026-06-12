@@ -93,7 +93,7 @@ struct ModuleMapEntry {
 impl ModuleMapEntry {
     fn from_proc_map_entry(entry: crate::jsapi::util::ProcMapEntry<'_>) -> Option<Self> {
         let path = entry.path?;
-        if path.starts_with('[') || !path.contains('/') {
+        if !is_proc_maps_module_path(path) {
             return None;
         }
 
@@ -343,9 +343,10 @@ impl AggregatedModuleRange {
 
 /// Parse file-backed VMAs from /proc/self/maps without merging gaps.
 fn parse_module_map_entries(maps: &str) -> Vec<ModuleMapEntry> {
-    crate::jsapi::util::proc_maps_entries(maps)
+    let entries: Vec<ModuleMapEntry> = crate::jsapi::util::proc_maps_entries(maps)
         .filter_map(ModuleMapEntry::from_proc_map_entry)
-        .collect()
+        .collect();
+    filter_non_shared_object_memfd_entries(entries)
 }
 
 fn read_module_map_entries() -> Vec<ModuleMapEntry> {
@@ -426,7 +427,21 @@ fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
 }
 
 pub(crate) fn is_address_in_loaded_module(addr: u64) -> bool {
-    find_module_by_address(addr).is_some()
+    if addr == 0 {
+        return false;
+    }
+
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let found = crate::jsapi::util::proc_maps_entries(&maps).any(|entry| {
+        entry.contains(addr)
+            && entry.path.is_some()
+            && entry.prot_flags() & libc::PROT_EXEC != 0
+    });
+    found
 }
 
 fn collect_module_ranges<'a>(entries: impl IntoIterator<Item = &'a ModuleMapEntry>) -> Vec<AggregatedModuleRange> {
@@ -445,8 +460,118 @@ fn collect_module_ranges<'a>(entries: impl IntoIterator<Item = &'a ModuleMapEntr
     modules
 }
 
+fn normalized_module_path(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
 fn module_basename(path: &str) -> &str {
+    let path = normalized_module_path(path);
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_memfd_path(path: &str) -> bool {
+    let path = normalized_module_path(path);
+    path.starts_with("/memfd:") || path.starts_with("memfd:")
+}
+
+fn is_proc_maps_module_path(path: &str) -> bool {
+    let path = normalized_module_path(path);
+    path.starts_with('/') && !path.starts_with('[')
+}
+
+fn is_symbol_scan_candidate_path(path: &str, base_address: u64) -> bool {
+    let path = normalized_module_path(path);
+    if !is_proc_maps_module_path(path) {
+        return false;
+    }
+    if is_memfd_path(path) {
+        return is_memory_elf_shared_object(base_address);
+    }
+
+    let basename = module_basename(path);
+    basename == "linker"
+        || basename == "linker64"
+        || basename.ends_with(".so")
+        || basename.contains(".so.")
+        || basename.contains(".so!")
+        || path.contains(".apk")
+}
+
+fn filter_non_shared_object_memfd_entries(entries: Vec<ModuleMapEntry>) -> Vec<ModuleMapEntry> {
+    let mut memfd_bases: HashMap<String, u64> = HashMap::new();
+    for entry in &entries {
+        if !is_memfd_path(&entry.path) {
+            continue;
+        }
+        memfd_bases
+            .entry(entry.path.clone())
+            .and_modify(|base| *base = (*base).min(entry.start))
+            .or_insert(entry.start);
+    }
+
+    if memfd_bases.is_empty() {
+        return entries;
+    }
+
+    let shared_object_memfds: HashSet<String> = memfd_bases
+        .iter()
+        .filter_map(|(path, &base)| is_memory_elf_shared_object(base).then_some(path.clone()))
+        .collect();
+
+    entries
+        .into_iter()
+        .filter(|entry| !is_memfd_path(&entry.path) || shared_object_memfds.contains(&entry.path))
+        .collect()
+}
+
+fn is_memory_elf_shared_object(base_address: u64) -> bool {
+    const MAX_MEMFD_ELF_PHDRS: usize = 1024;
+
+    if base_address == 0 || !is_addr_accessible(base_address, std::mem::size_of::<Elf64Ehdr>()) {
+        return false;
+    }
+
+    unsafe {
+        let ehdr = &*(base_address as *const Elf64Ehdr);
+        if ehdr.e_ident[0..4] != *b"\x7fELF" || ehdr.e_ident[4] != 2 || ehdr.e_type != ET_DYN {
+            return false;
+        }
+
+        let phnum = ehdr.e_phnum as usize;
+        let phentsize = ehdr.e_phentsize as usize;
+        if phnum == 0 || phnum > MAX_MEMFD_ELF_PHDRS || phentsize < std::mem::size_of::<Elf64Phdr>() {
+            return false;
+        }
+
+        let Some(phdr_base) = base_address.checked_add(ehdr.e_phoff) else {
+            return false;
+        };
+        let Some(phdr_bytes) = phnum.checked_mul(phentsize) else {
+            return false;
+        };
+        if !is_addr_accessible(phdr_base, phdr_bytes) {
+            return false;
+        }
+
+        let mut has_load = false;
+        let mut has_dynamic = false;
+        for idx in 0..phnum {
+            let Some(offset) = idx.checked_mul(phentsize) else {
+                return false;
+            };
+            let Some(phdr_addr) = phdr_base.checked_add(offset as u64) else {
+                return false;
+            };
+            let phdr = &*(phdr_addr as *const Elf64Phdr);
+            has_load |= phdr.p_type == PT_LOAD;
+            has_dynamic |= phdr.p_type == PT_DYNAMIC;
+            if has_load && has_dynamic {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn matches_exact_module_name(path: &str, module_name: &str) -> bool {

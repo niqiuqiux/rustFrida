@@ -103,6 +103,7 @@ struct Elf64Shdr {
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+const ET_DYN: u16 = 3;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
