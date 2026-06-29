@@ -15,40 +15,87 @@ import sys
 import subprocess
 import shutil
 
+# Windows 控制台默认 GBK/cp936，✓ 等非 GBK 字符会触发 UnicodeEncodeError。
+# 统一用 UTF-8 输出（errors=replace 兜底），避免脚本因打印而崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HELPERS_DIR = os.path.join(SCRIPT_DIR, "helpers")
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
 
-# Android NDK setup
-NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
+# ---- 跨平台 NDK / 工具链解析 (Windows / Linux / macOS) ----
+IS_WINDOWS = sys.platform.startswith("win")
+
+
+def host_tag():
+    """NDK prebuilt host tag for the current OS."""
+    if IS_WINDOWS:
+        return "windows-x86_64"
+    if sys.platform == "darwin":
+        return "darwin-x86_64"
+    return "linux-x86_64"
+
+
+def tool_exe(name):
+    """Append .exe for llvm-* binaries on Windows."""
+    return name + ".exe" if IS_WINDOWS else name
+
 
 def find_ndk():
-    """Find the latest Android NDK."""
-    if not os.path.isdir(NDK_BASE):
-        print(f"错误: NDK 目录不存在: {NDK_BASE}")
-        sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
-    if not versions:
-        print("错误: 未找到 NDK 版本")
-        sys.exit(1)
-    return os.path.join(NDK_BASE, versions[0])
+    """Find the Android NDK from env vars or common SDK locations."""
+    # 1) explicit env vars pointing at a specific NDK root
+    for key in ("NDK_PATH", "ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"):
+        v = os.environ.get(key)
+        if v and os.path.isdir(os.path.join(v, "toolchains")):
+            return v
+    # 2) SDK/ndk dirs -> pick the latest installed version
+    bases = []
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if sdk:
+        bases.append(os.path.join(sdk, "ndk"))
+    bases.append(os.path.expanduser("~/Android/Sdk/ndk"))
+    if IS_WINDOWS:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            bases.append(os.path.join(local, "Android", "Sdk", "ndk"))
+    for base in bases:
+        if os.path.isdir(base):
+            versions = sorted(os.listdir(base), reverse=True)
+            if versions:
+                return os.path.join(base, versions[0])
+    print("错误: 未找到 NDK（请设置 NDK_PATH / ANDROID_NDK_HOME 或 ANDROID_HOME）")
+    sys.exit(1)
+
 
 def find_tool(ndk_path, tool):
     """Find an NDK tool in the toolchain."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", host_tag(), "bin")
     # Try llvm- prefixed first
-    llvm_tool = os.path.join(toolchain, f"llvm-{tool}")
+    llvm_tool = os.path.join(toolchain, tool_exe(f"llvm-{tool}"))
     if os.path.isfile(llvm_tool):
         return llvm_tool
     # Try aarch64- prefixed
-    aarch64_tool = os.path.join(toolchain, f"aarch64-linux-android-{tool}")
+    aarch64_tool = os.path.join(toolchain, tool_exe(f"aarch64-linux-android-{tool}"))
     if os.path.isfile(aarch64_tool):
         return aarch64_tool
     return None
 
+
 def find_clang(ndk_path, api=33):
     """Find the NDK clang for aarch64."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", host_tag(), "bin")
+    if IS_WINDOWS:
+        # The per-API wrappers (aarch64-linux-android33-clang.cmd) are batch
+        # scripts that Python's subprocess (CreateProcess) cannot exec directly.
+        # Plain clang.exe is equivalent here because the explicit
+        # "-target aarch64-linux-android33" flag is already passed in cflags/ldflags.
+        clang = os.path.join(toolchain, "clang.exe")
+        if os.path.isfile(clang):
+            return clang
     clang = os.path.join(toolchain, f"aarch64-linux-android{api}-clang")
     if os.path.isfile(clang):
         return clang
@@ -57,10 +104,11 @@ def find_clang(ndk_path, api=33):
     if os.path.isfile(clang):
         return clang
     # Try plain clang
-    clang = os.path.join(toolchain, "clang")
+    clang = os.path.join(toolchain, tool_exe("clang"))
     if os.path.isfile(clang):
         return clang
     return None
+
 
 def run_cmd(cmd, desc=""):
     """Run a command and check for errors."""

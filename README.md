@@ -29,6 +29,8 @@ loader shellcode  ──┐
 agent (libagent.so) ┘
 ```
 
+> **平台说明**：仓库自带的 `.cargo/config.toml` 默认交叉编译到 `aarch64-linux-android`。下面的 1–3 步**以 Linux / WSL2 为准**（loader 脚本调用 `python3`、内核 LKM 用 bash）。在 **Windows 原生环境**构建请看本章的 [Windows 原生交叉编译](#windows-原生交叉编译) 一节——主程序、agent、loader、QBDI 组件均可在 Windows 上交叉编译，唯独 eBPF（`--watch-so`）因 `bpf-linker` 不支持 Windows 而无法构建。
+
 ### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
 
 ```bash
@@ -57,6 +59,64 @@ cargo build -p rust_frida --release
 ```
 
 rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
+
+### Windows 原生交叉编译
+
+在 Windows 上直接交叉编译到 `aarch64-linux-android`，无需 WSL。已在 **NDK 28.1.13356709 + Rust 1.92（MSVC host）** 实测通过：主程序、agent、loader shellcode、QBDI 组件均可构建。
+
+**前置**
+
+- Android NDK 25+（Windows 版，须含 `toolchains/llvm/prebuilt/windows-x86_64`）
+- `rustup target add aarch64-linux-android`
+- Python 3（Windows 下命令通常为 `python`，无 `python3`）
+
+**1) 配置 `.cargo/config.toml`**
+
+仓库的 `.cargo/config.toml` 已带 Windows 段（指向 `windows-x86_64` 工具链：`*-clang.cmd` / `llvm-ar.exe` / sysroot / `clang/19` builtins），Linux 段保留为注释。**把其中的 NDK 路径换成你自己的**：
+
+```toml
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+linker = "<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+ar = "<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","<NDK>/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/19/lib/linux"]
+
+[env]
+CC_aarch64-linux-android = "<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+AR_aarch64-linux-android = "<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+AR_aarch64_linux_android = "<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=<NDK>/toolchains/llvm/prebuilt/windows-x86_64/sysroot/"
+```
+
+> NDK 的 `*-clang.cmd` 包装脚本能被 cc crate / rustc 调用，但**不能**被 Python 的 `subprocess`（CreateProcess）直接执行——`loader/build_helpers.py` 已跨平台处理（Windows 下改用 `clang.exe` + 显式 `-target`，并修正了控制台 UTF-8 输出）。
+
+**2) 三步构建**（PowerShell；用 `NDK_PATH` 锁定本次使用的 NDK，避免环境里残留的其它 NDK 干扰）
+
+```powershell
+$env:NDK_PATH = "<NDK>"   # 例: C:\Users\<you>\AppData\Local\Android\Sdk\ndk\28.1.13356709
+
+python loader\build_helpers.py                 # 1) loader shellcode（注意是 python，不是 python3）
+cargo build -p agent --release                 # 2) agent
+cargo build -p rust_frida --release            # 3) 主程序 → target\aarch64-linux-android\release\rustfrida
+```
+
+**QBDI trace（可选）**：`qbdi-helper/build.rs` 会按 host 自动选用 `windows-x86_64` 的 libc++ 静态库，直接构建即可：
+
+```powershell
+cargo build -p qbdi-helper --release           # → libqbdi_helper.so
+cargo build -p agent --release --features qbdi
+cargo build -p rust_frida --release --features qbdi
+```
+
+**限制：eBPF / `--watch-so` 在 Windows 不可用**
+
+`--watch-so`（eBPF 监听 SO 加载自动附加）经 `ldmonitor → aya_build → bpf-linker`，而 `bpf-linker` 仅支持 Linux/macOS。为此 `rust_frida` 新增了 `watch-so` feature 并把 `ldmonitor` 设为可选依赖，**默认关闭**——Windows 默认构建不含该功能（运行 `--watch-so` 时会给出提示）。要启用需在 Linux / WSL2：
+
+```bash
+cargo build -p rust_frida --release --features watch-so
+```
 
 ### 可选组件（单独构建）
 

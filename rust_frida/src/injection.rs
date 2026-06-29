@@ -188,6 +188,7 @@ fn read_target_mls_range(pid: i32) -> Option<String> {
 }
 
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
+#[cfg(feature = "watch-so")]
 fn find_data_dir_by_uid(uid: u32) -> Option<String> {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
@@ -215,6 +216,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
+#[cfg(feature = "watch-so")]
 pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,

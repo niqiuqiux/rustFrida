@@ -1,28 +1,31 @@
-##windows
-#[target.aarch64-linux-android]
-#linker = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-#ar = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-#
-#[build]
-#target = "aarch64-linux-android"
-#rustflags = ["-l","clang_rt.builtins-aarch64","-L","E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/lib64/clang/14.0.6/lib/baremetal"]
-#
-#[env]
-#BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/sysroot"
-#CC_aarch64-linux-android = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-
-#linux
+# ============================================================
+# Windows 原生交叉编译配置 (NDK 28.1.13356709)
+# 目标: aarch64-linux-android  |  toolchain: windows-x86_64  |  clang 19
+# ============================================================
 [build]
 target = "aarch64-linux-android"
 
 [target.aarch64-linux-android]
-linker = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-ar = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux"]
+linker = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+ar = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/19/lib/linux"]
 
 [env]
-CC_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-AR_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-AR_aarch64_linux_android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-#CFLAGS_aarch64-linux-android = "--sysroot=/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
+CC_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+AR_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+AR_aarch64_linux_android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/sysroot/"
+
+# ============================================================
+# 原 Linux 配置（保留，在 WSL / Linux 环境构建时改用以下段）
+# ============================================================
+# [target.aarch64-linux-android]
+# linker = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+# ar = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+# rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux"]
+#
+# [env]
+# CC_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+# AR_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+# AR_aarch64_linux_android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+# BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"

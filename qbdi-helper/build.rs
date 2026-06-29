@@ -24,8 +24,17 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_os == "android" && target_arch == "aarch64" {
         let ndk_path = find_ndk_path();
-        let cxx_lib_dir = std::path::PathBuf::from(&ndk_path)
-            .join("toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android");
+        // host-aware NDK prebuilt 目录（Windows 原生构建需 windows-x86_64）
+        let host_tag = if cfg!(target_os = "windows") {
+            "windows-x86_64"
+        } else if cfg!(target_os = "macos") {
+            "darwin-x86_64"
+        } else {
+            "linux-x86_64"
+        };
+        let cxx_lib_dir = std::path::PathBuf::from(&ndk_path).join(format!(
+            "toolchains/llvm/prebuilt/{host_tag}/sysroot/usr/lib/aarch64-linux-android"
+        ));
         let cxx_static = cxx_lib_dir.join("libc++_static.a");
         let cxxabi = cxx_lib_dir.join("libc++abi.a");
 

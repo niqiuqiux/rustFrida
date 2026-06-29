@@ -1,6 +1,9 @@
 [features]
 frida-gum = []
 qbdi = []
+# watch-so: eBPF SO 加载监听（--watch-so）。依赖 ldmonitor，其 build.rs 需要
+# bpf-linker（仅 Linux 可用）。默认关闭，使主程序可在 Windows 原生交叉编译。
+watch-so = ["dep:ldmonitor"]
 
 [package]
 name = "rust_frida"
@@ -10,7 +13,7 @@ authors = ["Your Name <your.email@example.com>"]
 description = "ARM64架构下的动态库注入和远程函数调用工具"
 
 [dependencies]
-ldmonitor = { path = "../ldmonitor" }
+ldmonitor = { path = "../ldmonitor", optional = true }
 libc = "1.0.0-alpha.1"
 clap = { version = "4.5.37", features = ["derive"] }
 nix = { version = "0.30.1", features = ["ptrace", "socket", "uio"] }
