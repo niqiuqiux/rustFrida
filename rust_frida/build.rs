@@ -28,13 +28,37 @@ fn main() {
 
     let target = std::env::var("TARGET").unwrap_or_default();
     if target == "aarch64-linux-android" && helpers_are_stale(workspace_root) {
-        let status = std::process::Command::new("python3")
-            .arg(workspace_root.join("loader/build_helpers.py"))
-            .current_dir(workspace_root)
-            .status()
-            .expect("failed to run loader/build_helpers.py");
-        if !status.success() {
-            panic!("loader/build_helpers.py failed with status {}", status);
+        // Windows 通常只有 `python`（无 `python3`），类 Unix 用 `python3`。
+        // 按平台优先级尝试可用的解释器。
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &["python", "python3"]
+        } else {
+            &["python3", "python"]
+        };
+        let script = workspace_root.join("loader/build_helpers.py");
+        let mut ran = false;
+        let mut last_err = None;
+        for py in candidates {
+            match std::process::Command::new(py)
+                .arg(&script)
+                .current_dir(workspace_root)
+                .status()
+            {
+                Ok(status) => {
+                    if !status.success() {
+                        panic!("loader/build_helpers.py failed with status {}", status);
+                    }
+                    ran = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !ran {
+            panic!(
+                "failed to run loader/build_helpers.py (tried {:?}): {:?}",
+                candidates, last_err
+            );
         }
     }
 
