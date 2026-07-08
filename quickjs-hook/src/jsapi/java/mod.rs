@@ -497,6 +497,7 @@ unsafe extern "C" fn js_art_route_stats(
     let mut replacement_hits: u64 = 0;
     let mut do_call_table_hits: u64 = 0;
     let mut do_call_last_x0: u64 = 0;
+    let mut do_call_raw_last_x0: u64 = 0;
     let mut quick_pass_hits: u64 = 0;
     let mut quick_callback_calls: u64 = 0;
     let mut quick_skip_hits: u64 = 0;
@@ -513,6 +514,7 @@ unsafe extern "C" fn js_art_route_stats(
         &mut replacement_hits,
         &mut do_call_table_hits,
         &mut do_call_last_x0,
+        &mut do_call_raw_last_x0,
         &mut quick_pass_hits,
         &mut quick_callback_calls,
         &mut quick_skip_hits,
@@ -612,6 +614,11 @@ unsafe extern "C" fn js_art_route_stats(
         ctx,
         "doCallRouterLastX0",
         JSValue(ffi::JS_NewBigUint64(ctx, do_call_last_x0)),
+    );
+    obj_val.set_property(
+        ctx,
+        "doCallRawLastX0",
+        JSValue(ffi::JS_NewBigUint64(ctx, do_call_raw_last_x0)),
     );
     obj_val.set_property(
         ctx,
@@ -1526,24 +1533,36 @@ pub fn register_java_api(ctx: &JSContext) {
 // Java hook 拆卸原子操作 — 供 js_java_unhook 和 cleanup_java_hooks 复用
 // ============================================================================
 
-/// 恢复 ArtMethod 原始 flags。
+/// 恢复 ArtMethod 原始 flags，以及 hook 安装时主动改写过的内部 entry。
 ///
 /// 目标 app/framework ArtMethod 的 entry_point_/data_ 不写外部地址，也不在
 /// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
 /// ART shared entry hook 完成。
 pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
-    if !data.hook_type.original_flags_mutated() {
+    if !data.hook_type.original_flags_mutated() && !data.hook_type.original_entry_mutated() {
         return;
     }
     if let Some(spec) = ART_METHOD_SPEC.get() {
-        std::ptr::write_volatile(
-            (data.art_method as usize + spec.access_flags_offset) as *mut u32,
-            data.original_access_flags,
-        );
-        hook_ffi::hook_flush_cache(
-            (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
-            4,
-        );
+        if data.hook_type.original_flags_mutated() {
+            std::ptr::write_volatile(
+                (data.art_method as usize + spec.access_flags_offset) as *mut u32,
+                data.original_access_flags,
+            );
+            hook_ffi::hook_flush_cache(
+                (data.art_method as usize + spec.access_flags_offset) as *mut std::ffi::c_void,
+                4,
+            );
+        }
+        if data.hook_type.original_entry_mutated() {
+            std::ptr::write_volatile(
+                (data.art_method as usize + spec.entry_point_offset) as *mut u64,
+                data.original_entry_point,
+            );
+            hook_ffi::hook_flush_cache(
+                (data.art_method as usize + spec.entry_point_offset) as *mut std::ffi::c_void,
+                8,
+            );
+        }
     }
 }
 

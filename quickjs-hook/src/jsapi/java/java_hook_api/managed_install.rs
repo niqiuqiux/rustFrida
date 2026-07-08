@@ -933,7 +933,7 @@ unsafe fn install_managed_method_helper(
     let (per_method_hook_target, quick_trampoline) = if original_is_shared_entrypoint {
         set_managed_replacement_method(art_method, helper_art_method, 0);
         install_guard.set_replacement_registered();
-        let (per_method_hook_target, _trampoline, _use_blr, _router_thunk_body) = match install_per_method_router_hook(
+        let (per_method_hook_target, _trampoline, _use_blr, _router_thunk_body, _original_entry_mutated) = match install_per_method_router_hook(
             false,
             original_entry_point,
             &bridge,
@@ -942,6 +942,7 @@ unsafe fn install_managed_method_helper(
             art_method,
             (original_access_flags & K_ACC_NATIVE) != 0,
             true,
+            false,
             false,
         ) {
             Ok(installed) => installed,
@@ -967,7 +968,7 @@ unsafe fn install_managed_method_helper(
         }
         (per_method_hook_target, 0)
     } else {
-        let (hook_addr, stealth_flag) =
+        let (hook_addr, stealth_flag, real_addr) =
             super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
                 .map_err(|e| format!("prepare_hook_target: {}", e))?;
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -985,7 +986,7 @@ unsafe fn install_managed_method_helper(
             delete_local_ref(env, helper_cls);
             return Err("hook_install_managed_direct_router failed".to_string());
         }
-        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, real_addr);
         if let Some(backup_art_method) = orig_backup_art_method {
             let orig_stub = crate::ffi::hook::hook_create_managed_orig_stub(art_method, quick_trampoline);
             if orig_stub.is_null() {
@@ -1101,7 +1102,7 @@ unsafe fn install_count_orig_fast_path(
             class_name, method_name, actual_sig
         ));
     } else {
-        let (hook_addr, stealth_flag) =
+        let (hook_addr, stealth_flag, real_addr) =
             super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
                 .map_err(|e| format!("prepare_hook_target: {}", e))?;
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -1116,7 +1117,7 @@ unsafe fn install_count_orig_fast_path(
         if quick_trampoline.is_null() {
             return Err("hook_install_count_orig_router failed".to_string());
         }
-        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+        super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, real_addr);
 
         let per_method_hook_target = if !hooked_target.is_null() {
             Some(hooked_target as u64)

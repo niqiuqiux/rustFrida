@@ -479,6 +479,7 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
                                      uint64_t* replacement_hits,
                                      uint64_t* do_call_table_hits,
                                      uint64_t* last_do_call_x0,
+                                     uint64_t* last_do_call_raw_x0,
                                      uint64_t* quick_pass_hits,
                                      uint64_t* quick_callback_calls,
                                      uint64_t* quick_skip_hits,
@@ -660,9 +661,11 @@ uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline);
  * g_art_router_table). Replacement methods skip the OAT lookup to prevent
  * NULL+0x18 SIGSEGV in WalkStack.
  *
+ * @param exclude_addr  Function body address to exclude from the pattern scan
+ *                      (usually ArtMethod::GetOatQuickMethodHeader itself), or 0.
  * @return  Number of patterns patched (>=0), or negative error code
  */
-int hook_patch_inlined_oat_header_checks(void);
+int hook_patch_inlined_oat_header_checks(uint64_t exclude_addr);
 
 /*
  * Restore all inlined OAT header patches applied by hook_patch_inlined_oat_header_checks().

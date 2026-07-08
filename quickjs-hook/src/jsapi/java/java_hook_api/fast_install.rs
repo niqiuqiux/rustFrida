@@ -71,7 +71,8 @@ pub(in crate::jsapi::java) unsafe fn install_fast_hook_with_env(
         class_global_ref,
     );
 
-    let (per_method_hook_target, quick_trampoline, use_blr, router_thunk_body) = install_per_method_router_hook(
+    let (per_method_hook_target, quick_trampoline, use_blr, router_thunk_body, _original_entry_mutated) =
+        install_per_method_router_hook(
         true,
         original_entry_point,
         &bridge,
@@ -80,6 +81,7 @@ pub(in crate::jsapi::java) unsafe fn install_fast_hook_with_env(
         art_method,
         false,
         method_name == "<init>",
+        false,
         false,
     )?;
     let stack_entry_point = router_thunk_body.ok_or("fastHook requires router thunk body")?;

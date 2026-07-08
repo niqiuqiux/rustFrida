@@ -30,6 +30,7 @@ volatile uint64_t g_art_router_quick_test_suspend_entrypoint = 0;
 volatile uint64_t g_art_router_replacement_hit_count = 0;
 volatile uint64_t g_art_router_do_call_table_hit_count = 0;
 volatile uint64_t g_art_router_last_do_call_x0 = 0;
+volatile uint64_t g_art_router_last_do_call_raw_x0 = 0;
 volatile uint64_t g_managed_backup_stub_hit_count = 0;
 volatile uint64_t g_managed_direct_hit_count = 0;
 
@@ -160,6 +161,7 @@ uint64_t hook_art_router_table_lookup_original(uint64_t replacement) {
 }
 
 int hook_art_router_record_do_call(uint64_t method) {
+    __atomic_store_n(&g_art_router_last_do_call_raw_x0, method, __ATOMIC_RELAXED);
     for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
         if (g_art_router_table[i].original == 0) break;
         if (g_art_router_table[i].original == method) {
@@ -334,6 +336,7 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
                                      uint64_t* replacement_hits,
                                      uint64_t* do_call_table_hits,
                                      uint64_t* last_do_call_x0,
+                                     uint64_t* last_do_call_raw_x0,
                                      uint64_t* quick_pass_hits,
                                      uint64_t* quick_callback_calls,
                                      uint64_t* quick_skip_hits,
@@ -346,6 +349,7 @@ void hook_art_router_get_route_stats(uint64_t* quick_hits,
     if (replacement_hits)    *replacement_hits    = g_art_router_replacement_hit_count;
     if (do_call_table_hits)  *do_call_table_hits  = g_art_router_do_call_table_hit_count;
     if (last_do_call_x0)     *last_do_call_x0     = g_art_router_last_do_call_x0;
+    if (last_do_call_raw_x0) *last_do_call_raw_x0 = g_art_router_last_do_call_raw_x0;
     if (quick_pass_hits)     *quick_pass_hits     = g_art_router_quick_pass_count;
     if (quick_callback_calls)*quick_callback_calls= g_art_router_quick_callback_count;
     if (quick_skip_hits)     *quick_skip_hits     = g_art_router_quick_skip_count;
