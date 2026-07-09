@@ -958,7 +958,9 @@ Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 
 
 ### Managed DSL 高频 Hook
 
-DSL 是为应对高频 Java hook 开发的小型 JS-Java 动态编译器。普通 `Java.use().impl = function (...) { ... }` 每次命中都会进入 JS runtime；DSL 会把受限的 JS/Java 风格代码编译成 dex callback，让热路径在 ART/Java 侧执行，适合任何被高频调用的java方法。DSL 后续会继续优化语法、类型推断和可用能力。
+DSL 是为应对高频 Java hook 开发的小型 JS-Java 动态编译器。普通 `Java.use().impl = function (...) { ... }` 每次命中都会进入 JS runtime；DSL 会把受限的 JS/Java 风格代码编译成 dex callback，让热路径在 ART/Java 侧执行，适合已进入 compiled/JIT quick code 的高频 Java 方法。DSL 后续会继续优化语法、类型推断和可用能力。
+
+DSL 只支持独立 quick entrypoint，不会为 nterp/shared ART entrypoint 安装共享入口路由。目标方法仍在解释器或 shared entry 上时，`dslImpl` 会直接报错；先显式调用 `method.opt("auto")` / `method.compile("auto")`，确认方法被编译后再安装 DSL。
 
 #### 什么时候用 DSL
 
@@ -976,27 +978,27 @@ DSL 语法接近 JS/Java，但不是完整 JS runtime。它不能访问 JS 变�
 ```js
 Java.ready(function () {
     var HashMap = Java.use("java.util.HashMap");
+    var put = HashMap.put.overload("java.lang.Object", "java.lang.Object");
 
-    HashMap.put
-        .overload("java.lang.Object", "java.lang.Object")
-        .dsl({ buff: 4096 })       // 可选。默认 4096，必须是 2 的幂，最大 1048576
-        .dslImpl = `
-            count("put");
+    console.log(JSON.stringify(put.opt("auto")));
 
-            let n: int = this.size();
-            let has: boolean = this.containsKey(arg0);
-            let selected: java.lang.Object = (arg0 != null ? arg0 : arg1);
+    put.dsl({ buff: 4096 }).dslImpl = `
+        count("put");
 
-            if ((n & 1023) == 0) {
-                send("size", n);
-            }
+        let n: int = this.size();
+        let has: boolean = this.containsKey(arg0);
+        let selected: java.lang.Object = (arg0 != null ? arg0 : arg1);
 
-            if (has && selected != null) {
-                java.lang.String.valueOf(selected);
-            }
+        if ((n & 1023) == 0) {
+            send("size", n);
+        }
 
-            return orig(arg0, arg1);
-        `;
+        if (has && selected != null) {
+            java.lang.String.valueOf(selected);
+        }
+
+        return orig(arg0, arg1);
+    `;
 
     // JS 侧低频拉取 DSL 发出的消息。不要在 DSL 热路径里 print 或进 JS。
     var drained = HashMap.put.dslRead(64);

@@ -1,7 +1,8 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::{output_message, output_verbose};
+use crate::jsapi::hook_api::StealthMode;
 
-use super::super::art_controller::{ensure_shared_entry_router_hook, prepare_hook_target};
+use super::super::art_controller::{ensure_shared_entry_router_hook, prepare_hook_target, stealth_mode};
 use super::super::art_method::*;
 use super::super::callback::delete_replacement_method;
 use super::super::jni_core::*;
@@ -311,8 +312,9 @@ pub(super) unsafe fn install_per_method_router_hook(
         // shells. The quick router patches only the actual quick entry code.
         let use_fast_orig = enable_fast_orig && !is_native_method;
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-        let (hook_addr, sflag, real_addr) = prepare_hook_target(original_entry_point as u64, env as *mut std::ffi::c_void)
-            .map_err(|e| format!("prepare_hook_target: {}", e))?;
+        let (hook_addr, sflag, real_addr) =
+            prepare_hook_target(original_entry_point as u64, env as *mut std::ffi::c_void)
+                .map_err(|e| format!("prepare_hook_target: {}", e))?;
         // current_pc_hint = 0: 不需要 LR/x20 swap，让 JNI 正常走 epilogue
         let trampoline = hook_ffi::hook_install_art_router(
             hook_addr as *mut std::ffi::c_void,
@@ -323,6 +325,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             1, // skip_resolve
             0, // no hint — replacement is kAccNative, ART handles it
             if use_fast_orig { 1 } else { 0 },
+            0,
         );
 
         if trampoline.is_null() {
@@ -364,12 +367,19 @@ pub(super) unsafe fn install_per_method_router_hook(
         // 非 compiled 方法: entry_point 是共享 stub (nterp/interpreter_bridge/resolution)
         // 或 libart 内未归类的解释器入口。不能把 ArtMethod.entry_point_ 改到外部
         // thunk；这里只补全 libart/shared entry 自身的全局 router。
-        // Only exact bridge/trampoline entries are considered router-safe here.
-        // TLS-resolved/nterp/libart internal entries may enter with x0 != ArtMethod,
-        // so per-method hooks normalize them to quick_to_interpreter_bridge instead
-        // of relying on a global router hit.
+        // Only exact bridge/trampoline entries are considered router-safe for
+        // default Java callbacks. Managed DSL passes allow_internal_entry_downgrade=false
+        // because it is the high-frequency path: preserve exact nterp shared
+        // entries in stealth modes and route them directly instead of degrading
+        // the target ArtMethod to quick_to_interpreter_bridge.
+        let preserve_exact_nterp = !allow_internal_entry_downgrade
+            && stealth_mode() != StealthMode::Normal
+            && ((bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point)
+                || (bridge.nterp_with_clinit_entry_point != 0
+                    && original_entry_point == bridge.nterp_with_clinit_entry_point));
         let is_already_routed = original_entry_point == bridge.quick_to_interpreter_bridge
-            || original_entry_point == bridge.quick_resolution_trampoline;
+            || original_entry_point == bridge.quick_resolution_trampoline
+            || preserve_exact_nterp;
 
         if shared_native_art_entry || !is_already_routed {
             if is_native_method {
@@ -386,10 +396,7 @@ pub(super) unsafe fn install_per_method_router_hook(
                     (art_method as usize + ep_offset) as *mut u64,
                     bridge.quick_to_interpreter_bridge,
                 );
-                hook_ffi::hook_flush_cache(
-                    (art_method as usize + ep_offset) as *mut std::ffi::c_void,
-                    8,
-                );
+                hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
                 original_entry_mutated = true;
                 output_verbose(&format!(
                     "[java hook] Step 9: libart shared entry {:#x} downgraded to interpreter bridge {:#x} (internal entry only)",
@@ -405,7 +412,13 @@ pub(super) unsafe fn install_per_method_router_hook(
                 ));
                 return Ok((None, 0, false, None, false));
             }
-            ensure_shared_entry_router_hook("method-shared-entry", shared_router_entry, ep_offset, env)?;
+            ensure_shared_entry_router_hook(
+                "method-shared-entry",
+                shared_router_entry,
+                ep_offset,
+                env,
+                preserve_exact_nterp,
+            )?;
             output_verbose(&format!(
                 "[java hook] Step 9: dynamic shared ART router active: ep={:#x}; target ArtMethod entry_external=false",
                 shared_router_entry
@@ -413,10 +426,17 @@ pub(super) unsafe fn install_per_method_router_hook(
             return Ok((None, 0, false, None, original_entry_mutated));
         }
 
-        output_verbose(&format!(
-            "[java hook] Step 9: 共享 stub, 依赖 Layer 1+2 路由: ep={:#x}",
-            original_entry_point
-        ));
+        if preserve_exact_nterp {
+            output_verbose(&format!(
+                "[java hook] Step 9: exact nterp shared entry preserved for high-frequency DSL routing: ep={:#x}",
+                original_entry_point
+            ));
+        } else {
+            output_verbose(&format!(
+                "[java hook] Step 9: 共享 stub, 依赖 Layer 1+2 路由: ep={:#x}",
+                original_entry_point
+            ));
+        }
         Ok((None, 0, false, None, false))
     }
 }

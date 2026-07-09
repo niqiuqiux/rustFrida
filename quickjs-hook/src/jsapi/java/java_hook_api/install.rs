@@ -25,6 +25,7 @@ fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) 
         || addr == bridge.quick_resolution_trampoline
         || addr == bridge.quick_imt_conflict_trampoline
         || addr == bridge.nterp_entry_point
+        || addr == bridge.nterp_with_clinit_entry_point
         || (bridge.resolved_jni_entrypoint != 0 && addr == bridge.resolved_jni_entrypoint)
         || (bridge.resolved_interpreter_bridge_entrypoint != 0 && addr == bridge.resolved_interpreter_bridge_entrypoint)
         || (bridge.resolved_resolution_entrypoint != 0 && addr == bridge.resolved_resolution_entrypoint)
@@ -72,8 +73,7 @@ unsafe fn normalize_internal_shared_entry_if_needed(
         bridge.quick_to_interpreter_bridge,
     );
     hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-    if let Err(msg) =
-        ensure_shared_entry_router_hook(reason, bridge.quick_to_interpreter_bridge, ep_offset, env)
+    if let Err(msg) = ensure_shared_entry_router_hook(reason, bridge.quick_to_interpreter_bridge, ep_offset, env, false)
     {
         output_verbose(&format!(
             "[java hook] {} interpreter bridge router ensure failed: {}",
@@ -91,8 +91,7 @@ fn mark_original_entry_mutated(art_method: u64) {
     with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
         if let Some(hook_data) = registry.get_mut(&art_method) {
             if let HookType::Replaced {
-                original_entry_mutated,
-                ..
+                original_entry_mutated, ..
             } = &mut hook_data.hook_type
             {
                 *original_entry_mutated = true;
@@ -101,19 +100,14 @@ fn mark_original_entry_mutated(art_method: u64) {
     });
 }
 
-fn schedule_internal_shared_entry_refresh(
-    art_method: u64,
-    ep_offset: usize,
-    bridge: &'static ArtBridgeFunctions,
-) {
+fn schedule_internal_shared_entry_refresh(art_method: u64, ep_offset: usize, bridge: &'static ArtBridgeFunctions) {
     let _ = std::thread::Builder::new()
         .name("rf-art-entry-refresh".to_string())
         .spawn(move || {
             for delay_ms in [120_i64, 400, 900] {
                 crate::raw_thread::sleep_ms(delay_ms);
                 let still_registered =
-                    with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method))
-                        .unwrap_or(false);
+                    with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
                 if !still_registered {
                     return;
                 }
@@ -255,13 +249,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     init_java_registry();
     if with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false) {
         let refreshed_entry = (original_access_flags & K_ACC_NATIVE) == 0
-            && normalize_internal_shared_entry_if_needed(
-                art_method,
-                ep_offset,
-                env,
-                bridge,
-                "existing-hook-refresh",
-            );
+            && normalize_internal_shared_entry_if_needed(art_method, ep_offset, env, bridge, "existing-hook-refresh");
         let new_callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
         let old_callback_bytes = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
@@ -351,8 +339,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         is_native_method && original_data != 0 && is_registered_native_entry_candidate(original_data, bridge);
     let shared_native_art_entry = is_native_method && !has_independent_code && !has_registered_native_entry;
     let native_entry_is_quick_entry = has_registered_native_entry && original_entry_point == original_data;
-    let route_has_independent_code =
-        (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
+    let route_has_independent_code = (has_independent_code && !native_entry_is_quick_entry) || shared_native_art_entry;
     let mutate_original_method_flags = false;
 
     output_verbose(&format!(
@@ -535,28 +522,29 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     // B2: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)。
     // 此时 replacement 尚未加入 art_router 表；若其他线程打到 quickCode，会继续走原始方法，
     // 避免热点方法在半安装窗口进入 JS callback。
-    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, mut original_entry_mutated) = match install_per_method_router_hook(
-        route_has_independent_code,
-        original_entry_point,
-        &bridge,
-        ep_offset,
-        env,
-        art_method,
-        is_native_method,
-        shared_native_art_entry,
-        enable_fast_orig,
-        true,
-    ) {
-        Ok(v) => v,
-        Err(msg) => {
-            if let Some(removed) =
-                with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
-            {
-                free_callback_bytes(ctx, removed.callback_bytes);
+    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, mut original_entry_mutated) =
+        match install_per_method_router_hook(
+            route_has_independent_code,
+            original_entry_point,
+            &bridge,
+            ep_offset,
+            env,
+            art_method,
+            is_native_method,
+            shared_native_art_entry,
+            enable_fast_orig,
+            true,
+        ) {
+            Ok(v) => v,
+            Err(msg) => {
+                if let Some(removed) =
+                    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
+                {
+                    free_callback_bytes(ctx, removed.callback_bytes);
+                }
+                return throw_internal_error(ctx, msg);
             }
-            return throw_internal_error(ctx, msg);
-        }
-    };
+        };
     if original_entry_mutated {
         install_guard.set_original_entry_mutated();
     }
@@ -802,21 +790,22 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
     install_guard.set_replacement_addr(replacement_addr);
 
     let is_constructor = method_name == "<init>";
-    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, _original_entry_mutated) = match install_per_method_router_hook(
-        true,
-        original_entry_point,
-        &bridge,
-        ep_offset,
-        env,
-        art_method,
-        (original_access_flags & K_ACC_NATIVE) != 0,
-        is_constructor,
-        false,
-        false,
-    ) {
-        Ok(v) => v,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
+    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body, _original_entry_mutated) =
+        match install_per_method_router_hook(
+            true,
+            original_entry_point,
+            &bridge,
+            ep_offset,
+            env,
+            art_method,
+            (original_access_flags & K_ACC_NATIVE) != 0,
+            is_constructor,
+            false,
+            false,
+        ) {
+            Ok(v) => v,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
 
     set_quick_callback_method(art_method, replacement_addr as u64, Some(java_hook_dispatch_from_quick));
     install_guard.set_replacement_registered();

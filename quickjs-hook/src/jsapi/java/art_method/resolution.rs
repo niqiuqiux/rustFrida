@@ -21,6 +21,7 @@ pub(super) fn is_art_quick_entrypoint(addr: u64, bridge: &ArtBridgeFunctions) ->
         || addr == bridge.quick_resolution_trampoline
         || addr == bridge.quick_imt_conflict_trampoline
         || addr == bridge.nterp_entry_point
+        || addr == bridge.nterp_with_clinit_entry_point
     {
         return true;
     }

@@ -288,7 +288,11 @@ pub(super) unsafe fn prepare_hook_target(addr: u64, jni_env: *mut std::ffi::c_vo
     }
 }
 
-unsafe fn prepare_hook_target_strict(label: &str, addr: u64, jni_env: *mut std::ffi::c_void) -> Option<(u64, i32, u64)> {
+unsafe fn prepare_hook_target_strict(
+    label: &str,
+    addr: u64,
+    jni_env: *mut std::ffi::c_void,
+) -> Option<(u64, i32, u64)> {
     match prepare_hook_target(addr, jni_env) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -618,15 +622,26 @@ pub(super) fn ensure_art_controller_initialized(
             "[artController] Layer 1: quick_generic_jni_trampoline skipped in normal mode; enable Java.setStealth(1/2) for shared JNI native routing",
         );
     } else {
-        stubs.push(("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline));
+        stubs.push((
+            "quick_generic_jni_trampoline",
+            bridge.quick_generic_jni_trampoline,
+            false,
+        ));
     }
     if bridge.nterp_entry_point != 0 && stealth_mode() != StealthMode::Normal {
-        stubs.push(("nterp_entry_point", bridge.nterp_entry_point));
+        stubs.push(("nterp_entry_point", bridge.nterp_entry_point, true));
     }
-    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge));
-    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline));
+    if bridge.nterp_with_clinit_entry_point != 0 && stealth_mode() != StealthMode::Normal {
+        stubs.push((
+            "nterp_with_clinit_entry_point",
+            bridge.nterp_with_clinit_entry_point,
+            true,
+        ));
+    }
+    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge, false));
+    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline, false));
 
-    for (name, addr) in &stubs {
+    for (name, addr, pre_scan) in &stubs {
         if *addr == 0 {
             output_verbose(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
             continue;
@@ -649,6 +664,7 @@ pub(super) fn ensure_art_controller_initialized(
                 1, // skip_resolve: 已在 prepare_hook_target 中 resolve
                 0, // no hint — replacement is kAccNative, ART handles it
                 0, // use_blr=0: Layer 1 shared stubs 不用 BLR
+                if *pre_scan { 1 } else { 0 },
             )
         };
         if !trampoline.is_null() {
@@ -696,7 +712,8 @@ pub(super) fn ensure_art_controller_initialized(
                 continue;
             }
             let label = format!("Layer 2: DoCall[{}]", i);
-            let Some((ha, sf, real_addr)) = (unsafe { prepare_hook_target_strict(&label, addr, std::ptr::null_mut()) }) else {
+            let Some((ha, sf, real_addr)) = (unsafe { prepare_hook_target_strict(&label, addr, std::ptr::null_mut()) })
+            else {
                 continue;
             };
             let ret = unsafe {
@@ -740,12 +757,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        real_addr,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC CopyingPhase hook 安装成功: {:#x} (hooked={:#x})",
@@ -779,12 +791,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        real_addr,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC CollectGarbageInternal hook 安装成功: {:#x} (hooked={:#x})",
@@ -814,12 +821,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        real_addr,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 gc_hook_targets.push(ha);
                 output_verbose(&format!(
                     "[artController] GC RunFlipFunction hook 安装成功: {:#x} (hooked={:#x})",
@@ -891,12 +893,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        real_addr,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 fixup_hook_target = ha;
                 output_verbose(&format!(
                     "[artController] FixupStaticTrampolines hook 安装成功: {:#x} (hooked={:#x})",
@@ -930,12 +927,7 @@ pub(super) fn ensure_art_controller_initialized(
                 )
             };
             if ret == 0 {
-                unsafe {
-                    try_fixup_trampoline(
-                        hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void),
-                        real_addr,
-                    )
-                };
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), real_addr) };
                 pretty_method_hook_target = ha;
                 output_verbose(&format!(
                     "[artController] PrettyMethod hook 安装成功: {:#x} (hooked={:#x})",
@@ -1007,6 +999,7 @@ pub(super) unsafe fn ensure_shared_entry_router_hook(
     entry_point: u64,
     ep_offset: usize,
     env: JniEnv,
+    pre_scan: bool,
 ) -> Result<(), String> {
     if entry_point == 0 {
         return Err(format!("{} entry_point is null", label));
@@ -1026,12 +1019,13 @@ pub(super) unsafe fn ensure_shared_entry_router_hook(
     }
 
     let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-    let (hook_addr, sflag, real_addr) = prepare_hook_target(entry_point, env as *mut std::ffi::c_void).map_err(|e| {
-        format!(
-            "Layer 1 dynamic {} prepare failed: source={:#x}, {}",
-            label, entry_point, e
-        )
-    })?;
+    let (hook_addr, sflag, real_addr) =
+        prepare_hook_target(entry_point, env as *mut std::ffi::c_void).map_err(|e| {
+            format!(
+                "Layer 1 dynamic {} prepare failed: source={:#x}, {}",
+                label, entry_point, e
+            )
+        })?;
 
     let trampoline = hook_ffi::hook_install_art_router(
         hook_addr as *mut std::ffi::c_void,
@@ -1042,6 +1036,7 @@ pub(super) unsafe fn ensure_shared_entry_router_hook(
         1,
         0,
         0,
+        if pre_scan { 1 } else { 0 },
     );
     if trampoline.is_null() {
         return Err(format!(
@@ -1216,7 +1211,7 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
         if !should_replace_for_stack(replacement) {
             return; // managed stack 递归 — 走 tail-jump
         }
-        if route_mode != 4 {
+        if route_mode < 4 {
             // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
             // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
             // Managed DSL 的 replacement 是真实 dex 方法，declaring_class_ 必须保持 helper 类。
@@ -1437,6 +1432,12 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     }
 
     let original_for_js = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    if hook_ffi::hook_art_router_table_lookup_mode_by_replacement(replacement) >= 4 {
+        if original_for_js != 0 && call_original_bypass_contains(original_for_js) {
+            return 0;
+        }
+        return if should_replace_for_stack(replacement) { 1 } else { 0 };
+    }
     if !should_sample_original_method(original_for_js) {
         return 0;
     }

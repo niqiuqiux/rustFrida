@@ -1430,6 +1430,8 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "optMethod", js_java_compile_method, 4);
+    add_cfunction_to_object(ctx_ptr, java_obj, "optimizeMethod", js_java_compile_method, 4);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastMethod", js_java_fast_method, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastConstructor", js_java_fast_constructor, 3);
     add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_fast_field, 3);

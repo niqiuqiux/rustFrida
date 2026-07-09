@@ -1607,10 +1607,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             message: "Thread::Current() unavailable".to_string(),
         };
     };
-    let compile_sym = crate::jsapi::module::libart_dlsym(
-        "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEb",
-    );
-    if compile_sym.is_null() {
+    let Some((compile_method, compile_symbol)) = find_jit_compile_method() else {
         return CompileResult {
             before,
             after: before,
@@ -1619,11 +1616,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             kind: kind.label(),
             message: "Jit::CompileMethod symbol not found".to_string(),
         };
-    }
-
-    type CompileMethodFn =
-        unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8;
-    let compile_method: CompileMethodFn = std::mem::transmute(compile_sym);
+    };
 
     let mut last_kind = kind.label();
     let mut saw_compile_success = false;
@@ -1634,7 +1627,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             3 => "optimized",
             _ => "unknown",
         };
-        let ok = compile_method(jit, art_method, thread, *k, 0) != 0;
+        let ok = compile_method.call(jit, art_method, thread, *k) != 0;
         let after = read_entry_point(art_method, entry_point_offset);
         if ok {
             saw_compile_success = true;
@@ -1646,7 +1639,7 @@ pub(crate) unsafe fn compile_art_method_to_quick(
                 success: true,
                 compiled: true,
                 kind: last_kind,
-                message: format!("Jit::CompileMethod({}) succeeded", last_kind),
+                message: format!("{}({}) succeeded", compile_symbol, last_kind),
             };
         }
     }
@@ -1664,6 +1657,42 @@ pub(crate) unsafe fn compile_art_method_to_quick(
             "Jit::CompileMethod returned false".to_string()
         },
     }
+}
+
+enum JitCompileMethod {
+    OneBool(unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8),
+    TwoBool(unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8, osr: u8) -> u8),
+}
+
+impl JitCompileMethod {
+    unsafe fn call(&self, jit: u64, method: u64, thread: u64, compilation_kind: u32) -> u8 {
+        match self {
+            Self::OneBool(f) => f(jit, method, thread, compilation_kind, 0),
+            Self::TwoBool(f) => f(jit, method, thread, compilation_kind, 0, 0),
+        }
+    }
+}
+
+unsafe fn find_jit_compile_method() -> Option<(JitCompileMethod, &'static str)> {
+    let two_bool_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEbb";
+    let two_bool = crate::jsapi::module::libart_dlsym(two_bool_symbol);
+    if !two_bool.is_null() {
+        type CompileMethodFn =
+            unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8, osr: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(two_bool);
+        return Some((JitCompileMethod::TwoBool(compile_method), two_bool_symbol));
+    }
+
+    let one_bool_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadENS_15CompilationKindEb";
+    let one_bool = crate::jsapi::module::libart_dlsym(one_bool_symbol);
+    if !one_bool.is_null() {
+        type CompileMethodFn =
+            unsafe extern "C" fn(this: u64, method: u64, thread: u64, compilation_kind: u32, prejit: u8) -> u8;
+        let compile_method: CompileMethodFn = std::mem::transmute(one_bool);
+        return Some((JitCompileMethod::OneBool(compile_method), one_bool_symbol));
+    }
+
+    None
 }
 
 unsafe fn current_art_thread(env: JniEnv) -> Option<u64> {

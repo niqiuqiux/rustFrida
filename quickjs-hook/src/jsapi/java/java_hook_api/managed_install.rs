@@ -7,14 +7,13 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::super::art_controller::{ensure_art_controller_initialized, refresh_walkstack_sigsegv_guard};
+use super::super::art_controller::refresh_walkstack_sigsegv_guard;
 use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{
-    create_class_global_ref, install_per_method_router_hook, update_original_method_flags_for_hook,
-    JavaHookInstallGuard,
+    create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard,
 };
 use super::managed_dex_builder::{
     build_java_worker_dex, build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral,
@@ -34,6 +33,63 @@ static DYNAMIC_MANAGED_CLASS_ID: AtomicU64 = AtomicU64::new(1);
 static JAVA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_THREAD_GLOBAL: Mutex<Option<u64>> = Mutex::new(None);
 static NATIVE_MANAGED_COUNTERS: OnceLock<Mutex<HashMap<(String, String), Box<AtomicU64>>>> = OnceLock::new();
+
+fn shared_entrypoint_name(entry_point: u64, bridge: &ArtBridgeFunctions) -> &'static str {
+    if entry_point == bridge.nterp_entry_point {
+        "nterp_entry_point"
+    } else if entry_point == bridge.nterp_with_clinit_entry_point {
+        "nterp_with_clinit_entry_point"
+    } else if entry_point == bridge.resolved_interpreter_bridge_entrypoint
+        || entry_point == bridge.quick_to_interpreter_bridge
+    {
+        "quick_to_interpreter_bridge"
+    } else if entry_point == bridge.resolved_resolution_entrypoint
+        || entry_point == bridge.quick_resolution_trampoline
+    {
+        "quick_resolution_trampoline"
+    } else if entry_point == bridge.resolved_jni_entrypoint || entry_point == bridge.quick_generic_jni_trampoline {
+        "quick_generic_jni_trampoline"
+    } else if entry_point == bridge.quick_imt_conflict_trampoline {
+        "quick_imt_conflict_trampoline"
+    } else {
+        "shared ART entrypoint"
+    }
+}
+
+unsafe fn ensure_dsl_target_has_independent_quick_code(
+    env: JniEnv,
+    class_name: &str,
+    method_name: &str,
+    sig: &str,
+    art_method: u64,
+) -> Result<(), String> {
+    let spec = get_art_method_spec(env, art_method);
+    let entry_point = read_entry_point(art_method, spec.entry_point_offset);
+    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+    if !is_code_pointer(entry_point) {
+        return Err(format!(
+            "DSL hook requires compiled/JIT quick code for {}.{}{}, but entry_point is not executable (ArtMethod={:#x}, entry={:#x}). Try Java.compileMethod(\"{}\", \"{}\", \"{}\", \"auto\") first.",
+            class_name, method_name, sig, art_method, entry_point, class_name, method_name, sig
+        ));
+    }
+    if is_art_quick_entrypoint(entry_point, bridge) {
+        return Err(format!(
+            "DSL hook only supports compiled/JIT quick entrypoints. {}.{}{} currently uses {} ({:#x}); not installing the nterp/shared-entry router. Call Java.compileMethod(\"{}\", \"{}\", \"{}\", \"auto\") or Java.use(\"{}\").{}.overload(\"{}\").opt() first, then install dslImpl again.",
+            class_name,
+            method_name,
+            sig,
+            shared_entrypoint_name(entry_point, bridge),
+            entry_point,
+            class_name,
+            method_name,
+            sig,
+            class_name,
+            method_name,
+            sig
+        ));
+    }
+    Ok(())
+}
 
 unsafe fn jni_failure_with_exception(env: JniEnv, context: &str) -> String {
     match jni_take_exception(env) {
@@ -926,48 +982,22 @@ unsafe fn install_managed_method_helper(
         class_global_ref,
     );
 
-    ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
+    if original_is_shared_entrypoint {
+        delete_local_ref(env, helper_cls);
+        return Err(format!(
+            "DSL hook only supports compiled/JIT quick entrypoints. {}.{}{} currently uses {} ({:#x}); call Java.compileMethod(...) or MethodWrapper.opt() before installing dslImpl.",
+            class_name,
+            method_name,
+            actual_sig,
+            shared_entrypoint_name(original_entry_point, bridge),
+            original_entry_point
+        ));
+    }
+
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    let (per_method_hook_target, quick_trampoline) = if original_is_shared_entrypoint {
-        set_managed_replacement_method(art_method, helper_art_method, 0);
-        install_guard.set_replacement_registered();
-        let (per_method_hook_target, _trampoline, _use_blr, _router_thunk_body, _original_entry_mutated) = match install_per_method_router_hook(
-            false,
-            original_entry_point,
-            &bridge,
-            ep_offset,
-            env,
-            art_method,
-            (original_access_flags & K_ACC_NATIVE) != 0,
-            true,
-            false,
-            false,
-        ) {
-            Ok(installed) => installed,
-            Err(e) => {
-                delete_local_ref(env, helper_cls);
-                return Err(e);
-            }
-        };
-        if let Some(backup_art_method) = orig_backup_art_method {
-            let orig_stub =
-                crate::ffi::hook::hook_create_managed_orig_stub(art_method, original_entry_point as *mut c_void);
-            if orig_stub.is_null() {
-                delete_local_ref(env, helper_cls);
-                return Err("hook_create_managed_orig_stub failed for shared entrypoint".to_string());
-            }
-            set_orig_backup_entrypoint(
-                backup_art_method,
-                spec.size,
-                spec.access_flags_offset,
-                ep_offset,
-                orig_stub as u64,
-            )?;
-        }
-        (per_method_hook_target, 0)
-    } else {
+    let (per_method_hook_target, quick_trampoline) = {
         let (hook_addr, stealth_flag, real_addr) =
             super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
                 .map_err(|e| format!("prepare_hook_target: {}", e))?;
@@ -1078,6 +1108,17 @@ unsafe fn install_count_orig_fast_path(
 
     let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
+    if original_is_shared_entrypoint {
+        return Err(format!(
+            "count-orig native fast path only supports compiled/JIT quick entrypoints. {}.{}{} currently uses {} ({:#x}); call Java.compileMethod(...) or MethodWrapper.opt() first.",
+            class_name,
+            method_name,
+            actual_sig,
+            shared_entrypoint_name(original_entry_point, bridge),
+            original_entry_point
+        ));
+    }
+
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
@@ -1090,18 +1131,12 @@ unsafe fn install_count_orig_fast_path(
         class_global_ref,
     );
 
-    ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
     let mut counter_ptrs = install_native_counter_ptrs(helper_class, counter_fields);
 
-    let (per_method_hook_target, quick_trampoline) = if original_is_shared_entrypoint {
-        return Err(format!(
-            "count-orig native fast path for shared ART entry {}.{}{} would require external ArtMethod entry stub; disabled",
-            class_name, method_name, actual_sig
-        ));
-    } else {
+    let (per_method_hook_target, quick_trampoline) = {
         let (hook_addr, stealth_flag, real_addr) =
             super::super::art_controller::prepare_hook_target(original_entry_point, env as *mut std::ffi::c_void)
                 .map_err(|e| format!("prepare_hook_target: {}", e))?;
@@ -1230,6 +1265,7 @@ pub(in crate::jsapi::java) unsafe fn install_managed_dsl_with_env(
             class_name, method_name, sig
         ));
     }
+    ensure_dsl_target_has_independent_quick_code(env, class_name, method_name, sig, art_method)?;
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
     let generated = build_managed_dsl_dex(
         env,
