@@ -620,6 +620,20 @@
         return invoker;
     }
 
+    function _makeHookOriginalInvoker(target, name) {
+        var invoker = function() {
+            return target.__$orig.apply(target, arguments);
+        };
+        invoker.overload = function() {
+            var sig = _resolveSingleOverload(target.__$hookClass || target.__jclass, name, arguments, null);
+            if (target.__$hookSig && sig !== target.__$hookSig) {
+                return _makeInstanceMethodInvoker(target, name, sig);
+            }
+            return _makeHookOriginalInvoker(target, name);
+        };
+        return invoker;
+    }
+
     // ========================================================================
     // Frida-style FieldWrapper: obj.field 返回 FieldWrapper，通过 .value 读写
     //   obj.field.value        — 读（每次 JNI GetField，无 FIELD_CACHE 锁）
@@ -811,6 +825,9 @@
                             _argsFrom(arguments, 2)
                         );
                     };
+                }
+                if (target.__$orig && prop === target.__$hookName) {
+                    return _makeHookOriginalInvoker(target, prop);
                 }
 
                 // 已缓存 — 直接返回（FieldWrapper 或 hybrid 函数）
@@ -1051,7 +1068,8 @@
                 // wrapCallback 的 ctx 是 Rust 侧注入的内部 hook-ctx 对象，
                 // 保留用于 origCallOriginal.apply(ctx, ...) 让 js_call_original 读到
                 // __hookCtxPtr / __hookArtMethod，用户层不再可见。
-                var wrapCallback = function(ctx) {
+                var makeWrapCallback = function(hookSig) {
+                    return function(ctx) {
                     // Wrap args → JS Proxy for Java objects, 其它原样
                     var rawArgs = ctx.args || [];
                     var wrappedArgs = new Array(rawArgs.length);
@@ -1082,7 +1100,10 @@
                         fnThis = _wrapJavaObjOnTarget({
                             __jptr: thisObjRaw,
                             __jclass: cls,
-                            __$orig: origWrapped
+                            __$orig: origWrapped,
+                            __$hookClass: cls,
+                            __$hookName: name,
+                            __$hookSig: hookSig
                         });
                     } else {
                         // 静态方法: 简单对象 + Frida-style 入口
@@ -1095,9 +1116,10 @@
                     return _withDirectHookBypassMany(bypassKeys, function() {
                         return userFn.apply(fnThis, wrappedArgs);
                     });
+                    };
                 };
                 for (var i = 0; i < sigs.length; i++) {
-                    _hook(cls, name, sigs[i], wrapCallback);
+                    _hook(cls, name, sigs[i], makeWrapCallback(sigs[i]));
                     _directHookImpls[_methodKey(cls, name, sigs[i])] = userFn;
                 }
                 this._fn = fn;

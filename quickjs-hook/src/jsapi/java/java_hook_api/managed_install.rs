@@ -10,11 +10,10 @@ use std::sync::{Mutex, OnceLock};
 use super::super::art_controller::refresh_walkstack_sigsegv_guard;
 use super::super::art_method::*;
 use super::super::callback::*;
+use super::super::java_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
-use super::install_support::{
-    create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard,
-};
+use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
 use super::managed_dex_builder::{
     build_java_worker_dex, build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral,
     MANAGED_MESSAGE_CAPACITY, MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_DROPPED_FIELD, MANAGED_MESSAGE_HEAD_FIELD,
@@ -43,8 +42,7 @@ fn shared_entrypoint_name(entry_point: u64, bridge: &ArtBridgeFunctions) -> &'st
         || entry_point == bridge.quick_to_interpreter_bridge
     {
         "quick_to_interpreter_bridge"
-    } else if entry_point == bridge.resolved_resolution_entrypoint
-        || entry_point == bridge.quick_resolution_trampoline
+    } else if entry_point == bridge.resolved_resolution_entrypoint || entry_point == bridge.quick_resolution_trampoline
     {
         "quick_resolution_trampoline"
     } else if entry_point == bridge.resolved_jni_entrypoint || entry_point == bridge.quick_generic_jni_trampoline {
@@ -962,12 +960,32 @@ unsafe fn install_managed_method_helper(
     let original_is_shared_entrypoint = is_art_quick_entrypoint(original_entry_point, bridge);
 
     let helper_spec = get_art_method_spec(env, helper_art_method);
-    let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
+    let mut helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
     if is_art_quick_entrypoint(helper_entry_point, bridge) {
+        let compile = compile_art_method_to_quick(
+            env,
+            helper_art_method,
+            helper_spec.entry_point_offset,
+            bridge,
+            RequestedCompileKind::Auto,
+        );
         output_message(&format!(
-            "[managedHook] helper still uses shared ART entrypoint {:#x}; installing via ArtMethod entrypoint",
-            helper_entry_point
+            "[managedHook] helper used shared ART entrypoint {:#x}; compile helper: success={} compiled={} kind={} message={}",
+            helper_entry_point, compile.success, compile.compiled, compile.kind, compile.message
         ));
+        helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
+        if is_art_quick_entrypoint(helper_entry_point, bridge) {
+            delete_local_ref(env, helper_cls);
+            return Err(format!(
+                "DSL helper did not compile to independent quick code: helper={}.{}{} entry={} ({:#x}); {}",
+                label,
+                helper_method_name_str,
+                helper_method_sig_str,
+                shared_entrypoint_name(helper_entry_point, bridge),
+                helper_entry_point,
+                compile.message
+            ));
+        }
     }
     let orig_bypass_art_method = art_method;
     let class_global_ref = create_class_global_ref(env, class_name)?;
