@@ -101,30 +101,28 @@ fn mark_original_entry_mutated(art_method: u64) {
 }
 
 fn schedule_internal_shared_entry_refresh(art_method: u64, ep_offset: usize, bridge: &'static ArtBridgeFunctions) {
-    let _ = std::thread::Builder::new()
-        .name("rf-art-entry-refresh".to_string())
-        .spawn(move || {
-            for delay_ms in [120_i64, 400, 900] {
-                crate::raw_thread::sleep_ms(delay_ms);
-                let still_registered =
-                    with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
-                if !still_registered {
-                    return;
-                }
-                let refreshed = unsafe {
-                    normalize_internal_shared_entry_if_needed(
-                        art_method,
-                        ep_offset,
-                        std::ptr::null_mut(),
-                        bridge,
-                        "delayed-entry-refresh",
-                    )
-                };
-                if refreshed {
-                    mark_original_entry_mutated(art_method);
-                }
+    let _ = crate::raw_thread::spawn_detached(b"rf-art-refresh\0", move || {
+        for delay_ms in [120_i64, 400, 900] {
+            crate::raw_thread::sleep_ms(delay_ms);
+            let still_registered =
+                with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
+            if !still_registered {
+                return;
             }
-        });
+            let refreshed = unsafe {
+                normalize_internal_shared_entry_if_needed(
+                    art_method,
+                    ep_offset,
+                    std::ptr::null_mut(),
+                    bridge,
+                    "delayed-entry-refresh",
+                )
+            };
+            if refreshed {
+                mark_original_entry_mutated(art_method);
+            }
+        }
+    });
 }
 
 unsafe fn free_callback_bytes(ctx: *mut ffi::JSContext, callback_bytes: [u8; 16]) {
