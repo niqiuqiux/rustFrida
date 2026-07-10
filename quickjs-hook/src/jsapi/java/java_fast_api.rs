@@ -1671,14 +1671,7 @@ impl JitCompileMethod {
         match self {
             Self::OsrOnly(f) => f(jit, method, thread, 0),
             Self::BaselineOsr(f) => f(jit, method, thread, Self::old_baseline_flag(compilation_kind), 0),
-            Self::BaselineOsrPrejit(f) => f(
-                jit,
-                method,
-                thread,
-                Self::old_baseline_flag(compilation_kind),
-                0,
-                0,
-            ),
+            Self::BaselineOsrPrejit(f) => f(jit, method, thread, Self::old_baseline_flag(compilation_kind), 0, 0),
             Self::KindPrejit(f) => f(jit, method, thread, compilation_kind, 0),
             Self::KindPrejitOsr(f) => f(jit, method, thread, compilation_kind, 0, 0),
         }
@@ -1746,8 +1739,7 @@ unsafe fn find_jit_compile_method() -> Option<(JitCompileMethod, &'static str)> 
     let baseline_osr_symbol = "_ZN3art3jit3Jit13CompileMethodEPNS_9ArtMethodEPNS_6ThreadEbb";
     let baseline_osr = crate::jsapi::module::libart_dlsym(baseline_osr_symbol);
     if !baseline_osr.is_null() {
-        type CompileMethodFn =
-            unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8) -> u8;
+        type CompileMethodFn = unsafe extern "C" fn(this: u64, method: u64, thread: u64, baseline: u8, osr: u8) -> u8;
         let compile_method: CompileMethodFn = std::mem::transmute(baseline_osr);
         return Some((JitCompileMethod::BaselineOsr(compile_method), baseline_osr_symbol));
     }

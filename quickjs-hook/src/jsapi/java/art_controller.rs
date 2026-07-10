@@ -2321,19 +2321,17 @@ unsafe fn remove_art_controller_hook(label: &str, addr: u64) {
 pub fn cut_art_controller_walkstack_guards() {
     let targets: Vec<(&'static str, u64)> = {
         let guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
-        let state = match guard.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
         let mut all: Vec<(&str, u64)> = Vec::new();
-        if state.oat_header_hook_target != 0 {
-            all.push(("OatHeader", state.oat_header_hook_target));
-        }
-        if state.pretty_method_hook_target != 0 {
-            all.push(("PrettyMethod", state.pretty_method_hook_target));
-        }
-        if state.decode_gc_masks_hook_target != 0 {
-            all.push(("DecodeGcMasks", state.decode_gc_masks_hook_target));
+        if let Some(state) = guard.as_ref() {
+            if state.oat_header_hook_target != 0 {
+                all.push(("OatHeader", state.oat_header_hook_target));
+            }
+            if state.pretty_method_hook_target != 0 {
+                all.push(("PrettyMethod", state.pretty_method_hook_target));
+            }
+            if state.decode_gc_masks_hook_target != 0 {
+                all.push(("DecodeGcMasks", state.decode_gc_masks_hook_target));
+            }
         }
         all
     };

@@ -25,6 +25,7 @@ struct DynamicManagedHelperRefs {
     class_global_ref: u64,
     loader_global_ref: u64,
     dex_bytes: Vec<u8>,
+    natives_registered: bool,
 }
 
 static DYNAMIC_MANAGED_HELPER_REFS: Mutex<Vec<DynamicManagedHelperRefs>> = Mutex::new(Vec::new());
@@ -141,6 +142,7 @@ unsafe fn load_dynamic_managed_helper_class(
             class_global_ref: 0,
             loader_global_ref: 0,
             dex_bytes,
+            natives_registered: false,
         });
         idx
     };
@@ -364,7 +366,7 @@ pub(crate) unsafe fn start_java_worker_thread(native_loop: *mut c_void) -> Resul
 
     let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
     let native_name = CString::new("nativeLoop").unwrap();
-    let native_sig = CString::new("()V").unwrap();
+    let native_sig = CString::new("()Z").unwrap();
     let methods = [JniNativeMethod {
         name: native_name.as_ptr(),
         signature: native_sig.as_ptr(),
@@ -453,6 +455,78 @@ pub(crate) unsafe fn start_java_worker_thread(native_loop: *mut c_void) -> Resul
         "[java worker] started ART-managed worker class={}",
         generated.class_name
     ));
+    Ok(())
+}
+
+pub(crate) unsafe fn finish_java_worker_thread_from_native(env: JniEnv, worker_cls: *mut c_void) -> Result<(), String> {
+    if env.is_null() || worker_cls.is_null() {
+        return Err("Java worker native release received null JNI arguments".to_string());
+    }
+    let worker = {
+        let guard = JAVA_WORKER_THREAD_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+        match *guard {
+            Some(worker) => worker as *mut c_void,
+            None => {
+                JAVA_WORKER_STARTED.store(false, Ordering::Release);
+                return Ok(());
+            }
+        }
+    };
+
+    let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+    let unregister_natives: UnregisterNativesFn = jni_fn!(env, UnregisterNativesFn, JNI_UNREGISTER_NATIVES);
+
+    let managed_helpers: Vec<(String, u64)> = {
+        let refs = DYNAMIC_MANAGED_HELPER_REFS.lock().unwrap_or_else(|e| e.into_inner());
+        refs.iter()
+            .filter(|slot| slot.natives_registered && slot.class_global_ref != 0)
+            .map(|slot| (slot.class_name.clone(), slot.class_global_ref))
+            .collect()
+    };
+    for (class_name, class_ref) in &managed_helpers {
+        if unregister_natives(env, *class_ref as *mut c_void) != 0 {
+            return Err(jni_failure_with_exception(
+                env,
+                &format!("UnregisterNatives failed for managed helper {}", class_name),
+            ));
+        }
+        if let Some(exc) = jni_take_exception(env) {
+            return Err(format!(
+                "UnregisterNatives failed for managed helper {}: {}",
+                class_name, exc
+            ));
+        }
+    }
+    if !managed_helpers.is_empty() {
+        let mut refs = DYNAMIC_MANAGED_HELPER_REFS.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in refs.iter_mut() {
+            if managed_helpers
+                .iter()
+                .any(|(_, class_ref)| *class_ref == slot.class_global_ref)
+            {
+                slot.natives_registered = false;
+            }
+        }
+        output_message(&format!(
+            "[java worker] removed native bindings from {} managed helper class(es)",
+            managed_helpers.len()
+        ));
+    }
+
+    if unregister_natives(env, worker_cls) != 0 {
+        return Err(jni_failure_with_exception(
+            env,
+            "UnregisterNatives failed for Java worker",
+        ));
+    }
+    if let Some(exc) = jni_take_exception(env) {
+        return Err(format!("UnregisterNatives failed for Java worker: {}", exc));
+    }
+
+    delete_global_ref(env, worker);
+    *JAVA_WORKER_THREAD_GLOBAL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    JAVA_WORKER_STARTED.store(false, Ordering::Release);
+    output_message("[java worker] stopped and native binding removed");
     Ok(())
 }
 
@@ -792,6 +866,13 @@ unsafe fn register_managed_guard_helpers(env: JniEnv, helper_cls: *mut c_void) -
         return Err("RegisterNatives failed for managed reentrancy guard helpers".to_string());
     }
     Ok(())
+}
+
+fn mark_managed_helper_natives_registered(class_name: &str) {
+    let mut refs = DYNAMIC_MANAGED_HELPER_REFS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = refs.iter_mut().find(|slot| slot.class_name == class_name) {
+        slot.natives_registered = true;
+    }
 }
 
 unsafe fn register_direct_buffer_helpers(env: JniEnv, helper_cls: *mut c_void) -> Result<(), String> {
@@ -1370,6 +1451,7 @@ pub(in crate::jsapi::java) unsafe fn install_managed_dsl_with_env(
     }
     let helper_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
     register_managed_guard_helpers(env, helper_cls)?;
+    mark_managed_helper_natives_registered(&generated.class_name);
     initialize_generated_string_literals(env, helper_cls, &generated.string_literals)?;
     initialize_generated_message_queue(env, helper_cls, &generated.message_channels, generated.message_capacity)?;
     if generated.uses_direct_buffer_helpers {

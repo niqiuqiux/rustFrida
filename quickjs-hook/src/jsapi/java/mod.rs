@@ -66,6 +66,13 @@ pub fn start_java_worker_thread(native_loop: *mut std::ffi::c_void) -> Result<()
     }
 }
 
+pub unsafe fn finish_java_worker_thread_from_native(
+    env: *mut *const *const std::ffi::c_void,
+    worker_cls: *mut std::ffi::c_void,
+) -> Result<(), String> {
+    java_hook_api::finish_java_worker_thread_from_native(env, worker_cls)
+}
+
 pub(crate) unsafe fn decode_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     art_class::decode_jobject(env, obj)
 }
