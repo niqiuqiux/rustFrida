@@ -5,6 +5,7 @@ use crate::ffi;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Class ID for NativePointer — global (not thread_local) so hook callbacks on
 /// arbitrary threads share the same ID and inherit the prototype (toString etc.).
@@ -13,8 +14,26 @@ static NATIVE_POINTER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 /// NativePointer class name
 const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
 
+struct OwnedAllocation {
+    addr: u64,
+}
+
+impl Drop for OwnedAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            libc::free(self.addr as *mut libc::c_void);
+        }
+    }
+}
+
+struct NativePointerData {
+    addr: u64,
+    owner: Option<Arc<OwnedAllocation>>,
+}
+
 /// Finalizer called by QuickJS GC when a NativePointer object is collected.
-/// Frees the 8-byte heap allocation created by Box::into_raw in create_native_pointer.
+/// Derived pointers share the allocation owner, so `Memory.alloc(n).add(k)`
+/// remains valid until the last related pointer is collected.
 unsafe extern "C" fn native_pointer_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSValue) {
     let class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
     if class_id == 0 {
@@ -22,7 +41,7 @@ unsafe extern "C" fn native_pointer_finalizer(_rt: *mut ffi::JSRuntime, val: ffi
     }
     let opaque = ffi::JS_GetOpaque(val, class_id);
     if !opaque.is_null() {
-        drop(Box::from_raw(opaque as *mut u64));
+        drop(Box::from_raw(opaque as *mut NativePointerData));
     }
 }
 
@@ -60,8 +79,11 @@ fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
     class_id
 }
 
-/// Create a NativePointer object
-pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
+fn create_native_pointer_with_owner(
+    ctx: *mut ffi::JSContext,
+    addr: u64,
+    owner: Option<Arc<OwnedAllocation>>,
+) -> JSValue {
     let class_id = get_or_init_class_id(ctx);
 
     unsafe {
@@ -72,16 +94,24 @@ pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
             return JSValue(obj);
         }
 
-        // Store the address as opaque data
-        let addr_ptr = Box::into_raw(Box::new(addr));
-        ffi::JS_SetOpaque(obj, addr_ptr as *mut _);
+        let data = Box::into_raw(Box::new(NativePointerData { addr, owner }));
+        ffi::JS_SetOpaque(obj, data as *mut _);
 
         JSValue(obj)
     }
 }
 
-/// Get address from NativePointer object
-pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
+/// Create a non-owning NativePointer object.
+pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
+    create_native_pointer_with_owner(ctx, addr, None)
+}
+
+/// Create a NativePointer that owns a libc allocation.
+pub(crate) fn create_owned_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
+    create_native_pointer_with_owner(ctx, addr, Some(Arc::new(OwnedAllocation { addr })))
+}
+
+fn clone_native_pointer_parts(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<(u64, Option<Arc<OwnedAllocation>>)> {
     let class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
     if class_id == 0 {
         return None;
@@ -92,12 +122,26 @@ pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Optio
         if opaque.is_null() {
             return None;
         }
-        Some(*(opaque as *const u64))
+        let data = &*(opaque as *const NativePointerData);
+        Some((data.addr, data.owner.clone()))
     }
+}
+
+/// Get address from NativePointer object
+pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
+    clone_native_pointer_parts(_ctx, val).map(|(addr, _)| addr)
 }
 
 fn format_native_pointer(addr: u64) -> String {
     format!("0x{:x}", addr)
+}
+
+fn native_pointer_as_i32(addr: u64) -> i32 {
+    addr as u32 as i32
+}
+
+fn native_pointer_as_u32(addr: u64) -> u32 {
+    addr as u32
 }
 
 /// ptr() function implementation
@@ -114,6 +158,7 @@ unsafe extern "C" fn js_ptr(
 
     let arg = JSValue(*argv);
     let addr: u64;
+    let mut owner = None;
 
     // Check argument type
     if arg.is_string() {
@@ -137,9 +182,10 @@ unsafe extern "C" fn js_ptr(
             return ffi::JS_ThrowTypeError(ctx, b"ptr() failed to convert numeric value\0".as_ptr() as *const _);
         }
         addr = v;
-    } else if let Some(ptr_addr) = get_native_pointer_addr(ctx, arg) {
+    } else if let Some((ptr_addr, ptr_owner)) = clone_native_pointer_parts(ctx, arg) {
         // Already a NativePointer
         addr = ptr_addr;
+        owner = ptr_owner;
     } else {
         return ffi::JS_ThrowTypeError(
             ctx,
@@ -147,7 +193,7 @@ unsafe extern "C" fn js_ptr(
         );
     }
 
-    create_native_pointer(ctx, addr).raw()
+    create_native_pointer_with_owner(ctx, addr, owner).raw()
 }
 
 /// Parse an offset argument for add()/sub() with strict type checking.
@@ -208,8 +254,8 @@ unsafe extern "C" fn native_pointer_add(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let this_val = JSValue(this);
-    let addr = match get_native_pointer_addr(ctx, this_val) {
-        Some(a) => a,
+    let (addr, owner) = match clone_native_pointer_parts(ctx, this_val) {
+        Some(parts) => parts,
         None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
     };
 
@@ -223,7 +269,7 @@ unsafe extern "C" fn native_pointer_add(
     };
     let new_addr = (addr as i64 + offset) as u64;
 
-    create_native_pointer(ctx, new_addr).raw()
+    create_native_pointer_with_owner(ctx, new_addr, owner).raw()
 }
 
 /// NativePointer.sub() implementation
@@ -234,8 +280,8 @@ unsafe extern "C" fn native_pointer_sub(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let this_val = JSValue(this);
-    let addr = match get_native_pointer_addr(ctx, this_val) {
-        Some(a) => a,
+    let (addr, owner) = match clone_native_pointer_parts(ctx, this_val) {
+        Some(parts) => parts,
         None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
     };
 
@@ -249,7 +295,7 @@ unsafe extern "C" fn native_pointer_sub(
     };
     let new_addr = (addr as i64 - offset) as u64;
 
-    create_native_pointer(ctx, new_addr).raw()
+    create_native_pointer_with_owner(ctx, new_addr, owner).raw()
 }
 
 /// NativePointer.toString() implementation
@@ -303,6 +349,32 @@ unsafe extern "C" fn native_pointer_to_number(
     ffi::JS_NewBigUint64(ctx, addr)
 }
 
+unsafe extern "C" fn native_pointer_to_int32(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let addr = match get_native_pointer_addr(ctx, JSValue(this)) {
+        Some(addr) => addr,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+    JSValue::int(native_pointer_as_i32(addr)).raw()
+}
+
+unsafe extern "C" fn native_pointer_to_uint32(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let addr = match get_native_pointer_addr(ctx, JSValue(this)) {
+        Some(addr) => addr,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+    ffi::qjs_new_uint32(ctx, native_pointer_as_u32(addr))
+}
+
 /// Register ptr() function and NativePointer class
 pub fn register_ptr(ctx: &JSContext) {
     let class_id = get_or_init_class_id(ctx.as_ptr());
@@ -324,6 +396,8 @@ pub fn register_ptr(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, proto, "toJSON", native_pointer_to_json, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toNumber", native_pointer_to_number, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toInt", native_pointer_to_number, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toInt32", native_pointer_to_int32, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toUInt32", native_pointer_to_uint32, 0);
 
         // Frida 兼容: 注册 Memory 读写方法到 NativePointer prototype
         // 支持 ptr.readU32() / ptr.writeU32(val) 调用风格
@@ -338,10 +412,18 @@ pub fn register_ptr(ctx: &JSContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_native_pointer;
+    use super::{format_native_pointer, native_pointer_as_i32, native_pointer_as_u32};
 
     #[test]
     fn formats_native_pointer_as_hex_string() {
         assert_eq!(format_native_pointer(0x1234_abcd), "0x1234abcd");
+    }
+
+    #[test]
+    fn truncates_native_pointer_to_32_bits() {
+        assert_eq!(native_pointer_as_i32(0xffff_ffff), -1);
+        assert_eq!(native_pointer_as_u32(0xffff_ffff), u32::MAX);
+        assert_eq!(native_pointer_as_i32(0x1_0000_0001), 1);
+        assert_eq!(native_pointer_as_u32(0x1_0000_0001), 1);
     }
 }

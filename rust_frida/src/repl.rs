@@ -98,12 +98,13 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
         .eval_state
         .recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS))
     {
-        Some(Ok(_)) => {
+        Some(Ok(ack)) if ack == "java-worker-ready" => {
             session
                 .java_worker_ready
                 .store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }
+        Some(Ok(ack)) => Err(format!("Java worker 初始化收到非预期响应: {}", ack)),
         Some(Err(e)) => Err(format!("Java worker 初始化失败: {}", e)),
         None => Err(format!(
             "等待 Java worker 初始化超时({}s)",

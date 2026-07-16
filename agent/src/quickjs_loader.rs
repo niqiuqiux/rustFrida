@@ -40,6 +40,23 @@ static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
 
+fn worker_diag(event: &str) {
+    if quickjs_hook::jsapi::console::is_verbose() {
+        crate::communication::write_stream_sync(
+            format!(
+                "[java worker diag] {}: requested={} started={} entered={} running={} eval_in_flight={}\n",
+                event,
+                JAVA_WORKER_START_REQUESTED.load(Ordering::Acquire),
+                JAVA_WORKER_STARTED.load(Ordering::Acquire),
+                JAVA_WORKER_LOOP_ENTERED.load(Ordering::Acquire),
+                JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire),
+                JAVA_WORKER_EVAL_IN_FLIGHT.load(Ordering::Acquire),
+            )
+            .as_bytes(),
+        );
+    }
+}
+
 enum JavaWorkerTask {
     Eval {
         script: String,
@@ -249,6 +266,7 @@ pub fn init() -> Result<(), String> {
 unsafe extern "C" fn java_worker_native_loop(_env: *mut *const *const std::ffi::c_void, _cls: *mut std::ffi::c_void) {
     JAVA_WORKER_LOOP_ENTERED.store(true, Ordering::Release);
     JAVA_WORKER_LOOP_RUNNING.store(true, Ordering::Release);
+    worker_diag("native loop entered");
     let result = std::panic::catch_unwind(|| loop {
         match JavaWorkerQueue::get().pop() {
             JavaWorkerTask::Eval {
@@ -257,8 +275,10 @@ unsafe extern "C" fn java_worker_native_loop(_env: *mut *const *const std::ffi::
                 init_engine,
                 reply,
             } => {
+                worker_diag("eval task begin");
                 let result = run_eval_task(&script, &filename, init_engine);
                 JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+                worker_diag("eval task end");
                 let _ = reply.send(result);
             }
             JavaWorkerTask::Stop => break,
@@ -301,6 +321,7 @@ fn wait_java_worker_loop_entered(timeout_ms: u64) -> bool {
 }
 
 pub fn start_java_worker() -> Result<(), String> {
+    worker_diag("start requested");
     if JAVA_WORKER_STARTED.load(Ordering::Acquire) {
         if JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
             return Ok(());
@@ -328,6 +349,7 @@ pub fn start_java_worker() -> Result<(), String> {
         ));
     }
     write_stream(b"[java worker] ready");
+    worker_diag("start complete");
     Ok(())
 }
 
@@ -370,6 +392,7 @@ fn wait_java_worker_stopped(had_worker: bool, timeout_ms: u64) -> bool {
 }
 
 pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
+    worker_diag("eval requested");
     start_java_worker()?;
     if !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
         return Err("Java worker loop is not running".to_string());
@@ -379,8 +402,10 @@ pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) 
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        worker_diag("eval rejected busy");
         return Err("Java worker busy: previous Java eval is still running".to_string());
     }
+    worker_diag("eval accepted");
     let (tx, rx) = mpsc::channel();
     queue.push(JavaWorkerTask::Eval {
         script,

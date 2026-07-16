@@ -482,6 +482,11 @@ fn park_agent_after_unsafe_unload() -> ! {
 }
 
 fn process_cmd(command: &str) {
+    #[cfg(feature = "quickjs")]
+    if quickjs_hook::jsapi::console::is_verbose() {
+        let name = command.split_whitespace().next().unwrap_or("(empty)");
+        crate::communication::write_stream_sync(format!("[command diag] {}\n", name).as_bytes());
+    }
     match command.split_whitespace().next() {
         Some("trace") => {
             let tid = command

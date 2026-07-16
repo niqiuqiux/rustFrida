@@ -4,8 +4,8 @@ use crate::data::{
 };
 use crate::state::{
     helper_log, log_trace_stats, reset_trace_stats, update_max, TraceWriter, TRACE_CHUNK_SIZE, TRACE_MAX_CHUNK_BYTES,
-    TRACE_MERGE_NS, TRACE_NEXT_SEQ, TRACE_OUTPUT_DIR, TRACE_PUBLISHED_SESSION, TRACE_PUBLISH_LOCK, TRACE_SESSION_SEQ,
-    TRACE_TRANSCODE_NS, TRACE_WRITER,
+    TRACE_MERGE_NS, TRACE_NEXT_SEQ, TRACE_PUBLISHED_SESSION, TRACE_PUBLISH_LOCK, TRACE_SESSION_SEQ, TRACE_TRANSCODE_NS,
+    TRACE_WRITER,
 };
 use std::fs::{create_dir_all, remove_file, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -46,10 +46,7 @@ fn open_trace_writer(base: &str, session_id: u64) -> Result<TraceWriter, String>
     })
 }
 
-pub(crate) fn start_trace_writer() -> Result<(), String> {
-    let Some(base) = TRACE_OUTPUT_DIR.get() else {
-        return Err("output dir not set".to_string());
-    };
+pub(crate) fn start_trace_writer(base: &str) -> Result<(), String> {
     let mut guard = TRACE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_some() {
         return Err("trace session already active".to_string());

@@ -90,6 +90,7 @@ struct HelperApi {
 
 static HELPER_API: OnceLock<HelperApi> = OnceLock::new();
 static QBDI_HELPER_HANDLE: OnceLock<usize> = OnceLock::new();
+const QBDI_HELPER_MODULE: &str = "libqbdi_helper.so";
 
 fn valid_package_name(name: &str) -> bool {
     !name.is_empty()
@@ -194,12 +195,19 @@ fn write_qbdi_helper_to_app_files(blob: &[u8]) -> Result<PathBuf, String> {
 }
 
 unsafe fn resolve_symbol(handle: *mut c_void, name: &str) -> *mut c_void {
-    let ptr = module_dlsym("qbdi_helper.so", name);
+    let ptr = module_dlsym(QBDI_HELPER_MODULE, name);
     if !ptr.is_null() {
         return ptr;
     }
     let sym = CString::new(name).unwrap();
     libc::dlsym(handle, sym.as_ptr())
+}
+
+unsafe fn find_loaded_helper_api() -> Result<Option<HelperApi>, String> {
+    if module_dlsym(QBDI_HELPER_MODULE, "qbdi_trace_last_error").is_null() {
+        return Ok(None);
+    }
+    build_helper_api(std::ptr::null_mut()).map(Some)
 }
 
 fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
@@ -208,7 +216,7 @@ fn verify_qbdi_helper_hide_result(handle: *mut c_void) {
         .find_map(|name| {
             let sym = CString::new(*name).unwrap();
             let ptr = unsafe {
-                let ptr = module_dlsym("qbdi_helper.so", sym.to_str().unwrap());
+                let ptr = module_dlsym(QBDI_HELPER_MODULE, sym.to_str().unwrap());
                 if ptr.is_null() {
                     libc::dlsym(handle, sym.as_ptr())
                 } else {
@@ -316,6 +324,12 @@ unsafe fn build_helper_api(handle: *mut c_void) -> Result<HelperApi, String> {
 fn load_qbdi_helper() -> Result<&'static HelperApi, String> {
     if let Some(api) = HELPER_API.get() {
         return Ok(api);
+    }
+
+    if let Some(api) = unsafe { find_loaded_helper_api()? } {
+        let _ = HELPER_API.set(api);
+        output_message("[qbdi] helper load: reusing loaded helper");
+        return Ok(HELPER_API.get().expect("helper api set"));
     }
 
     let helper_blob = qbdi_helper_blob().ok_or_else(|| "qbdi helper blob not configured".to_string())?;

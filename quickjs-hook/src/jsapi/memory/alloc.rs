@@ -13,33 +13,8 @@
 //!   - 额外用 JS_SetOpaque 存 owned 堆指针，finalizer 时 libc::free
 
 use crate::ffi;
-use crate::jsapi::ptr::create_native_pointer;
+use crate::jsapi::ptr::create_owned_native_pointer;
 use crate::value::JSValue;
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-/// 追踪由 Memory.alloc* 创建的指针，到 GC 时 free
-/// key: addr, value: layout size
-static OWNED_ALLOCS: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
-
-fn register_owned_alloc(addr: u64, size: usize) {
-    let mut guard = OWNED_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
-    guard.as_mut().unwrap().insert(addr, size);
-}
-
-/// 清理所有 owned 分配（engine cleanup 时调用）
-pub(crate) fn cleanup_owned_allocs() {
-    let mut guard = OWNED_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = guard.as_mut() {
-        for (&addr, _) in map.iter() {
-            unsafe { libc::free(addr as *mut libc::c_void) };
-        }
-        map.clear();
-    }
-}
 
 /// Memory.alloc(size) - 分配 size 字节，返回 NativePointer
 pub(super) unsafe extern "C" fn memory_alloc(
@@ -70,8 +45,7 @@ pub(super) unsafe extern "C" fn memory_alloc(
         return ffi::JS_ThrowInternalError(ctx, b"Memory.alloc() out of memory\0".as_ptr() as *const _);
     }
     let addr = mem as u64;
-    register_owned_alloc(addr, size);
-    create_native_pointer(ctx, addr).raw()
+    create_owned_native_pointer(ctx, addr).raw()
 }
 
 /// Memory.flushCodeCache(addr, size) - 刷新 instruction cache
@@ -226,6 +200,5 @@ pub(super) unsafe extern "C" fn memory_alloc_utf8_string(
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem as *mut u8, bytes.len());
     *(mem as *mut u8).add(bytes.len()) = 0;
     let addr = mem as u64;
-    register_owned_alloc(addr, total);
-    create_native_pointer(ctx, addr).raw()
+    create_owned_native_pointer(ctx, addr).raw()
 }

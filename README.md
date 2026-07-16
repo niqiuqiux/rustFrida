@@ -1529,7 +1529,7 @@ Memory.flushCodeCache(code, 16);
 
 **约束**：
 - 无效地址抛 `RangeError`；`readCString` 超过 4096B 抛
-- `Memory.alloc` 是 RWX 堆内存，GC 时自动释放；勿 `munmap`
+- `Memory.alloc*` 是 RWX 堆内存；原指针及其 `add/sub/ptr(existing)` 派生指针全部被 GC 后自动释放，勿 `munmap`
 - 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache
 - `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect`
 
@@ -1647,6 +1647,8 @@ var p = ptr("0x7f12345678");   // hex string / number / BigInt / NativePointer
 p.add(0x100).sub(0x10);        // 算术，返回新 NativePointer
 p.toString();                  // → "0x7f12345678"
 p.toInt();                     // → bigint (等价 toNumber)
+p.toInt32();                   // → 有符号低 32 位
+p.toUInt32();                  // → 无符号低 32 位
 
 // Frida 兼容读写（完整 API 见上面 Memory 章节）
 p.readU32();                   // 等价 Memory.readU32(p)
@@ -1660,6 +1662,7 @@ p.readPointer().readCString(); // 链式解引用
 | `p.add(offset)` / `p.sub(offset)` | `AddressLike` | `NativePointer` |
 | `p.toString()` / `p.toJSON()` | — | `string` (`"0x..."`) |
 | `p.toNumber()` / `p.toInt()` | — | `bigint` |
+| `p.toInt32()` / `p.toUInt32()` | — | `number`（低 32 位） |
 | `p.readU8/U16/U32/U64/Pointer()` | — | `number \| bigint \| NativePointer` |
 | `p.readCString()` / `p.readUtf8String()` | — | `string` |
 | `p.readByteArray(len)` | `number` | `ArrayBuffer` |
@@ -1730,7 +1733,7 @@ out.close();
 | `qbdi.removeAllInstrumentedRanges(vm)` | `number` | `boolean` |
 | `qbdi.allocateVirtualStack(vm, size)` | `number, number` | `boolean` |
 | `qbdi.simulateCall(vm, retAddr, ...args)` | `number, AddressLike, ...AddressLike` | `boolean` |
-| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike` | `NativePointer \| null` |
+| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike` | `number \| bigint \| null` |
 | `qbdi.run(vm, start, stop)` | `number, AddressLike, AddressLike` | `boolean` |
 | `qbdi.getGPR(vm, reg)` | `number, number` | `NativePointer` |
 | `qbdi.setGPR(vm, reg, value)` | `number, number, AddressLike` | `boolean` |
@@ -1772,6 +1775,7 @@ QBDI helper 运行时会被写入 App 私有目录再加载：
 ```
 
 这规避了 SELinux Enforcing 下普通 App 不能访问 `/data/local/tmp` SO 的问题。
+同一目标进程后续注入会复用这份 helper；agent shutdown 会结束 trace 并清空 VM/元数据状态，helper 映射随目标进程退出而释放。
 
 Host 侧可用 `qbdi-trace-dump` 直接输出明文：
 

@@ -1,6 +1,6 @@
 //! Memory write operations
 
-use super::helpers::{get_addr_this_or_arg, write_with_perm};
+use super::helpers::{get_addr_from_arg, get_addr_this_or_arg, write_with_perm};
 use super::writest::extract_bytes;
 use crate::ffi;
 use crate::jsapi::util::is_addr_accessible;
@@ -104,8 +104,35 @@ pub(super) unsafe extern "C" fn memory_write_pointer(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    // Same as writeU64
-    memory_write_u64(ctx, this, argc, argv)
+    let (addr, rem_argv, rem_argc) = match get_addr_this_or_arg(ctx, this, argc, argv) {
+        Some(v) => v,
+        None => return ffi::JS_ThrowTypeError(ctx, b"writePointer() requires a pointer\0".as_ptr() as *const _),
+    };
+    if rem_argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"writePointer() requires value argument\0".as_ptr() as *const _);
+    }
+    let value = match get_addr_from_arg(ctx, JSValue(*rem_argv)) {
+        Some(value) => value,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"writePointer() value must be a NativePointer or integer\0".as_ptr() as *const _,
+            )
+        }
+    };
+    if !is_addr_accessible(addr, std::mem::size_of::<u64>()) {
+        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
+    }
+    if !write_with_perm(addr, std::mem::size_of::<u64>(), || {
+        std::ptr::write_unaligned(addr as *mut u64, value);
+    }) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"writePointer(): target page is not writable; call Memory.protect(addr, size, \"rwx\") first\0".as_ptr()
+                as *const _,
+        );
+    }
+    JSValue::undefined().raw()
 }
 
 /// `Memory.writeBytes(ptr, bytes, stealth?)` / `ptr.writeBytes(bytes, stealth?)`

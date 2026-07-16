@@ -4,7 +4,7 @@ use qbdi::{VirtualStack, VM};
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 pub(crate) const TRACE_BUNDLE_MAGIC: &[u8; 4] = b"TRB1";
 pub(crate) const DYNAMIC_EXEC_CHUNK_SIZE: usize = 1024 * 1024;
@@ -34,7 +34,6 @@ pub(crate) struct ManagedVm {
 
 unsafe impl Send for ManagedVm {}
 
-pub(crate) static TRACE_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 pub(crate) static LAST_ERROR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 pub(crate) static TRACE_BUNDLE_METADATA: Mutex<Option<TraceBundleMetadata>> = Mutex::new(None);
 pub(crate) static TRACE_WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
@@ -143,10 +142,6 @@ pub extern "C" fn qbdi_trace_last_error() -> *const c_char {
     }
 }
 
-pub(crate) fn set_trace_output_dir(path: &str) {
-    let _ = TRACE_OUTPUT_DIR.set(path.to_string());
-}
-
 pub(crate) fn set_trace_bundle_metadata(module_path: String, module_base: u64) {
     *TRACE_BUNDLE_METADATA.lock().unwrap_or_else(|e| e.into_inner()) = Some(TraceBundleMetadata {
         module_path,
@@ -156,6 +151,15 @@ pub(crate) fn set_trace_bundle_metadata(module_path: String, module_base: u64) {
 
 pub(crate) fn get_trace_bundle_metadata() -> Option<TraceBundleMetadata> {
     TRACE_BUNDLE_METADATA.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub(crate) fn reset_helper_state() {
+    VM_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ADDED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    DUMPED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ADDED_MODULES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *TRACE_BUNDLE_METADATA.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    clear_last_error();
 }
 
 #[no_mangle]

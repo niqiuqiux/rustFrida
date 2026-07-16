@@ -1,6 +1,6 @@
 use crate::data::{DynamicExecChunk, ExternalReturn, MemAccess, TraceBundleEvent, TraceBundleEventKind, TraceContext};
 use crate::state::{
-    clear_last_error, get_trace_bundle_metadata, helper_log, set_last_error, set_trace_output_dir, ExecMap,
+    clear_last_error, get_trace_bundle_metadata, helper_log, reset_helper_state, set_last_error, ExecMap,
     ADDED_DYNAMIC_RANGES, ADDED_MODULES, DUMPED_DYNAMIC_RANGES, DYNAMIC_EXEC_CHUNK_SIZE, TRACE_EXECUTED_INSTRUCTIONS,
     TRACE_PROGRESS_EVERY,
 };
@@ -429,6 +429,7 @@ fn read_tpidr_el0() -> u64 {
 #[no_mangle]
 pub extern "C" fn qbdi_trace_shutdown() {
     shutdown_trace_writer();
+    reset_helper_state();
 }
 
 #[no_mangle]
@@ -449,8 +450,7 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(handle: u64, target: u64, out
             return -1;
         }
     };
-    set_trace_output_dir(output_dir);
-    if let Err(err) = start_trace_writer() {
+    if let Err(err) = start_trace_writer(output_dir) {
         set_last_error(err);
         return -1;
     }
