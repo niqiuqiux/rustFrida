@@ -81,6 +81,9 @@ pub use module::*;
 mod module_map;
 pub use module_map::*;
 
+mod module_registry;
+pub use module_registry::*;
+
 mod process;
 pub use process::*;
 

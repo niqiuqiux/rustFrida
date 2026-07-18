@@ -19,9 +19,15 @@ pub struct StalkerIterator<'a> {
     phantom: PhantomData<&'a frida_gum_sys::GumStalkerIterator>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StalkerMemoryAccess {
+    Open,
+    Exclusive,
+}
+
 extern "C" fn put_callout_callback(cpu_context: *mut frida_gum_sys::GumCpuContext, user_data: *mut c_void) {
     let mut f = unsafe { Box::from_raw(user_data as *mut Box<dyn FnMut(CpuContext)>) };
-    f(CpuContext::from_raw(cpu_context));
+    f(unsafe { CpuContext::from_raw(cpu_context) });
     // Leak the box again, we want to destruct it in the data_destroy callback.
     //
     Box::leak(f);
@@ -59,6 +65,14 @@ impl<'a> StalkerIterator<'a> {
 
     pub fn put_chaining_return(&self) {
         unsafe { frida_gum_sys::gum_stalker_iterator_put_chaining_return(self.iterator) };
+    }
+
+    pub fn memory_access(&self) -> StalkerMemoryAccess {
+        match unsafe { frida_gum_sys::gum_stalker_iterator_get_memory_access(self.iterator) } {
+            frida_gum_sys::GumMemoryAccess_GUM_MEMORY_ACCESS_OPEN => StalkerMemoryAccess::Open,
+            frida_gum_sys::GumMemoryAccess_GUM_MEMORY_ACCESS_EXCLUSIVE => StalkerMemoryAccess::Exclusive,
+            value => panic!("unknown Gum Stalker memory access value: {value}"),
+        }
     }
 }
 

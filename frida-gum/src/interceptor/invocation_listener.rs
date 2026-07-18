@@ -156,6 +156,6 @@ impl<'a> InvocationContext<'a> {
 
     /// Get the [`CpuContext`] at the time of invocation.
     pub fn cpu_context(&self) -> CpuContext<'_> {
-        CpuContext::from_raw(unsafe { (*self.context).cpu_context })
+        unsafe { CpuContext::from_raw((*self.context).cpu_context) }
     }
 }

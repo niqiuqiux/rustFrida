@@ -18,6 +18,14 @@ G_DEFINE_TYPE_EXTENDED(GumRustEventSink,
 static void
 gum_rust_event_sink_finalize(GObject *obj)
 {
+  GumRustEventSink *self = GUM_RUST_EVENT_SINK(obj);
+
+  if (self->rust.destroy != NULL)
+  {
+    self->rust.destroy(self->rust.user_data);
+    self->rust.user_data = NULL;
+  }
+
   G_OBJECT_CLASS(gum_rust_event_sink_parent_class)->finalize(obj);
 }
 

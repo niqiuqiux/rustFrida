@@ -33,7 +33,13 @@ pub struct CpuContext<'a> {
 }
 
 impl<'a> CpuContext<'a> {
-    pub(crate) fn from_raw(cpu_context: *mut GumCpuContext) -> CpuContext<'a> {
+    /// Wrap a raw Gum CPU context whose lifetime is managed by Gum.
+    ///
+    /// # Safety
+    ///
+    /// `cpu_context` must remain valid and exclusively writable for the
+    /// returned wrapper's lifetime.
+    pub unsafe fn from_raw(cpu_context: *mut GumCpuContext) -> CpuContext<'a> {
         CpuContext {
             cpu_context,
             phantom: PhantomData,
@@ -71,8 +77,7 @@ impl<'a> CpuContext<'a> {
     // TODO(meme) uint32_t r[8];
 
     #[cfg(target_arch = "aarch64")]
-    cpu_accesors!(u64, pc, sp, fp, lr);
-    // TODO(meme) uint8_t q[128]; uint64_t x[29];
+    cpu_accesors!(u64, pc, sp, fp, lr, nzcv);
 
     #[cfg(target_arch = "aarch64")]
     /// Get the value of the specified general purpose register.
@@ -86,6 +91,20 @@ impl<'a> CpuContext<'a> {
     pub fn set_reg(&mut self, index: usize, value: u64) {
         assert!(index < 29);
         unsafe { (*self.cpu_context).x[index] = value };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Read one of the 32 128-bit vector registers.
+    pub fn vector_reg(&self, index: usize) -> [u8; 16] {
+        assert!(index < 32);
+        unsafe { (*self.cpu_context).v[index].q }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Replace one of the 32 128-bit vector registers.
+    pub fn set_vector_reg(&mut self, index: usize, value: [u8; 16]) {
+        assert!(index < 32);
+        unsafe { (*self.cpu_context).v[index].q = value };
     }
 
     #[cfg(feature = "backtrace")]

@@ -26,6 +26,7 @@ typedef struct {
   void (*process)(void *user_data, const GumEvent *event);
   void (*flush)(void *user_data);
   void (*stop)(void *user_data);
+  void (*destroy)(void *user_data);
 } RustEventSinkVTable;
 
 struct _GumRustEventSink {

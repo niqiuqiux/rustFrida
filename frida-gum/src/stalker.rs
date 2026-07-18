@@ -41,10 +41,16 @@
 //! ```
 
 use {
-    crate::{Gum, MemoryRange, NativePointer},
-    core::ffi::c_void,
+    crate::{CpuContext, Gum, MemoryRange, NativePointer},
+    core::{ffi::c_void, marker::PhantomData},
     frida_gum_sys as gum_sys,
 };
+
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
+#[cfg(feature = "std")]
+use std::boxed::Box;
 
 #[cfg(feature = "event-sink")]
 mod event_sink;
@@ -91,6 +97,67 @@ pub use observer::*;
 pub struct Stalker {
     stalker: *mut frida_gum_sys::GumStalker,
     _gum: Gum,
+}
+
+/// Details for a call observed by a Stalker call probe.
+pub struct CallProbeDetails<'a> {
+    details: *mut gum_sys::GumCallDetails,
+    phantom: PhantomData<&'a mut gum_sys::GumCallDetails>,
+}
+
+/// Native callback invoked by a Stalker call probe.
+///
+/// `GumCallDetails` and the user-data pointer follow the same ABI as
+/// `gum_stalker_add_call_probe()`.
+pub type NativeCallProbeCallback = unsafe extern "C" fn(*mut gum_sys::GumCallDetails, *mut c_void);
+
+impl CallProbeDetails<'_> {
+    fn from_raw(details: *mut gum_sys::GumCallDetails) -> Self {
+        Self {
+            details,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Address of the function being called.
+    pub fn target_address(&self) -> NativePointer {
+        NativePointer(unsafe { (*self.details).target_address })
+    }
+
+    /// Address where the called function will return.
+    pub fn return_address(&self) -> NativePointer {
+        NativePointer(unsafe { (*self.details).return_address })
+    }
+
+    /// Stack pointer at the call site.
+    pub fn stack_data(&self) -> NativePointer {
+        NativePointer(unsafe { (*self.details).stack_data })
+    }
+
+    /// Mutable processor state backing the call's arguments.
+    pub fn cpu_context(&mut self) -> CpuContext<'_> {
+        unsafe { CpuContext::from_raw((*self.details).cpu_context) }
+    }
+}
+
+unsafe extern "C" fn call_probe_callback<F>(details: *mut gum_sys::GumCallDetails, user_data: *mut c_void)
+where
+    F: Fn(CallProbeDetails<'_>) + Send + Sync + 'static,
+{
+    if details.is_null() || user_data.is_null() {
+        return;
+    }
+    let callback = &*(user_data as *const F);
+    callback(CallProbeDetails::from_raw(details));
+}
+
+unsafe extern "C" fn call_probe_destroy<F>(user_data: *mut c_void)
+where
+    F: Fn(CallProbeDetails<'_>) + Send + Sync + 'static,
+{
+    if !user_data.is_null() {
+        drop(Box::from_raw(user_data as *mut F));
+    }
 }
 
 impl Stalker {
@@ -214,6 +281,51 @@ impl Stalker {
         unsafe { gum_sys::gum_stalker_follow(self.stalker, thread_id as GumThreadId, transformer.transformer, sink) };
     }
 
+    /// Begin tracing a thread with a sink whose lifetime is owned by Gum.
+    ///
+    /// This is the safe choice for long-lived tracing: the sink is destroyed only
+    /// after Gum releases its final reference during unfollow/stop.
+    #[cfg(feature = "event-sink")]
+    pub fn follow_with_owned_sink<S: EventSink + 'static>(
+        &mut self,
+        thread_id: usize,
+        transformer: Option<&Transformer>,
+        event_sink: S,
+    ) {
+        use frida_gum_sys::GumThreadId;
+
+        let sink = event_sink_transform_owned(event_sink);
+        let transformer = transformer.map_or(core::ptr::null_mut(), |value| value.transformer);
+        unsafe {
+            gum_sys::gum_stalker_follow(self.stalker, thread_id as GumThreadId, transformer, sink);
+            gum_sys::g_object_unref(sink as *mut c_void);
+        }
+    }
+
+    /// Begin tracing a thread and deliver each event directly to a native
+    /// callback instead of buffering it for a Rust/JavaScript consumer.
+    ///
+    /// # Safety
+    ///
+    /// `callback` and `data` must remain valid until the thread is unfollowed
+    /// and Gum has finished releasing the event sink.
+    #[cfg(feature = "event-sink")]
+    pub unsafe fn follow_with_native_sink(
+        &mut self,
+        thread_id: usize,
+        transformer: Option<&Transformer>,
+        event_mask: EventMask,
+        callback: NativeEventSinkCallback,
+        data: *mut c_void,
+    ) {
+        use frida_gum_sys::GumThreadId;
+
+        let sink = gum_sys::gum_event_sink_make_from_callback(event_mask.bits(), Some(callback), data, None);
+        let transformer = transformer.map_or(core::ptr::null_mut(), |value| value.transformer);
+        gum_sys::gum_stalker_follow(self.stalker, thread_id as GumThreadId, transformer, sink);
+        gum_sys::g_object_unref(sink as *mut c_void);
+    }
+
     /// Begin the Stalker on the current thread.
     ///
     /// A [`Transformer`] must be specified, and will be updated with all events.
@@ -230,6 +342,37 @@ impl Stalker {
         };
 
         unsafe { gum_sys::gum_stalker_follow_me(self.stalker, transformer.transformer, sink) };
+    }
+
+    /// Begin tracing the current thread with a sink whose lifetime is owned by Gum.
+    #[cfg(feature = "event-sink")]
+    pub fn follow_me_with_owned_sink<S: EventSink + 'static>(
+        &mut self,
+        transformer: Option<&Transformer>,
+        event_sink: S,
+    ) {
+        let sink = event_sink_transform_owned(event_sink);
+        let transformer = transformer.map_or(core::ptr::null_mut(), |value| value.transformer);
+        unsafe {
+            gum_sys::gum_stalker_follow_me(self.stalker, transformer, sink);
+            gum_sys::g_object_unref(sink as *mut c_void);
+        }
+    }
+
+    /// Begin tracing the current thread with synchronous native event
+    /// delivery. See [`Stalker::follow_with_native_sink`] for safety rules.
+    #[cfg(feature = "event-sink")]
+    pub unsafe fn follow_me_with_native_sink(
+        &mut self,
+        transformer: Option<&Transformer>,
+        event_mask: EventMask,
+        callback: NativeEventSinkCallback,
+        data: *mut c_void,
+    ) {
+        let sink = gum_sys::gum_event_sink_make_from_callback(event_mask.bits(), Some(callback), data, None);
+        let transformer = transformer.map_or(core::ptr::null_mut(), |value| value.transformer);
+        gum_sys::gum_stalker_follow_me(self.stalker, transformer, sink);
+        gum_sys::g_object_unref(sink as *mut c_void);
     }
 
     /// Begin the Stalker on the current thread.
@@ -269,6 +412,53 @@ impl Stalker {
     /// Pause the Stalker.
     pub fn deactivate(&mut self) {
         unsafe { gum_sys::gum_stalker_deactivate(self.stalker) }
+    }
+
+    /// Invalidate a translated block for every followed thread.
+    pub fn invalidate(&mut self, address: NativePointer) {
+        unsafe { gum_sys::gum_stalker_invalidate(self.stalker, address.0) }
+    }
+
+    /// Invalidate a translated block for one followed thread.
+    pub fn invalidate_for_thread(&mut self, thread_id: usize, address: NativePointer) {
+        unsafe { gum_sys::gum_stalker_invalidate_for_thread(self.stalker, thread_id as _, address.0) }
+    }
+
+    /// Register a callback invoked whenever a followed thread calls `target`.
+    pub fn add_call_probe<F>(&mut self, target: NativePointer, callback: F) -> u32
+    where
+        F: Fn(CallProbeDetails<'_>) + Send + Sync + 'static,
+    {
+        let user_data = Box::into_raw(Box::new(callback)) as *mut c_void;
+        unsafe {
+            gum_sys::gum_stalker_add_call_probe(
+                self.stalker,
+                target.0,
+                Some(call_probe_callback::<F>),
+                user_data,
+                Some(call_probe_destroy::<F>),
+            )
+        }
+    }
+
+    /// Register a call probe whose callback is native code.
+    ///
+    /// # Safety
+    ///
+    /// `callback` and `data` must remain valid until the probe is removed and
+    /// Gum has finished releasing translated blocks that reference it.
+    pub unsafe fn add_call_probe_native(
+        &mut self,
+        target: NativePointer,
+        callback: NativeCallProbeCallback,
+        data: *mut c_void,
+    ) -> u32 {
+        gum_sys::gum_stalker_add_call_probe(self.stalker, target.0, Some(callback), data, None)
+    }
+
+    /// Remove a call probe previously returned by [`Stalker::add_call_probe`].
+    pub fn remove_call_probe(&mut self, id: u32) {
+        unsafe { gum_sys::gum_stalker_remove_call_probe(self.stalker, id) }
     }
 
     /// Enable (experimental) unwind hooking
