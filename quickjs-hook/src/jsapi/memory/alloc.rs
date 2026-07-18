@@ -14,6 +14,7 @@
 
 use crate::ffi;
 use crate::jsapi::ptr::create_owned_native_pointer;
+use crate::jsapi::util::canonicalize_user_address;
 use crate::value::JSValue;
 
 /// Memory.alloc(size) - 分配 size 字节，返回 NativePointer
@@ -81,12 +82,9 @@ pub(super) unsafe extern "C" fn memory_protect(
         Err(e) => return e,
     };
     let size = match JSValue(*argv.add(1)).to_i64(ctx) {
-        Some(n) if n > 0 => n as usize,
+        Some(n) if (0..=0x7fff_ffff).contains(&n) => n as usize,
         _ => {
-            return ffi::JS_ThrowTypeError(
-                ctx,
-                b"Memory.protect: size must be positive integer\0".as_ptr() as *const _,
-            );
+            return ffi::JS_ThrowTypeError(ctx, b"Memory.protect: invalid size\0".as_ptr() as *const _);
         }
     };
     let prot_str = match JSValue(*argv.add(2)).to_string(ctx) {
@@ -99,29 +97,44 @@ pub(super) unsafe extern "C" fn memory_protect(
         }
     };
 
-    let mut prot: i32 = 0;
     let b = prot_str.as_bytes();
-    if b.len() >= 3 {
-        if b[0] == b'r' {
-            prot |= libc::PROT_READ;
-        }
-        if b[1] == b'w' {
-            prot |= libc::PROT_WRITE;
-        }
-        if b[2] == b'x' {
-            prot |= libc::PROT_EXEC;
-        }
-    } else {
+    if b.len() != 3 || !matches!(b[0], b'r' | b'-') || !matches!(b[1], b'w' | b'-') || !matches!(b[2], b'x' | b'-') {
         return ffi::JS_ThrowTypeError(
             ctx,
             b"Memory.protect: protection must be 3-char string like \"rwx\"\0".as_ptr() as *const _,
         );
     }
+    let mut prot: i32 = 0;
+    if b[0] == b'r' {
+        prot |= libc::PROT_READ;
+    }
+    if b[1] == b'w' {
+        prot |= libc::PROT_WRITE;
+    }
+    if b[2] == b'x' {
+        prot |= libc::PROT_EXEC;
+    }
 
-    // mprotect 要求 addr 页对齐; 自动 round down. size 自动 round up 到跨页尾.
-    const PAGE_SIZE: usize = 0x1000;
-    let page_start = (addr as usize) & !(PAGE_SIZE - 1);
-    let page_end = ((addr as usize + size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if size == 0 {
+        return JSValue::bool(true).raw();
+    }
+
+    // Android devices may use 4K, 16K, or 64K pages.
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+    if page_size <= 0 {
+        return ffi::JS_ThrowInternalError(ctx, b"Memory.protect: unable to query page size\0".as_ptr() as *const _);
+    }
+    let page_size = page_size as usize;
+    let addr = canonicalize_user_address(addr);
+    let range_end = match (addr as usize).checked_add(size) {
+        Some(value) => value,
+        None => return ffi::JS_ThrowRangeError(ctx, b"Memory.protect: address range overflow\0".as_ptr() as *const _),
+    };
+    let page_start = (addr as usize) & !(page_size - 1);
+    let page_end = match range_end.checked_add(page_size - 1) {
+        Some(value) => value & !(page_size - 1),
+        None => return ffi::JS_ThrowRangeError(ctx, b"Memory.protect: address range overflow\0".as_ptr() as *const _),
+    };
     let page_len = page_end - page_start;
 
     if libc::mprotect(page_start as *mut libc::c_void, page_len, prot) != 0 {
@@ -162,6 +175,7 @@ pub(super) unsafe extern "C" fn memory_flush_code_cache(
     extern "C" {
         fn __clear_cache(start: *mut std::ffi::c_void, end: *mut std::ffi::c_void);
     }
+    let addr = canonicalize_user_address(addr);
     let start = addr as *mut std::ffi::c_void;
     let end = (addr as usize + size) as *mut std::ffi::c_void;
     __clear_cache(start, end);
@@ -201,4 +215,45 @@ pub(super) unsafe extern "C" fn memory_alloc_utf8_string(
     *(mem as *mut u8).add(bytes.len()) = 0;
     let addr = mem as u64;
     create_owned_native_pointer(ctx, addr).raw()
+}
+
+/// Memory.allocUtf16String(str) - allocate a native-endian UTF-16 string.
+pub(super) unsafe extern "C" fn memory_alloc_utf16_string(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Memory.allocUtf16String() requires 1 argument: str\0".as_ptr() as *const _,
+        );
+    }
+    let string = match JSValue(*argv).to_string(ctx) {
+        Some(value) => value,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Memory.allocUtf16String() argument must be a string\0".as_ptr() as *const _,
+            )
+        }
+    };
+    let units: Vec<u16> = string.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_length = units.len() * std::mem::size_of::<u16>();
+    let memory = libc::malloc(byte_length);
+    if memory.is_null() {
+        return ffi::JS_ThrowInternalError(ctx, b"Memory.allocUtf16String() out of memory\0".as_ptr() as *const _);
+    }
+    std::ptr::copy_nonoverlapping(units.as_ptr(), memory as *mut u16, units.len());
+    create_owned_native_pointer(ctx, memory as u64).raw()
+}
+
+pub(super) unsafe extern "C" fn memory_alloc_ansi_string(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    ffi::JS_ThrowTypeError(ctx, b"ANSI API is only applicable on Windows\0".as_ptr() as *const _)
 }

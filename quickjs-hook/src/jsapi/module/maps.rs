@@ -37,26 +37,12 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
 /// Find a loaded module's file path and base address by name.
 /// Returns `None` if not found. Used by `module_dlsym` for direct ELF parsing.
 fn find_module_path_and_base(module_name: &str) -> Option<(String, u64)> {
-    {
-        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(found) = guard.snapshot.find_module_path_and_base(module_name) {
-            return Some(found);
-        }
-    }
-
     let snapshot = refresh_module_snapshot_cache();
     snapshot.find_module_path_and_base(module_name)
 }
 
 /// Parse /proc/self/maps to find a module's base address.
 pub(crate) fn find_module_base(module_name: &str) -> u64 {
-    {
-        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(base) = guard.snapshot.find_module_base(module_name) {
-            return base;
-        }
-    }
-
     let snapshot = refresh_module_snapshot_cache();
     snapshot.find_module_base(module_name).unwrap_or(0)
 }
@@ -268,44 +254,18 @@ impl ModuleSnapshot {
     }
 }
 
-#[derive(Clone, Debug)]
-struct AddressLookupHint {
-    entry: ModuleMapEntry,
-    module: ModuleInfo,
-}
-
 #[derive(Clone, Debug, Default)]
 struct ModuleCache {
     snapshot: ModuleSnapshot,
-    lookup_hint: Option<AddressLookupHint>,
 }
 
 impl ModuleCache {
     fn new(snapshot: ModuleSnapshot) -> Self {
-        Self {
-            snapshot,
-            lookup_hint: None,
-        }
+        Self { snapshot }
     }
 
     fn refresh_snapshot(&mut self, snapshot: ModuleSnapshot) {
         self.snapshot = snapshot;
-        self.lookup_hint = None;
-    }
-
-    fn lookup_hint(&self, addr: u64) -> Option<ModuleInfo> {
-        self.lookup_hint
-            .as_ref()
-            .filter(|hint| hint.entry.contains(addr))
-            .map(|hint| hint.module.clone())
-    }
-
-    fn update_lookup_hint(&mut self, entry: ModuleMapEntry, module: ModuleInfo) -> ModuleInfo {
-        self.lookup_hint = Some(AddressLookupHint {
-            entry,
-            module: module.clone(),
-        });
-        module
     }
 }
 
@@ -390,40 +350,20 @@ fn find_module_by_address_in_entries(
     snapshot.find_module_by_address(addr).map(|(_, module)| module)
 }
 
-fn try_find_module_by_address_in_cache(addr: u64) -> Option<ModuleInfo> {
-    {
-        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(module) = guard.lookup_hint(addr) {
-            return Some(module);
-        }
-    }
-
-    let mut guard = module_cache().write().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(module) = guard.lookup_hint(addr) {
-        return Some(module);
-    }
-
-    let (entry, module) = guard.snapshot.find_module_by_address(addr)?;
-    Some(guard.update_lookup_hint(entry, module))
-}
-
 fn refresh_and_find_module_by_address(addr: u64) -> Option<ModuleInfo> {
     let snapshot = ModuleSnapshot::load_current();
-    let found = snapshot.find_module_by_address(addr);
+    let found = snapshot
+        .find_module_by_address(addr)
+        .map(|(_, module)| module);
 
     let mut guard = module_cache().write().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.refresh_snapshot(snapshot);
-    guard.lookup_hint = found.as_ref().map(|(entry, module)| AddressLookupHint {
-        entry: entry.clone(),
-        module: module.clone(),
-    });
-
-    found.map(|(_, module)| module)
+    found
 }
 
 /// Find the module containing `addr` and return the module-wide aggregated range.
 fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
-    try_find_module_by_address_in_cache(addr).or_else(|| refresh_and_find_module_by_address(addr))
+    refresh_and_find_module_by_address(addr)
 }
 
 pub(crate) fn is_address_in_loaded_module(addr: u64) -> bool {
@@ -647,5 +587,23 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
                 path: "/tmp/libfoo.so".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn refreshed_snapshot_drops_unloaded_modules() {
+        let loaded_maps = "\
+1000-2000 r-xp 00000000 00:00 0 /tmp/libgone.so
+2000-2800 r--p 00001000 00:00 0 /tmp/libgone.so
+";
+        let mut cache = ModuleCache::new(ModuleSnapshot::from_entries(
+            parse_module_map_entries(loaded_maps),
+        ));
+        assert_eq!(cache.snapshot.find_module_base("libgone.so"), Some(0x1000));
+        assert!(cache.snapshot.find_module_by_address(0x1800).is_some());
+
+        cache.refresh_snapshot(ModuleSnapshot::from_entries(Vec::new()));
+        assert_eq!(cache.snapshot.find_module_base("libgone.so"), None);
+        assert_eq!(cache.snapshot.find_module_path_and_base("libgone.so"), None);
+        assert!(cache.snapshot.find_module_by_address(0x1800).is_none());
     }
 }

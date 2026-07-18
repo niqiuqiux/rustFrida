@@ -617,3 +617,7 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
 
     had_exception
 }
+pub(crate) unsafe fn discard_pending_exception(ctx: *mut ffi::JSContext) {
+    let exception = ffi::JS_GetException(ctx);
+    ffi::qjs_free_value(ctx, exception);
+}

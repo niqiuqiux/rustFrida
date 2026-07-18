@@ -88,9 +88,69 @@ pub(crate) fn proc_maps_entries(maps: &str) -> impl Iterator<Item = ProcMapEntry
     maps.lines().filter_map(parse_proc_map_line)
 }
 
+/// Kernel VM interfaces and `/proc/self/maps` expect an untagged address even
+/// though Android's allocator may return pointers using the AArch64 top byte.
+#[inline]
+pub(crate) fn canonicalize_user_address(addr: u64) -> u64 {
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    {
+        addr & 0x00ff_ffff_ffff_ffff
+    }
+    #[cfg(not(all(target_os = "android", target_arch = "aarch64")))]
+    {
+        addr
+    }
+}
+
+/// Return the protection flags of the mapping containing `addr`.
+pub(crate) fn query_page_protection(addr: u64) -> Option<i32> {
+    let addr = canonicalize_user_address(addr);
+    let maps = read_proc_self_maps()?;
+    let protection = proc_maps_entries(&maps)
+        .find(|entry| entry.contains(addr))
+        .map(|entry| entry.prot_flags());
+    protection
+}
+
+/// Check that every byte in `[addr, addr + size)` is mapped and has all of
+/// `required` protection flags. Adjacent VMAs are handled independently.
+pub(crate) fn range_has_protection(addr: u64, size: usize, required: i32) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let addr = canonicalize_user_address(addr);
+    let end = match addr.checked_add(size as u64) {
+        Some(end) if end > addr => end,
+        _ => return false,
+    };
+    let maps = match read_proc_self_maps() {
+        Some(maps) => maps,
+        None => return false,
+    };
+
+    let mut cursor = addr;
+    for entry in proc_maps_entries(&maps) {
+        if entry.end <= cursor {
+            continue;
+        }
+        if entry.start > cursor {
+            return false;
+        }
+        if (entry.prot_flags() & required) != required {
+            return false;
+        }
+        cursor = entry.end.min(end);
+        if cursor == end {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if [addr, addr+size) is accessible using mincore(2).
 /// Returns false for null/zero or unmapped pages.
 pub(crate) fn is_addr_accessible(addr: u64, size: usize) -> bool {
+    let addr = canonicalize_user_address(addr);
     if addr == 0 || size == 0 {
         return false;
     }

@@ -12,7 +12,7 @@ use crate::ffi;
 use crate::value::JSValue;
 
 /// 提取 JS 端 bytes 参数（ArrayBuffer / TypedArray / Array<number>）到 `Vec<u8>`。
-pub(super) unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Result<Vec<u8>, ffi::JSValue> {
+pub(crate) unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Result<Vec<u8>, ffi::JSValue> {
     // JS_GetArrayBuffer 对合法 ArrayBuffer 返回 (data_ptr, byte_length)；对非 AB
     // 返回 NULL+size=0. 空 AB 会返回非 NULL + size=0（data 分配存在但长度 0），
     // 我们把它视作有效输入并返回空 Vec，避免上层 reject empty ArrayBuffer 输入。
@@ -22,6 +22,7 @@ pub(super) unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Re
         let slice = std::slice::from_raw_parts(buf_ptr, size);
         return Ok(slice.to_vec());
     }
+    crate::jsapi::callback_util::discard_pending_exception(ctx);
 
     let mut byte_offset: usize = 0;
     let mut byte_length: usize = 0;
@@ -53,8 +54,7 @@ pub(super) unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Re
     }
 
     if ffi::JS_IsArray(ctx, val.raw()) != 0 {
-        let len_val_raw = ffi::qjs_get_property(ctx, val.raw(), ffi::JS_NewAtom(ctx, b"length\0".as_ptr() as *const _));
-        let len_val = JSValue(len_val_raw);
+        let len_val = val.get_property(ctx, "length");
         let len_i = len_val.to_i64(ctx).unwrap_or(0);
         len_val.free(ctx);
         if len_i < 0 {
