@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 已完成，Goal 01 待执行）
+> 状态：执行中（Goal 00 已完成，Goal 01 devkit 阶段已完成）
 >
 > 更新日期：2026-07-19
 >
@@ -168,6 +168,29 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 - README 中的全局对象列表由快照校验，发现漂移时测试失败。
 
 ### Goal 01：受控同步 Gum tag 后修复（P0）
+
+状态：**执行中（可复现 devkit 已落地，设备卸载/重载回归待完成）**。
+
+当前 devkit 证据：
+
+- `frida-gum-sys/FRIDA_GUM_DEVKIT.json` 固定 Frida root `200c682e`、Gum `867975dc` 和必需修复 `8f514005`。
+- 构建目标为 Android arm64/API 21，使用 NDK `29.0.14206865`；NDK 归档 SHA-1 为 `87e2bb7e9be5d6a1c6cdf5ec40dd4e0c6d07c30b`。
+- manifest 同时固定 configure 参数、`frida-gum.h` 和 `libfrida-gum.a` 的文件大小与 SHA-256。
+- `scripts/build-frida-gum-devkit.py` 在构建前校验源码 revision、工作树和 NDK，在构建后校验 artifact。
+- 设置 `FRIDA_GUM_DEVKIT_DIR` 时，`frida-gum-sys/build.rs` 会重新校验 manifest 和 artifact；不设置时仍使用 `FRIDA_VERSION = 17.15.5` 的官方 release devkit。
+
+复建与选择本地 devkit：
+
+```bash
+python3 scripts/build-frida-gum-devkit.py \
+  --frida-source /home/qiu/Android/frida \
+  --ndk /home/qiu/Android/Sdk/ndk/29.0.14206865
+
+export FRIDA_GUM_DEVKIT_DIR=/home/qiu/Android/frida/subprojects/frida-gum/build/gum/devkit
+cargo build --offline --release --target aarch64-linux-android
+```
+
+只复核已存在的 devkit 时增加 `--check`，不会重新配置或编译 Gum。NDK r29 的官方归档地址为 `https://dl.google.com/android/repository/android-ndk-r29-linux.zip`，安装时应保留现有 r28，不能覆盖项目当前默认工具链。
 
 目标：吸收 `8f514005` 的模块卸载安全修复，同时保持 devkit 可复现。
 

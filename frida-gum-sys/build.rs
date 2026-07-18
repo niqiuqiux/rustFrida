@@ -6,13 +6,137 @@
 
 extern crate bindgen;
 
+use ring::digest::{Context, SHA256};
+use serde::Deserialize;
 use std::env;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+const LOCAL_DEVKIT_ENV: &str = "FRIDA_GUM_DEVKIT_DIR";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevkitManifest {
+    schema_version: u32,
+    kind: String,
+    frida_revision: String,
+    gum_revision: String,
+    required_fixes: Vec<String>,
+    target: DevkitTarget,
+    artifacts: DevkitArtifacts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DevkitTarget {
+    os: String,
+    arch: String,
+}
+
+#[derive(Deserialize)]
+struct DevkitArtifacts {
+    header: DevkitArtifact,
+    archive: DevkitArtifact,
+}
+
+#[derive(Deserialize)]
+struct DevkitArtifact {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+fn sha256(path: &Path) -> String {
+    let mut file =
+        File::open(path).unwrap_or_else(|error| panic!("failed to open devkit artifact {}: {error}", path.display()));
+    let mut digest = Context::new(&SHA256);
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("failed to read devkit artifact {}: {error}", path.display()));
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let mut result = String::with_capacity(64);
+    for byte in digest.finish().as_ref() {
+        write!(result, "{byte:02x}").unwrap();
+    }
+    result
+}
+
+fn validate_artifact(devkit_dir: &Path, artifact: &DevkitArtifact) {
+    let path = devkit_dir.join(&artifact.path);
+    let metadata = path
+        .metadata()
+        .unwrap_or_else(|error| panic!("missing devkit artifact {}: {error}", path.display()));
+    assert!(metadata.is_file(), "devkit artifact is not a file: {}", path.display());
+    assert_eq!(
+        metadata.len(),
+        artifact.size,
+        "devkit artifact size mismatch: {}",
+        path.display()
+    );
+    assert_eq!(
+        sha256(&path),
+        artifact.sha256,
+        "devkit artifact SHA-256 mismatch: {}",
+        path.display()
+    );
+}
+
+fn use_local_devkit(devkit_dir: PathBuf, target_os: &str, target_arch: &str, use_gum_js: bool) -> PathBuf {
+    assert!(!use_gum_js, "{LOCAL_DEVKIT_ENV} currently provides a Gum-only devkit");
+
+    let manifest: DevkitManifest =
+        serde_json::from_str(include_str!("FRIDA_GUM_DEVKIT.json")).expect("invalid FRIDA_GUM_DEVKIT.json");
+    assert_eq!(manifest.schema_version, 1, "unsupported Gum devkit manifest schema");
+    assert_eq!(manifest.kind, "gum", "local devkit manifest kind mismatch");
+    assert_eq!(manifest.target.os, target_os, "local devkit target OS mismatch");
+    assert_eq!(
+        manifest.target.arch, target_arch,
+        "local devkit target architecture mismatch"
+    );
+    assert_eq!(
+        manifest.frida_revision.len(),
+        40,
+        "invalid Frida source revision in local devkit manifest"
+    );
+    assert_eq!(
+        manifest.gum_revision.len(),
+        40,
+        "invalid Gum source revision in local devkit manifest"
+    );
+    assert!(
+        !manifest.required_fixes.is_empty(),
+        "local devkit manifest does not record required fixes"
+    );
+
+    validate_artifact(&devkit_dir, &manifest.artifacts.header);
+    validate_artifact(&devkit_dir, &manifest.artifacts.archive);
+
+    println!("cargo:rustc-link-search=native={}", devkit_dir.display());
+    println!("cargo:rustc-link-lib=static=frida-gum");
+    println!(
+        "cargo:warning=Using pinned local Gum devkit at {} (Gum revision {})",
+        devkit_dir.display(),
+        manifest.gum_revision
+    );
+
+    devkit_dir
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=FRIDA_GUM_DEVKIT.json");
+    println!("cargo:rerun-if-env-changed={LOCAL_DEVKIT_ENV}");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap();
 
     let docs = std::env::var("DOCS_RS").is_ok();
@@ -54,21 +178,36 @@ fn main() {
 
     println!("cargo:rustc-link-search={}", env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    #[cfg(feature = "auto-download")]
-    let include_dir = {
-        use frida_build::download_and_use_devkit;
-        if cfg!(feature = "js") {
-            download_and_use_devkit("gumjs", include_str!("FRIDA_VERSION").trim())
-        } else {
-            download_and_use_devkit("gum", include_str!("FRIDA_VERSION").trim())
+    let include_dir = if let Some(devkit_dir) = env::var_os(LOCAL_DEVKIT_ENV) {
+        Some(use_local_devkit(
+            PathBuf::from(devkit_dir),
+            &target_os,
+            &target_arch,
+            use_gum_js,
+        ))
+    } else {
+        #[cfg(feature = "auto-download")]
+        {
+            use frida_build::download_and_use_devkit;
+            let kind = if cfg!(feature = "js") { "gumjs" } else { "gum" };
+            Some(PathBuf::from(download_and_use_devkit(
+                kind,
+                include_str!("FRIDA_VERSION").trim(),
+            )))
+        }
+        #[cfg(not(feature = "auto-download"))]
+        {
+            None
         }
     };
 
     #[cfg(not(feature = "auto-download"))]
-    if cfg!(feature = "js") {
-        println!("cargo:rustc-link-lib=frida-gumjs");
-    } else {
-        println!("cargo:rustc-link-lib=frida-gum");
+    if include_dir.is_none() {
+        if cfg!(feature = "js") {
+            println!("cargo:rustc-link-lib=frida-gumjs");
+        } else {
+            println!("cargo:rustc-link-lib=frida-gum");
+        }
     }
 
     if target_os != "android" && (target_os == "linux" || target_vendor == "apple") {
@@ -79,11 +218,9 @@ fn main() {
         .use_core()
         .formatter(bindgen::Formatter::Prettyplease);
 
-    #[cfg(feature = "auto-download")]
-    let bindings = bindings.clang_arg(format!("-I{include_dir}"));
-
-    #[cfg(not(feature = "auto-download"))]
-    let bindings = if docs {
+    let bindings = if let Some(ref include_dir) = include_dir {
+        bindings.clang_arg(format!("-I{}", include_dir.display()))
+    } else if docs {
         bindings.clang_arg("-Iinclude")
     } else {
         bindings
@@ -122,12 +259,11 @@ fn main() {
     {
         let mut builder = cc::Build::new();
 
-        #[cfg(feature = "auto-download")]
-        #[allow(unused_mut)]
-        let mut builder = builder.include(include_dir.clone());
-
-        #[cfg(not(feature = "auto-download"))]
-        let builder = if docs { builder.include("include") } else { &mut builder };
+        if let Some(ref include_dir) = include_dir {
+            builder.include(include_dir);
+        } else if docs {
+            builder.include("include");
+        }
 
         builder
             .file("event_sink.c")
@@ -140,12 +276,11 @@ fn main() {
     {
         let mut builder = cc::Build::new();
 
-        #[cfg(feature = "auto-download")]
-        #[allow(unused_mut)]
-        let mut builder = builder.include(include_dir.clone());
-
-        #[cfg(not(feature = "auto-download"))]
-        let builder = if docs { builder.include("include") } else { &mut builder };
+        if let Some(ref include_dir) = include_dir {
+            builder.include(include_dir);
+        } else if docs {
+            builder.include("include");
+        }
 
         builder
             .file("invocation_listener.c")
@@ -155,12 +290,11 @@ fn main() {
 
         let mut builder = cc::Build::new();
 
-        #[cfg(feature = "auto-download")]
-        #[allow(unused_mut)]
-        let mut builder = builder.include(include_dir.clone());
-
-        #[cfg(not(feature = "auto-download"))]
-        let builder = if docs { builder.include("include") } else { &mut builder };
+        if let Some(ref include_dir) = include_dir {
+            builder.include(include_dir);
+        } else if docs {
+            builder.include("include");
+        }
         builder
             .file("probe_listener.c")
             .opt_level(3)
@@ -172,12 +306,11 @@ fn main() {
     {
         let mut builder = cc::Build::new();
 
-        #[cfg(feature = "auto-download")]
-        #[allow(unused_mut)]
-        let mut builder = builder.include(include_dir.clone());
-
-        #[cfg(not(feature = "auto-download"))]
-        let builder = if docs { builder.include("include") } else { &mut builder };
+        if let Some(ref include_dir) = include_dir {
+            builder.include(include_dir);
+        } else if docs {
+            builder.include("include");
+        }
 
         builder
             .file("stalker_observer.c")
@@ -190,12 +323,11 @@ fn main() {
     {
         let mut builder = cc::Build::new();
 
-        #[cfg(feature = "auto-download")]
-        #[allow(unused_mut)]
-        let mut builder = builder.include(include_dir);
-
-        #[cfg(not(feature = "auto-download"))]
-        let builder = if docs { builder.include("include") } else { &mut builder };
+        if let Some(ref include_dir) = include_dir {
+            builder.include(include_dir);
+        } else if docs {
+            builder.include("include");
+        }
 
         builder
             .file("stalker_params.c")

@@ -14,4 +14,7 @@ tools/*_test.sh
 tools/
 CLAUDE.md
 scripts/
+!scripts/
+scripts/*
+!scripts/build-frida-gum-devkit.py
 testapps/

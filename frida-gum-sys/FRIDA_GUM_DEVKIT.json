@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "kind": "gum",
+  "fridaVersion": "17.15.6-dev.6",
+  "fridaRevision": "200c682e13094e2e1b0ede9e663a701b5a988f72",
+  "gumRevision": "867975dc6cfebbba872d608585afb90a73e86381",
+  "requiredFixes": [
+    "8f51400554b0d16a4a383a901b01040687fd7f80"
+  ],
+  "target": {
+    "os": "android",
+    "arch": "aarch64",
+    "fridaHost": "android-arm64",
+    "apiLevel": 21
+  },
+  "toolchain": {
+    "ndkRevision": "29.0.14206865",
+    "archiveSha1": "87e2bb7e9be5d6a1c6cdf5ec40dd4e0c6d07c30b"
+  },
+  "configureArguments": [
+    "--host=android-arm64",
+    "--with-devkits=gum",
+    "--disable-tests",
+    "--disable-graft-tool",
+    "--disable-inspector",
+    "--disable-v8",
+    "--disable-database"
+  ],
+  "artifacts": {
+    "header": {
+      "path": "frida-gum.h",
+      "size": 2080465,
+      "sha256": "8ce4b34f44518432cb11fdb719970bb45bdda2104c4a50551787e2a9bc14f2fb"
+    },
+    "archive": {
+      "path": "libfrida-gum.a",
+      "size": 77475052,
+      "sha256": "2cb887344a20a054cf48dbefd29a7716a92fee63071a5c55fbba643b74027bea"
+    }
+  }
+}
