@@ -44,7 +44,16 @@ tokio = "1"
 which = "7"
 
 [profile.release]
-strip = true
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# 保持与生产构建相同的优化级别，同时保留 LLDB/addr2line 所需符号。
+[profile.release-symbols]
+inherits = "release"
+debug = 2
+strip = "none"
 
 [profile.dev]
 strip = false

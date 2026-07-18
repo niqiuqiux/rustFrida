@@ -21,11 +21,7 @@ use crate::{log_error, log_info, log_success, log_verbose, log_warn};
 pub(crate) const BOOTSTRAPPER: &[u8] = include_bytes!("../../loader/build/bootstrapper.bin");
 pub(crate) const FRIDA_LOADER: &[u8] = include_bytes!("../../loader/build/rustfrida-loader.bin");
 
-#[cfg(debug_assertions)]
-pub(crate) const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-android/debug/libagent.so");
-
-#[cfg(not(debug_assertions))]
-pub(crate) const AGENT_SO: &[u8] = include_bytes!("../../target/aarch64-linux-android/release/libagent.so");
+pub(crate) const AGENT_SO: &[u8] = include_bytes!(env!("RUSTFRIDA_AGENT_SO_PATH"));
 
 #[cfg(feature = "qbdi")]
 pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PATH"));

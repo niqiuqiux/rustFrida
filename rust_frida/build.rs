@@ -3,10 +3,23 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let workspace_root = manifest_dir.parent().expect("rust_frida must be inside workspace root");
+    let profile_dir = current_profile_dir();
+    let profile_name = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("Cargo profile directory must have a valid UTF-8 name");
+    let target_dir = profile_dir
+        .parent()
+        .expect("Cargo profile directory must be below a target directory");
+    let agent_profile = std::env::var("RUSTFRIDA_AGENT_PROFILE").unwrap_or_else(|_| profile_name.to_owned());
+    let agent_path = target_dir.join(&agent_profile).join("libagent.so");
+    let map_path = profile_dir.join("rustfrida.map");
 
     // 当 agent.so 或 helper shellcode 变化时重新编译 host（include_bytes! 缓存问题）
-    println!("cargo:rerun-if-changed=../target/aarch64-linux-android/debug/libagent.so");
-    println!("cargo:rerun-if-changed=../target/aarch64-linux-android/release/libagent.so");
+    println!("cargo:rerun-if-env-changed=RUSTFRIDA_AGENT_PROFILE");
+    println!("cargo:rerun-if-changed={}", agent_path.display());
+    println!("cargo:rustc-env=RUSTFRIDA_AGENT_SO_PATH={}", agent_path.display());
+    println!("cargo:rustc-link-arg=-Wl,-Map={}", map_path.display());
     println!("cargo:rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo:rerun-if-changed=../loader/build/rustfrida-loader.bin");
 
@@ -63,16 +76,21 @@ fn main() {
     }
 
     if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
-        let profile = std::env::var("PROFILE").expect("PROFILE not set");
-        let helper_path = format!(
-            "{}/target/{}/{}/libqbdi_helper.so",
-            workspace_root.display(),
-            target,
-            if profile == "release" { "release" } else { "debug" }
-        );
-        println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path);
-        println!("cargo:rerun-if-changed={}", helper_path);
+        let helper_profile = std::env::var("RUSTFRIDA_QBDI_PROFILE").unwrap_or_else(|_| agent_profile.clone());
+        let helper_path = target_dir.join(helper_profile).join("libqbdi_helper.so");
+        println!("cargo:rerun-if-env-changed=RUSTFRIDA_QBDI_PROFILE");
+        println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path.display());
+        println!("cargo:rerun-if-changed={}", helper_path.display());
     }
+}
+
+fn current_profile_dir() -> PathBuf {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    out_dir
+        .ancestors()
+        .nth(3)
+        .expect("unexpected Cargo OUT_DIR layout")
+        .to_path_buf()
 }
 
 fn helpers_are_stale(workspace_root: &Path) -> bool {

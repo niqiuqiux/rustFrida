@@ -1,31 +1,45 @@
 # ============================================================
-# Windows 原生交叉编译配置 (NDK 28.1.13356709)
-# 目标: aarch64-linux-android  |  toolchain: windows-x86_64  |  clang 19
+# Linux 交叉编译配置 (NDK 28.2.13676358 / API 33)
+# 目标: aarch64-linux-android  |  toolchain: linux-x86_64  |  clang 19
 # ============================================================
 [build]
 target = "aarch64-linux-android"
 
 [target.aarch64-linux-android]
-linker = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
-ar = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/19/lib/linux"]
+linker = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+ar = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+rustflags = [
+    "-l", "clang_rt.builtins-aarch64-android",
+    "-L", "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux",
+    "-C", "link-arg=-Wl,--build-id=sha1",
+]
 
 [env]
-CC_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
-AR_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-AR_aarch64_linux_android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/sysroot/"
+ANDROID_HOME = { value = "/home/qiu/Android/Sdk", force = false }
+ANDROID_SDK_ROOT = { value = "/home/qiu/Android/Sdk", force = false }
+ANDROID_API_LEVEL = { value = "33", force = true }
+NDK_HOME = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358", force = true }
+ANDROID_NDK_HOME = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358", force = true }
+ANDROID_NDK_ROOT = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358", force = true }
+NDK_PATH = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358", force = true }
+CC_aarch64-linux-android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang", force = true }
+CC_aarch64_linux_android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang", force = true }
+CXX_aarch64-linux-android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++", force = true }
+CXX_aarch64_linux_android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++", force = true }
+AR_aarch64-linux-android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar", force = true }
+AR_aarch64_linux_android = { value = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar", force = true }
+BINDGEN_EXTRA_CLANG_ARGS = { value = "--sysroot=/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/", force = true }
 
 # ============================================================
-# 原 Linux 配置（保留，在 WSL / Linux 环境构建时改用以下段）
+# Windows 原生配置（需要时将本段与上方 Linux 配置互换）
 # ============================================================
 # [target.aarch64-linux-android]
-# linker = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-# ar = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-# rustflags = ["-l","clang_rt.builtins-aarch64-android","-L","/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/19/lib/linux"]
+# linker = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+# ar = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+# rustflags = ["-l", "clang_rt.builtins-aarch64-android", "-L", "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/19/lib/linux"]
 #
 # [env]
-# CC_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-# AR_aarch64-linux-android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-# AR_aarch64_linux_android = "/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-# BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/qiu/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
+# CC_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android33-clang.cmd"
+# AR_aarch64-linux-android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+# AR_aarch64_linux_android = "C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+# BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=C:/Users/Administrator/AppData/Local/Android/Sdk/ndk/28.1.13356709/toolchains/llvm/prebuilt/windows-x86_64/sysroot/"
