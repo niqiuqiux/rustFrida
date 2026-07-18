@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 const STACK_SIZE: usize = 1024 * 1024;
 const TLS_KEY_COUNT: usize = 128;
 const TLS_VALUE_SLOTS: usize = 512;
+const MUTEX_SLOT_COUNT: usize = 2048;
 const ONCE_IN_PROGRESS: i32 = 1;
 const ONCE_DONE: i32 = 2;
 const RWLOCK_WRITER: i32 = -1;
@@ -23,50 +24,125 @@ static TLS_KEY_ACTIVE: [AtomicU32; TLS_KEY_COUNT] = [const { AtomicU32::new(0) }
 static TLS_SLOT_THREAD: [AtomicU64; TLS_VALUE_SLOTS] = [const { AtomicU64::new(0) }; TLS_VALUE_SLOTS];
 static TLS_SLOT_KEY: [AtomicU32; TLS_VALUE_SLOTS] = [const { AtomicU32::new(0) }; TLS_VALUE_SLOTS];
 static TLS_SLOT_VALUE: [AtomicU64; TLS_VALUE_SLOTS] = [const { AtomicU64::new(0) }; TLS_VALUE_SLOTS];
+static MUTEX_SLOT_ADDRESS: [AtomicU64; MUTEX_SLOT_COUNT] = [const { AtomicU64::new(0) }; MUTEX_SLOT_COUNT];
+static MUTEX_SLOT_OWNER: [AtomicU64; MUTEX_SLOT_COUNT] = [const { AtomicU64::new(0) }; MUTEX_SLOT_COUNT];
+static MUTEX_SLOT_DEPTH: [AtomicU32; MUTEX_SLOT_COUNT] = [const { AtomicU32::new(0) }; MUTEX_SLOT_COUNT];
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int {
+#[cfg(not(test))]
+unsafe extern "C" {
+    #[link_name = "__real_pthread_mutex_lock"]
+    fn real_pthread_mutex_lock(mutex: *mut c_void) -> c_int;
+    #[link_name = "__real_pthread_mutex_unlock"]
+    fn real_pthread_mutex_unlock(mutex: *mut c_void) -> c_int;
+    #[link_name = "__real_pthread_mutex_destroy"]
+    fn real_pthread_mutex_destroy(mutex: *mut c_void) -> c_int;
+}
+
+#[cfg(test)]
+unsafe fn real_pthread_mutex_lock(mutex: *mut c_void) -> c_int {
+    libc::pthread_mutex_lock(mutex.cast())
+}
+
+#[cfg(test)]
+unsafe fn real_pthread_mutex_unlock(mutex: *mut c_void) -> c_int {
+    libc::pthread_mutex_unlock(mutex.cast())
+}
+
+#[cfg(test)]
+unsafe fn real_pthread_mutex_destroy(mutex: *mut c_void) -> c_int {
+    libc::pthread_mutex_destroy(mutex.cast())
+}
+
+#[cfg_attr(not(test), no_mangle)]
+pub unsafe extern "C" fn __wrap_pthread_mutex_lock(mutex: *mut c_void) -> c_int {
     if mutex.is_null() {
         return libc::EINVAL;
     }
+    let Some(slot) = mutex_slot(mutex as u64, false) else {
+        return real_pthread_mutex_lock(mutex);
+    };
     let state = &*(mutex as *const AtomicI32);
+    let thread_id = current_os_thread_id();
+    if MUTEX_SLOT_OWNER[slot].load(Ordering::Acquire) == thread_id {
+        MUTEX_SLOT_DEPTH[slot].fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
+
+    let mut spins = 0u32;
     loop {
         if state
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            MUTEX_SLOT_DEPTH[slot].store(1, Ordering::Relaxed);
+            MUTEX_SLOT_OWNER[slot].store(thread_id, Ordering::Release);
             return 0;
         }
-        asm!("yield", options(nomem, nostack, preserves_flags));
+        if spins < 64 {
+            asm!("yield", options(nomem, nostack, preserves_flags));
+            spins += 1;
+        } else {
+            sleep_for_ns(100_000);
+        }
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int {
+#[cfg_attr(not(test), no_mangle)]
+pub unsafe extern "C" fn __wrap_pthread_mutex_unlock(mutex: *mut c_void) -> c_int {
     if mutex.is_null() {
         return libc::EINVAL;
     }
+    let Some(slot) = mutex_slot(mutex as u64, false) else {
+        return real_pthread_mutex_unlock(mutex);
+    };
     let state = &*(mutex as *const AtomicI32);
+    let thread_id = current_os_thread_id();
+    if MUTEX_SLOT_OWNER[slot].load(Ordering::Acquire) != thread_id {
+        return libc::EPERM;
+    }
+    let depth = MUTEX_SLOT_DEPTH[slot].load(Ordering::Relaxed);
+    if depth > 1 {
+        MUTEX_SLOT_DEPTH[slot].store(depth - 1, Ordering::Relaxed);
+        return 0;
+    }
+    MUTEX_SLOT_DEPTH[slot].store(0, Ordering::Relaxed);
+    MUTEX_SLOT_OWNER[slot].store(0, Ordering::Release);
     state.store(0, Ordering::Release);
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut c_void, _attr: *const c_void) -> c_int {
     if mutex.is_null() {
         return libc::EINVAL;
     }
     let state = &*(mutex as *const AtomicI32);
     state.store(0, Ordering::Release);
+    let Some(slot) = mutex_slot(mutex as u64, true) else {
+        return libc::ENOMEM;
+    };
+    MUTEX_SLOT_OWNER[slot].store(0, Ordering::Release);
+    MUTEX_SLOT_DEPTH[slot].store(0, Ordering::Release);
     0
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pthread_mutex_destroy(_mutex: *mut c_void) -> c_int {
+#[cfg_attr(not(test), no_mangle)]
+pub unsafe extern "C" fn __wrap_pthread_mutex_destroy(mutex: *mut c_void) -> c_int {
+    if mutex.is_null() {
+        return libc::EINVAL;
+    }
+    let Some(slot) = mutex_slot(mutex as u64, false) else {
+        return real_pthread_mutex_destroy(mutex);
+    };
+    if MUTEX_SLOT_OWNER[slot].load(Ordering::Acquire) != 0 {
+        return libc::EBUSY;
+    }
+    MUTEX_SLOT_DEPTH[slot].store(0, Ordering::Release);
+    let _ = MUTEX_SLOT_ADDRESS[slot].compare_exchange(mutex as u64, 0, Ordering::AcqRel, Ordering::Acquire);
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_init(cond: *mut c_void, _attr: *const c_void) -> c_int {
     if cond.is_null() {
         return libc::EINVAL;
@@ -75,12 +151,12 @@ pub unsafe extern "C" fn pthread_cond_init(cond: *mut c_void, _attr: *const c_vo
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_destroy(_cond: *mut c_void) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_signal(cond: *mut c_void) -> c_int {
     if cond.is_null() {
         return libc::EINVAL;
@@ -89,17 +165,17 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut c_void) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut c_void) -> c_int {
     pthread_cond_signal(cond)
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     wait_on_cond(cond, mutex, std::ptr::null())
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_cond_timedwait(
     cond: *mut c_void,
     mutex: *mut c_void,
@@ -108,7 +184,7 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
     wait_on_cond(cond, mutex, abstime)
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_once(once: *mut c_void, init_routine: Option<unsafe extern "C" fn()>) -> c_int {
     if once.is_null() {
         return libc::EINVAL;
@@ -134,7 +210,7 @@ pub unsafe extern "C" fn pthread_once(once: *mut c_void, init_routine: Option<un
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_init(lock: *mut c_void, _attr: *const c_void) -> c_int {
     if lock.is_null() {
         return libc::EINVAL;
@@ -143,12 +219,12 @@ pub unsafe extern "C" fn pthread_rwlock_init(lock: *mut c_void, _attr: *const c_
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_destroy(_lock: *mut c_void) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_rdlock(lock: *mut c_void) -> c_int {
     if lock.is_null() {
         return libc::EINVAL;
@@ -167,7 +243,7 @@ pub unsafe extern "C" fn pthread_rwlock_rdlock(lock: *mut c_void) -> c_int {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_wrlock(lock: *mut c_void) -> c_int {
     if lock.is_null() {
         return libc::EINVAL;
@@ -184,7 +260,7 @@ pub unsafe extern "C" fn pthread_rwlock_wrlock(lock: *mut c_void) -> c_int {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_unlock(lock: *mut c_void) -> c_int {
     if lock.is_null() {
         return libc::EINVAL;
@@ -199,7 +275,7 @@ pub unsafe extern "C" fn pthread_rwlock_unlock(lock: *mut c_void) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_key_create(
     key: *mut pthread_key_t,
     _destructor: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -216,7 +292,7 @@ pub unsafe extern "C" fn pthread_key_create(
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_key_delete(key: pthread_key_t) -> c_int {
     let id = key as usize;
     if id == 0 || id >= TLS_KEY_COUNT {
@@ -233,7 +309,7 @@ pub unsafe extern "C" fn pthread_key_delete(key: pthread_key_t) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_getspecific(key: pthread_key_t) -> *mut c_void {
     let id = key as usize;
     if id == 0 || id >= TLS_KEY_COUNT || TLS_KEY_ACTIVE[id].load(Ordering::Acquire) == 0 {
@@ -250,7 +326,7 @@ pub unsafe extern "C" fn pthread_getspecific(key: pthread_key_t) -> *mut c_void 
     std::ptr::null_mut()
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_setspecific(key: pthread_key_t, value: *const c_void) -> c_int {
     let id = key as usize;
     if id == 0 || id >= TLS_KEY_COUNT || TLS_KEY_ACTIVE[id].load(Ordering::Acquire) == 0 {
@@ -278,7 +354,7 @@ pub unsafe extern "C" fn pthread_setspecific(key: pthread_key_t, value: *const c
     libc::ENOMEM
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_create(
     thread: *mut pthread_t,
     _attr: *const c_void,
@@ -316,12 +392,12 @@ pub unsafe extern "C" fn pthread_create(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn pthread_detach(_thread: pthread_t) -> c_int {
     0
 }
 
-#[no_mangle]
+#[cfg_attr(not(test), no_mangle)]
 pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> c_int {
     let mut result: c_long;
     asm!(
@@ -390,20 +466,45 @@ fn current_thread_token() -> u64 {
     }
 }
 
+#[inline]
+fn current_os_thread_id() -> u64 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+fn mutex_slot(address: u64, create: bool) -> Option<usize> {
+    let start = ((address >> 3) as usize) % MUTEX_SLOT_COUNT;
+    for offset in 0..MUTEX_SLOT_COUNT {
+        let index = (start + offset) % MUTEX_SLOT_COUNT;
+        let current = MUTEX_SLOT_ADDRESS[index].load(Ordering::Acquire);
+        if current == address {
+            return Some(index);
+        }
+        if current == 0
+            && create
+            && MUTEX_SLOT_ADDRESS[index]
+                .compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
 unsafe fn wait_on_cond(cond: *mut c_void, mutex: *mut c_void, abstime: *const timespec) -> c_int {
     if cond.is_null() || mutex.is_null() {
         return libc::EINVAL;
     }
     let state = &*(cond as *const AtomicU32);
     let observed = state.load(Ordering::Acquire);
-    let _ = pthread_mutex_unlock(mutex);
+    let _ = __wrap_pthread_mutex_unlock(mutex);
     loop {
         if state.load(Ordering::Acquire) != observed {
-            let _ = pthread_mutex_lock(mutex);
+            let _ = __wrap_pthread_mutex_lock(mutex);
             return 0;
         }
         if !abstime.is_null() && realtime_reached(abstime) {
-            let _ = pthread_mutex_lock(mutex);
+            let _ = __wrap_pthread_mutex_lock(mutex);
             return libc::ETIMEDOUT;
         }
         sleep_for_ns(1_000_000);
@@ -437,4 +538,26 @@ unsafe fn clock_gettime_raw(clock_id: clockid_t, ts: *mut timespec) -> c_int {
         options(nostack, preserves_flags),
     );
     result as c_int
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutex_supports_recursive_locking() {
+        let mutex = AtomicI32::new(0);
+        let pointer = (&mutex as *const AtomicI32).cast_mut().cast::<c_void>();
+        unsafe {
+            assert_eq!(pthread_mutex_init(pointer, std::ptr::null()), 0);
+            assert_eq!(__wrap_pthread_mutex_lock(pointer), 0);
+            assert_eq!(__wrap_pthread_mutex_lock(pointer), 0);
+            assert_eq!(mutex.load(Ordering::Acquire), 1);
+            assert_eq!(__wrap_pthread_mutex_unlock(pointer), 0);
+            assert_eq!(mutex.load(Ordering::Acquire), 1);
+            assert_eq!(__wrap_pthread_mutex_unlock(pointer), 0);
+            assert_eq!(mutex.load(Ordering::Acquire), 0);
+            assert_eq!(__wrap_pthread_mutex_destroy(pointer), 0);
+        }
+    }
 }

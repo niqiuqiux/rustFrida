@@ -248,6 +248,9 @@ pub fn init() -> Result<(), String> {
     quickjs_hook::recomp::set_cleanup_release_only(false);
     init_hook_runtime()?;
 
+    #[cfg(feature = "frida-gum")]
+    crate::stalker::install_quickjs_backend()?;
+
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
     }
@@ -526,6 +529,14 @@ pub fn cleanup() -> bool {
     };
 
     stage("cleanup start", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        if !crate::stalker::shutdown() {
+            log_msg("[quickjs] Stalker cleanup timed out; destructive cleanup skipped\n".to_string());
+            return false;
+        }
+        stage("phase0 shutdown_stalker", &mut t);
+    }
     let had_java_worker = stop_java_worker();
     if !wait_java_worker_stopped(had_java_worker, 800) {
         log_msg("[quickjs] Java worker native loop still running; destructive cleanup skipped\n".to_string());
@@ -560,6 +571,14 @@ pub fn cleanup() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        if let Err(error) = crate::stalker::shutdown_module_observer() {
+            log_msg(format!("[quickjs] module observer shutdown failed: {error}\n"));
+            return false;
+        }
+        stage("phase1 shutdown_module_observer", &mut t);
+    }
     cut_art_controller_routing_hooks();
     stage("phase1 cut_art_controller_routing", &mut t);
 
@@ -732,6 +751,14 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     };
 
     stage("cleanup start (managed-safe unload)", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        if !crate::stalker::shutdown() {
+            log_msg("[quickjs] Stalker cleanup timed out; managed-safe unload skipped\n".to_string());
+            return false;
+        }
+        stage("phase0 shutdown_stalker", &mut t);
+    }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     quickjs_hook::recomp::set_cleanup_release_only(false);
     if quickjs_hook::raw_clone_java_executor_hook_active() {
@@ -752,6 +779,14 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        if let Err(error) = crate::stalker::shutdown_module_observer() {
+            log_msg(format!("[quickjs] module observer shutdown failed: {error}\n"));
+            return false;
+        }
+        stage("phase1 shutdown_module_observer", &mut t);
+    }
     cut_art_controller_routing_hooks();
     stage("phase1 cut_art_controller_routing", &mut t);
 
@@ -860,6 +895,13 @@ pub fn cleanup_soft() -> Result<(), String> {
     };
 
     stage("soft cleanup start", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        if !crate::stalker::shutdown() {
+            return Err("Stalker cleanup timeout，软清理已放弃".to_string());
+        }
+        stage("phase0 shutdown_stalker", &mut t);
+    }
     quickjs_hook::recomp::set_cleanup_release_only(false);
     set_art_controller_reload_paused(true);
     stage("phase0 pause_art_controller_reload", &mut t);
@@ -869,6 +911,11 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    #[cfg(feature = "frida-gum")]
+    {
+        crate::stalker::pause_module_unload_observer_for_reload()?;
+        stage("phase1 pause_module_observer", &mut t);
+    }
 
     // Phase 2: drain thunk —— 必须归零才能安全 free callback JSValue
     let drained = drain_thunk_in_flight();

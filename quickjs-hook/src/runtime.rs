@@ -2,6 +2,7 @@
 
 use crate::context::JSContext;
 use crate::ffi;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 /// Wrapper around QuickJS JSRuntime
@@ -73,5 +74,47 @@ unsafe impl Sync for JSRuntime {}
 impl Default for JSRuntime {
     fn default() -> Self {
         Self::new().expect("Failed to create JSRuntime")
+    }
+}
+
+#[repr(align(16))]
+struct AlignedThreadState(MaybeUninit<ffi::JSRuntimeThreadState>);
+
+/// Temporarily detaches the current native stack from a QuickJS runtime.
+///
+/// Frida uses this boundary before calling native code that may synchronously
+/// re-enter JavaScript through Stalker or Interceptor callbacks.
+pub(crate) struct SuspendedRuntime {
+    runtime: *mut ffi::JSRuntime,
+    state: AlignedThreadState,
+    suspended: bool,
+}
+
+impl SuspendedRuntime {
+    /// `ctx` must belong to the runtime currently owned by this thread.
+    pub(crate) unsafe fn suspend(ctx: *mut ffi::JSContext) -> Self {
+        let runtime = ffi::JS_GetRuntime(ctx);
+        let mut state = AlignedThreadState(MaybeUninit::uninit());
+        ffi::JS_Suspend(runtime, state.0.as_mut_ptr());
+        Self {
+            runtime,
+            state,
+            suspended: true,
+        }
+    }
+
+    pub(crate) unsafe fn resume(&mut self) {
+        if self.suspended {
+            ffi::JS_Resume(self.runtime, self.state.0.as_ptr());
+            self.suspended = false;
+        }
+    }
+}
+
+impl Drop for SuspendedRuntime {
+    fn drop(&mut self) {
+        unsafe {
+            self.resume();
+        }
     }
 }

@@ -1,4 +1,5 @@
 [features]
+default = ["frida-gum"]
 frida-gum = []
 qbdi = []
 # watch-so: eBPF SO 加载监听（--watch-so）。依赖 ldmonitor，其 build.rs 需要

@@ -1,6 +1,51 @@
 use std::env;
 use std::path::PathBuf;
 
+fn insert_after_once(source: &mut String, anchor: &str, insertion: &str, label: &str) {
+    let mut matches = source.match_indices(anchor);
+    let Some((offset, _)) = matches.next() else {
+        panic!("QuickJS scope patch anchor not found: {label}");
+    };
+    assert!(
+        matches.next().is_none(),
+        "QuickJS scope patch anchor is ambiguous: {label}"
+    );
+    source.insert_str(offset + anchor.len(), insertion);
+}
+
+fn prepare_quickjs_sources(quickjs_src: &std::path::Path, out_path: &std::path::Path) -> (PathBuf, PathBuf) {
+    let patched_dir = out_path.join("quickjs-patched");
+    std::fs::create_dir_all(&patched_dir).expect("create patched QuickJS directory");
+
+    let mut source = std::fs::read_to_string(quickjs_src.join("quickjs.c")).expect("read quickjs.c");
+    insert_after_once(
+        &mut source,
+        "    JSShape **shape_hash;\n    void *user_opaque;\n};\n",
+        "\n#include \"quickjs_runtime_scope_internal.h\"\n",
+        "runtime layout",
+    );
+    insert_after_once(
+        &mut source,
+        "JSRuntime *JS_NewRuntime(void)\n{\n    return JS_NewRuntime2(&def_malloc_funcs, NULL);\n}\n",
+        "\n#include \"quickjs_runtime_scope_impl.inc\"\n",
+        "runtime API",
+    );
+    let patched_c = patched_dir.join("quickjs.c");
+    std::fs::write(&patched_c, source).expect("write patched quickjs.c");
+
+    let mut header = std::fs::read_to_string(quickjs_src.join("quickjs.h")).expect("read quickjs.h");
+    insert_after_once(
+        &mut header,
+        "typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *func_data);\n",
+        "\n#include \"quickjs_runtime_scope.h\"\n",
+        "public runtime API",
+    );
+    let patched_h = patched_dir.join("quickjs.h");
+    std::fs::write(&patched_h, header).expect("write patched quickjs.h");
+
+    (patched_c, patched_h)
+}
+
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -83,9 +128,11 @@ fn main() {
 
     // Compile QuickJS sources
     let quickjs_src = PathBuf::from(&manifest_dir).join("quickjs-src");
-    let quickjs_c = quickjs_src.join("quickjs.c");
-    let quickjs_h = quickjs_src.join("quickjs.h");
-    if quickjs_c.exists() && quickjs_h.exists() {
+    let quickjs_c_source = quickjs_src.join("quickjs.c");
+    let quickjs_h_source = quickjs_src.join("quickjs.h");
+    if quickjs_c_source.exists() && quickjs_h_source.exists() {
+        let (quickjs_c, quickjs_h) = prepare_quickjs_sources(&quickjs_src, &out_path);
+        let patched_quickjs_dir = quickjs_c.parent().expect("patched QuickJS source directory");
         let quickjs_version = std::fs::read_to_string(quickjs_src.join("VERSION"))
             .ok()
             .map(|s| s.trim().to_owned())
@@ -101,6 +148,7 @@ fn main() {
             .file(quickjs_src.join("libunicode.c"))
             .file(quickjs_src.join("cutils.c"))
             .file(src_path.join("quickjs_wrapper.c"))
+            .include(patched_quickjs_dir)
             .include(&quickjs_src)
             .include(&src_path)
             .opt_level(2)
@@ -125,8 +173,9 @@ fn main() {
 
         // Generate bindings for QuickJS + wrapper
         let bindings = bindgen::Builder::default()
-            .header(quickjs_src.join("quickjs.h").to_string_lossy().to_string())
+            .header(quickjs_h.to_string_lossy().to_string())
             .header(src_path.join("quickjs_wrapper.h").to_string_lossy().to_string())
+            .clang_arg(format!("-I{}", patched_quickjs_dir.display()))
             .clang_arg(format!("-I{}", quickjs_src.display()))
             .clang_arg(format!("-I{}", src_path.display()))
             .clang_arg("-xc")
@@ -228,5 +277,8 @@ fn main() {
     println!("cargo:rerun-if-changed=quickjs-src/libbf.c");
     println!("cargo:rerun-if-changed=src/quickjs_wrapper.c");
     println!("cargo:rerun-if-changed=src/quickjs_wrapper.h");
+    println!("cargo:rerun-if-changed=src/quickjs_runtime_scope.h");
+    println!("cargo:rerun-if-changed=src/quickjs_runtime_scope_internal.h");
+    println!("cargo:rerun-if-changed=src/quickjs_runtime_scope_impl.inc");
     println!("cargo:rerun-if-changed=build.rs");
 }

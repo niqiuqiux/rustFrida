@@ -10,6 +10,7 @@ pub mod memory;
 pub mod module;
 pub mod ptr;
 pub mod rpc;
+pub mod stalker;
 pub(crate) mod util;
 
 pub use console::register_console;
@@ -22,6 +23,7 @@ pub use memory::register_memory_api;
 pub use module::register_module_api;
 pub use ptr::register_ptr;
 pub use rpc::register_rpc;
+pub use stalker::register_stalker_api;
 
 use crate::context::JSContext;
 
@@ -34,6 +36,7 @@ pub fn register_all_apis(ctx: &JSContext) {
     register_jni_api(ctx);
     register_memory_api(ctx);
     register_module_api(ctx);
+    register_stalker_api(ctx);
     register_lazy_java_api(ctx);
     register_rpc(ctx);
 }

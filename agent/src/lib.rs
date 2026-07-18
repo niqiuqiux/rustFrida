@@ -468,6 +468,18 @@ fn cleanup_agent_runtime_for_unload(fast_unload_ok: bool) -> bool {
             safe_to_return = quickjs_loader::cleanup_for_unload_leak_safe();
         }
     }
+    #[cfg(feature = "frida-gum")]
+    if safe_to_return && !stalker::shutdown() {
+        log_msg_sync("Stalker 尚有待回收翻译块，拒绝卸载 agent\n".to_string());
+        safe_to_return = false;
+    }
+    #[cfg(feature = "frida-gum")]
+    if safe_to_return {
+        if let Err(error) = stalker::shutdown_module_observer() {
+            log_msg_sync(format!("Gum 模块观察器清理失败，拒绝卸载 agent: {error}\n"));
+            safe_to_return = false;
+        }
+    }
     if safe_to_return {
         crash_handler::uninstall_crash_handlers();
     }
@@ -517,6 +529,15 @@ fn process_cmd(command: &str) {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             stalker::follow(tid)
+        }
+        #[cfg(feature = "frida-gum")]
+        Some("stalker-stop") => {
+            let tid = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            stalker::unfollow(tid)
         }
         #[cfg(feature = "frida-gum")]
         Some("hfl") => {

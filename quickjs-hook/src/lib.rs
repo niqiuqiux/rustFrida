@@ -40,6 +40,7 @@ pub use context::JSContext;
 pub use jsapi::console::{set_console_callback, set_verbose};
 pub use jsapi::deferred_java_init;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use jsapi::hook_api::discard_native_hooks_in_range;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
@@ -58,6 +59,13 @@ pub use jsapi::java::raw_clone_java_executor_hook_active;
 pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
+pub use jsapi::stalker::{
+    clear_retired_stalker_callouts, dispatch_stalker_call_probe, dispatch_stalker_callout, dispatch_stalker_transform,
+    install_stalker_backend, retire_stalker_callout, shutdown_stalker_backend, wait_for_stalker_call_probe_callbacks,
+    wait_for_stalker_callout_callbacks, wait_for_stalker_transform_callbacks, StalkerBackend, StalkerCallProbeConfig,
+    StalkerCalloutAccess, StalkerDrainResult, StalkerEventBatch, StalkerFollowConfig, StalkerInstruction,
+    StalkerTransformAccess,
+};
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
@@ -389,25 +397,38 @@ pub fn load_script(script: &str) -> Result<String, String> {
 
 /// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
 pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
-    let mut engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    if engine.is_none() {
-        *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
+    let result = (|| -> Result<String, String> {
+        let mut engine = JS_ENGINE
+            .lock()
+            .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+        if engine.is_none() {
+            *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
+        }
+        let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+        let _owner_guard = JsEngineOwnerGuard::acquire();
+        let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
+        let value = engine.eval_file(script, filename)?;
+        engine.flush_java_ready_callbacks()?;
+        engine.run_pending_jobs();
+        let result = if value.is_undefined() {
+            "undefined".to_string()
+        } else {
+            value.to_string(engine.context().as_ptr()).unwrap_or_default()
+        };
+        value.free(engine.context().as_ptr());
+        Ok(result)
+    })();
+
+    combine_js_and_pending_result(result, jsapi::stalker::process_pending_stalker())
+}
+
+fn combine_js_and_pending_result<T>(result: Result<T, String>, pending: Result<(), String>) -> Result<T, String> {
+    match (result, pending) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("Stalker pending operation failed: {error}")),
+        (Err(error), Err(pending_error)) => Err(format!("{error}\nStalker pending operation failed: {pending_error}")),
     }
-    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    let _owner_guard = JsEngineOwnerGuard::acquire();
-    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
-    let value = engine.eval_file(script, filename)?;
-    engine.flush_java_ready_callbacks()?;
-    engine.run_pending_jobs();
-    let result = if value.is_undefined() {
-        "undefined".to_string()
-    } else {
-        value.to_string(engine.context().as_ptr()).unwrap_or_default()
-    };
-    value.free(engine.context().as_ptr());
-    Ok(result)
 }
 
 /// 将任意字符串编码成 JS 字符串字面量（带双引号），可直接拼入 JS 源码。
@@ -448,27 +469,71 @@ fn js_string_literal(s: &str) -> String {
 /// * `Ok(json)` - 返回值的 JSON 字符串表示；`undefined` 返回 `"null"`
 /// * `Err(msg)` - 引擎未初始化 / 方法不存在 / JS 异常
 pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
-    let engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    let _owner_guard = JsEngineOwnerGuard::acquire();
-    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
+    let result = (|| -> Result<String, String> {
+        let engine = JS_ENGINE
+            .lock()
+            .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+        let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+        let _owner_guard = JsEngineOwnerGuard::acquire();
+        let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
 
-    // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
-    let script = format!(
-        "__rpc_dispatch({}, {})",
-        js_string_literal(method),
-        js_string_literal(args_json),
-    );
+        // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
+        let script = format!(
+            "__rpc_dispatch({}, {})",
+            js_string_literal(method),
+            js_string_literal(args_json),
+        );
 
-    let value = engine.eval(&script)?;
-    engine.run_pending_jobs();
-    let result = value
-        .to_string(engine.context().as_ptr())
-        .unwrap_or_else(|| "null".to_string());
-    value.free(engine.context().as_ptr());
-    Ok(result)
+        let value = engine.eval(&script)?;
+        engine.run_pending_jobs();
+        let result = value
+            .to_string(engine.context().as_ptr())
+            .unwrap_or_else(|| "null".to_string());
+        value.free(engine.context().as_ptr());
+        Ok(result)
+    })();
+
+    combine_js_and_pending_result(result, jsapi::stalker::process_pending_stalker())
+}
+
+/// Run periodic Stalker delivery without waiting for a busy JavaScript task.
+/// The timer worker retries on its next tick when another thread owns QuickJS.
+pub fn try_dispatch_due_stalker_events() -> Result<bool, String> {
+    let result = (|| -> Result<bool, String> {
+        let engine = match JS_ENGINE.try_lock() {
+            Ok(engine) => engine,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let Some(engine) = engine.as_ref() else {
+            return Ok(false);
+        };
+
+        let _owner_guard = JsEngineOwnerGuard::acquire();
+        let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
+        let ctx = engine.context();
+        unsafe {
+            ffi::qjs_update_stack_top(ctx.as_ptr());
+        }
+
+        let global = ctx.global_object();
+        let dispatch = global.get_property(ctx.as_ptr(), "__rf_stalker_dispatch_due");
+        if !dispatch.is_function(ctx.as_ptr()) {
+            dispatch.free(ctx.as_ptr());
+            global.free(ctx.as_ptr());
+            return Ok(false);
+        }
+
+        let result = ctx.call_function(dispatch, JSValue::undefined(), &[]);
+        dispatch.free(ctx.as_ptr());
+        global.free(ctx.as_ptr());
+        let value = result?;
+        value.free(ctx.as_ptr());
+        engine.run_pending_jobs();
+        Ok(true)
+    })();
+
+    combine_js_and_pending_result(result, jsapi::stalker::process_pending_stalker())
 }
 
 /// Cleanup the global JS engine

@@ -450,6 +450,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         #[cfg(feature = "frida-gum")]
         {
             v.push(("stalker", "[tid]", "Frida Stalker 追踪 [frida-gum ✓]"));
+            v.push(("stalker-stop", "[tid]", "停止 Frida Stalker 并回收翻译块"));
             v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [frida-gum ✓]"));
         }
         #[cfg(not(feature = "frida-gum"))]
