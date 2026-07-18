@@ -60,6 +60,24 @@ cargo build -p rust_frida --release
 
 rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
 
+### 符号化构建
+
+标准构建会在剥离 release 产物的同时生成链接器 map。map 与设备实际运行的二进制来自同一次链接，不会因为额外 debuginfo 改变注入代码布局：
+
+```bash
+cargo build -p agent --release
+cargo build -p rust_frida --release
+# 输出:
+#   target/aarch64-linux-android/release/libagent.so
+#   target/aarch64-linux-android/release/rustfrida
+#   target/aarch64-linux-android/release/libagent.map
+#   target/aarch64-linux-android/release/rustfrida.map
+```
+
+解析 Android tombstone 中 `/memfd:wwb_so` 的 PC 时，将 backtrace 的 `pc` 与该行显示的 `offset` 相加，所得 ELF 虚拟地址可在 `libagent.map` 中查找最近符号。例如 `pc 0x8f33c (offset 0x303000)` 对应 `0x39233c`。
+
+`rustfrida` 默认嵌入与自身相同 profile 下的 agent，并会正确跟随自定义 `CARGO_TARGET_DIR`；高级场景可通过 `RUSTFRIDA_AGENT_PROFILE` 选择已有 agent 目录。启用 QBDI 时默认使用与 agent 相同 profile 下的 `libqbdi_helper.so`，也可通过 `RUSTFRIDA_QBDI_PROFILE` 单独覆盖。
+
 ### Windows 原生交叉编译
 
 在 Windows 上直接交叉编译到 `aarch64-linux-android`，无需 WSL。已在 **NDK 28.1.13356709 + Rust 1.92（MSVC host）** 实测通过：主程序、agent、loader shellcode、QBDI 组件均可构建。
@@ -72,7 +90,7 @@ rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`�
 
 **1) 配置 `.cargo/config.toml`**
 
-仓库的 `.cargo/config.toml` 已带 Windows 段（指向 `windows-x86_64` 工具链：`*-clang.cmd` / `llvm-ar.exe` / sysroot / `clang/19` builtins），Linux 段保留为注释。**把其中的 NDK 路径换成你自己的**：
+仓库的 `.cargo/config.toml` 默认启用 Linux 配置，并保留了一份注释状态的 Windows 配置模板（指向 `windows-x86_64` 工具链：`*-clang.cmd` / `llvm-ar.exe` / sysroot / `clang/19` builtins）。在 Windows 原生环境中，用模板替换当前的 `[target.aarch64-linux-android]` 和 `[env]` 段，并把 NDK 路径换成你自己的：
 
 ```toml
 [build]
@@ -496,7 +514,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `ptr()`, `Memory`, `File`, `Module`, `Interceptor`, `CModule`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `ptr()`, `Memory`, `File`, `Process`, `Module`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -1722,6 +1740,81 @@ out.close();
 | `file.close()` | — | `undefined` |
 
 常量：`File.SEEK_SET`、`File.SEEK_CUR`、`File.SEEK_END`。
+
+## Stalker Trace
+
+Android ARM64 下通过 Frida Gum 17.15.5 提供线程级动态跟踪。事件缓冲区在 `follow()` 时一次性分配；跟踪回调只写入有界缓冲区，队列满后丢弃新事件，不会在目标线程的回调路径中扩容。
+
+```js
+var tid = Process.getCurrentThreadId();
+var target = Module.findExportByName("libdemo.so", "target_function");
+
+Stalker.follow(tid, {
+    transform: function (iterator) {
+        var instruction;
+        while ((instruction = iterator.next()) !== null) {
+            console.log(instruction.address + " " + instruction);
+            if (instruction.address.equals(target)) {
+                iterator.putCallout(function (context) {
+                    console.log("x0=" + context.x0 + " pc=" + context.pc);
+                    context.x0 = ptr(123);
+                });
+            }
+            iterator.keep();
+        }
+    },
+    events: { call: true, ret: true },
+    onReceive: function (events) {
+        var rows = Stalker.parse(events, {
+            annotate: true,
+            stringify: true
+        });
+        console.log(JSON.stringify(rows));
+    },
+    onCallSummary: function (summary) {
+        console.log(JSON.stringify(summary));
+    }
+});
+
+// 在当前线程调用需要跟踪的 native 函数后收尾。
+Stalker.unfollow(tid);
+Stalker.flush();
+Stalker.garbageCollect();
+
+// 调用探针只对被 Stalker 跟踪线程上的调用生效；args 可在回调内读写。
+var probeId = Stalker.addCallProbe(target, function (args) {
+    console.log(args[0]);
+    args[0] = ptr(123);
+});
+Stalker.removeCallProbe(probeId);
+```
+
+| API | 参数 | 说明 |
+| --- | --- | --- |
+| `Stalker.supported` | — | 当前平台是否支持 Stalker |
+| `Stalker.follow(threadId?, options?)` | `number?, object?` | 跟踪线程；支持 JavaScript `transform`、队列回调及原生 `onEvent/data` 事件回调 |
+| `Stalker.unfollow(threadId?)` | `number?` | 停止跟踪并派发剩余事件 |
+| `Stalker.flush()` | — | 刷新并派发当前缓冲区 |
+| `Stalker.garbageCollect()` | — | 回收 Gum 翻译块并派发剩余事件 |
+| `Stalker.parse(events, options?)` | `ArrayBuffer, object?` | 解析 Gum 事件；支持 `annotate/stringify` |
+| `Stalker.exclude(range)` | `{base, size}` | 排除一段地址范围 |
+| `Stalker.invalidate(address)` | `AddressLike` | 使所有线程对应翻译块失效 |
+| `Stalker.invalidate(threadId, address)` | `number, AddressLike` | 使指定线程对应翻译块失效 |
+| `Stalker.addCallProbe(target, callback, data?)` | `AddressLike, function/AddressLike, AddressLike?` | 添加 JavaScript 或 CModule/原生调用探针；JavaScript 回调接收可读写的 `args[n]` |
+| `Stalker.removeCallProbe(id)` | `uint32` | 独立移除指定调用探针；重复移除为空操作 |
+| `Stalker.trustThreshold` | `int32` | 读写 Gum 信任阈值 |
+| `Stalker.queueCapacity` | `uint32` | 后续 `follow()` 使用的事件数上限 |
+| `Stalker.queueDrainInterval` | `uint32` | 后续 `follow()` 的自动派发周期（毫秒）；`0` 禁用 |
+
+`transform(iterator)` 当前提供 `iterator.next()`、`iterator.keep()`、`iterator.memoryAccess`、`iterator.putCallout(callback, data?)` 和 `iterator.putChainingReturn()`。`next()` 返回的指令快照包含 `id/address/next/size/mnemonic/opStr/bytes` 与 `toString()`；iterator 只在当前 transform 回调内有效。
+
+JavaScript callout 在被跟踪线程同步执行，接收实时可读写的 ARM64 `CpuContext`：`pc/sp/nzcv/x0..x28/fp/lr/q0..q31`。通用寄存器返回 `NativePointer`，`nzcv` 返回整数，向量寄存器返回 16 字节 `ArrayBuffer`，赋值时也接受 `ArrayBuffer`、TypedArray 或字节数组。该对象只在当前 callout 回调内有效，离开回调后继续访问会抛出异常。
+
+原生事件、callout 和调用探针回调与 Frida Gum ABI 一致，并在被跟踪线程同步执行。`onEvent` 的签名为 `void callback(const GumEvent *event, GumCpuContext *cpu_context, void *data)`，原生 callout 的签名为 `void callback(GumCpuContext *cpu_context, void *data)`，原生 call probe 的签名为 `void callback(GumCallDetails *details, void *data)`。这些位置可直接传入 CModule 导出的指针；实现会持有回调、CModule 和 `data`，直到对应探针移除或 Gum 翻译块回收。
+
+`%reload` 会先停止 Stalker 并注销当前脚本的模块观察器，但保留进程级 Gum/GLib runtime；新脚本初始化时重新注册观察器。只有 agent 最终退出时才释放 Gum，避免同一进程内重复初始化 Frida 的 startup callbacks。
+
+与 Frida 17.15.5 的当前主要差异：transform 尚未暴露 ARM64 writer 方法，项目也尚未提供通用 `NativeCallback` 构造器。`putCallout()`、`onEvent/data` 与 `addCallProbe()` 已支持 JavaScript 或 CModule/原生指针回调；JavaScript callout 可同步读写完整 ARM64 `CpuContext`，调用探针也可同步读取和修改参数。`queueDrainInterval` 已按每次 `follow()` 时的配置周期派发 `onReceive/onCallSummary`，设为 `0` 可禁用自动派发；`unfollow()`、`flush()` 和 `garbageCollect()` 仍会同步排空队列。
 
 ## QBDI Trace
 
