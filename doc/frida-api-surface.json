@@ -1,0 +1,2633 @@
+{
+  "fridaDevkitVersion": "17.15.5",
+  "rustFrida": {
+    "baselineRevision": "c7daef081b7965ce7e578e16b134a21a168d7646",
+    "compatibilityAreas": [
+      {
+        "area": "Core runtime",
+        "goal": "07",
+        "missing": [
+          "Frida",
+          "Script",
+          "send",
+          "recv",
+          "timers",
+          "Worker",
+          "hexdump"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Native ABI",
+        "goal": "04",
+        "missing": [
+          "NativeCallback",
+          "SystemFunction",
+          "variadic",
+          "struct-by-value",
+          "options"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Diagnostics",
+        "goal": "02",
+        "missing": [
+          "DebugSymbol",
+          "Thread",
+          "Backtracer",
+          "ApiResolver",
+          "Instruction.parse"
+        ],
+        "status": "missing"
+      },
+      {
+        "area": "Module and Process",
+        "goal": "03",
+        "missing": [
+          "Module instances",
+          "ModuleMap",
+          "observers",
+          "runOnThread",
+          "exception handler"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Memory",
+        "goal": "06",
+        "missing": [
+          "patchCode",
+          "async scan",
+          "findPointers",
+          "MemoryAccessMonitor",
+          "alloc options"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Stalker",
+        "goal": "05",
+        "missing": [
+          "Arm64Writer",
+          "Arm64Relocator",
+          "drop statistics"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Java facade",
+        "goal": "08",
+        "missing": [
+          "perform",
+          "performNow",
+          "ClassFactory",
+          "retain",
+          "cast",
+          "array"
+        ],
+        "status": "partial"
+      },
+      {
+        "area": "Optional modules",
+        "goal": "09",
+        "missing": [
+          "Cloak",
+          "Checksum",
+          "Socket",
+          "Stream",
+          "SQLite",
+          "Sampler",
+          "Profiler"
+        ],
+        "status": "missing"
+      }
+    ],
+    "documentedGlobals": [
+      "console",
+      "ptr",
+      "Memory",
+      "File",
+      "Process",
+      "Module",
+      "Interceptor",
+      "Stalker",
+      "CModule",
+      "NativeFunction",
+      "hook",
+      "hookNative",
+      "attachNative",
+      "unhook",
+      "callNative",
+      "qbdi",
+      "Java",
+      "Jni"
+    ],
+    "globals": [
+      {
+        "classification": "compatible",
+        "name": "console",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "ptr",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "NULL",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "Memory",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "File",
+        "type": "function"
+      },
+      {
+        "classification": "partial",
+        "name": "Process",
+        "type": "object"
+      },
+      {
+        "classification": "legacy",
+        "name": "Module",
+        "type": "object"
+      },
+      {
+        "classification": "extension",
+        "name": "Hook",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "Interceptor",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "Stalker",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "CModule",
+        "type": "function"
+      },
+      {
+        "classification": "partial",
+        "name": "NativeFunction",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "hook",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "hookNative",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "attachNative",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "unhook",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "callNative",
+        "type": "function"
+      },
+      {
+        "classification": "extension",
+        "name": "recompHook",
+        "type": "function"
+      },
+      {
+        "classification": "partial",
+        "name": "Java",
+        "type": "object"
+      },
+      {
+        "classification": "extension",
+        "name": "Jni",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "rpc",
+        "type": "object"
+      }
+    ],
+    "optionalGlobals": [
+      {
+        "classification": "extension",
+        "feature": "qbdi",
+        "name": "qbdi",
+        "type": "object"
+      }
+    ],
+    "probes": [
+      {
+        "path": "console.log",
+        "type": "function"
+      },
+      {
+        "path": "NULL.isNull",
+        "type": "function"
+      },
+      {
+        "path": "Memory.alloc",
+        "type": "function"
+      },
+      {
+        "path": "Memory.copy",
+        "type": "function"
+      },
+      {
+        "path": "Memory.dup",
+        "type": "function"
+      },
+      {
+        "path": "Memory.protect",
+        "type": "function"
+      },
+      {
+        "path": "Memory.queryProtection",
+        "type": "function"
+      },
+      {
+        "path": "Memory.scanSync",
+        "type": "function"
+      },
+      {
+        "path": "Memory.flushCodeCache",
+        "type": "function"
+      },
+      {
+        "path": "File.readAllBytes",
+        "type": "function"
+      },
+      {
+        "path": "File.writeAllBytes",
+        "type": "function"
+      },
+      {
+        "path": "Process.id",
+        "type": "number"
+      },
+      {
+        "path": "Process.arch",
+        "type": "string"
+      },
+      {
+        "path": "Process.pointerSize",
+        "type": "number"
+      },
+      {
+        "path": "Process.enumerateModules",
+        "type": "function"
+      },
+      {
+        "path": "Process.enumerateThreads",
+        "type": "function"
+      },
+      {
+        "path": "Process.findModuleByName",
+        "type": "function"
+      },
+      {
+        "path": "Module.findExportByName",
+        "type": "function"
+      },
+      {
+        "path": "Module.enumerateExports",
+        "type": "function"
+      },
+      {
+        "path": "Module.enumerateSymbols",
+        "type": "function"
+      },
+      {
+        "path": "Interceptor.attach",
+        "type": "function"
+      },
+      {
+        "path": "Interceptor.replace",
+        "type": "function"
+      },
+      {
+        "path": "Interceptor.revert",
+        "type": "function"
+      },
+      {
+        "path": "Interceptor.flush",
+        "type": "function"
+      },
+      {
+        "path": "Stalker.supported",
+        "type": "boolean"
+      },
+      {
+        "path": "Stalker.follow",
+        "type": "function"
+      },
+      {
+        "path": "Stalker.addCallProbe",
+        "type": "function"
+      },
+      {
+        "path": "Stalker.parse",
+        "type": "function"
+      },
+      {
+        "path": "Hook.NORMAL",
+        "type": "number"
+      },
+      {
+        "path": "Hook.WXSHADOW",
+        "type": "number"
+      },
+      {
+        "path": "Java.use",
+        "type": "function"
+      },
+      {
+        "path": "Java.ready",
+        "type": "function"
+      },
+      {
+        "path": "Java.choose",
+        "type": "function"
+      },
+      {
+        "path": "Java.enumerateClassLoadersSync",
+        "type": "function"
+      },
+      {
+        "path": "Jni.addr",
+        "type": "function"
+      },
+      {
+        "path": "rpc.exports",
+        "type": "object"
+      }
+    ],
+    "schemaVersion": 1
+  },
+  "schemaVersion": 1,
+  "upstream": {
+    "fridaDescribe": "17.15.5-5-g200c682",
+    "fridaRevision": "200c682e13094e2e1b0ede9e663a701b5a988f72",
+    "fridaTagRevision": "fdd722a991009eef0331dc0d6f68b70b4f91df63",
+    "gumDescribe": "17.15.5-7-g867975dc",
+    "gumRevision": "867975dc6cfebbba872d608585afb90a73e86381",
+    "gumTagRevision": "b3baae444049bbd2448debe0030cebacb1d26a50",
+    "modules": [
+      "core",
+      "kernel",
+      "memory",
+      "module",
+      "thread",
+      "process",
+      "file",
+      "checksum",
+      "stream",
+      "socket",
+      "database",
+      "interceptor",
+      "api_resolver",
+      "symbol",
+      "cmodule",
+      "instruction",
+      "control_flow_graph",
+      "code_writer",
+      "code_relocator",
+      "stalker",
+      "cloak",
+      "sampler",
+      "profiler"
+    ],
+    "runtimeGlobals": [
+      "rpc",
+      "recv",
+      "send",
+      "setTimeout",
+      "setInterval",
+      "setImmediate",
+      "clearImmediate",
+      "int64",
+      "uint64",
+      "ptr",
+      "NULL",
+      "console",
+      "hexdump",
+      "Worker"
+    ],
+    "sources": {
+      "gumquickapiresolver.c": {
+        "classes": [
+          "ApiResolver"
+        ],
+        "functionLists": {
+          "gumjs_api_resolver_entries": [
+            {
+              "kind": "function",
+              "name": "enumerateMatches"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "api_resolver"
+      },
+      "gumquickchecksum.c": {
+        "classes": [
+          "Checksum"
+        ],
+        "functionLists": {
+          "gumjs_checksum_entries": [
+            {
+              "kind": "function",
+              "name": "copy"
+            },
+            {
+              "kind": "function",
+              "name": "getDigest"
+            },
+            {
+              "kind": "function",
+              "name": "getString"
+            },
+            {
+              "kind": "function",
+              "name": "peekDigest"
+            },
+            {
+              "kind": "function",
+              "name": "peekString"
+            },
+            {
+              "kind": "function",
+              "name": "update"
+            }
+          ],
+          "gumjs_checksum_module_entries": [
+            {
+              "kind": "function",
+              "name": "compute"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "checksum"
+      },
+      "gumquickcloak.c": {
+        "classes": [],
+        "functionLists": {
+          "gumjs_cloak_entries": [
+            {
+              "kind": "function",
+              "name": "_addRange"
+            },
+            {
+              "kind": "function",
+              "name": "_clipRange"
+            },
+            {
+              "kind": "function",
+              "name": "_removeRange"
+            },
+            {
+              "kind": "function",
+              "name": "addFileDescriptor"
+            },
+            {
+              "kind": "function",
+              "name": "addThread"
+            },
+            {
+              "kind": "function",
+              "name": "hasFileDescriptor"
+            },
+            {
+              "kind": "function",
+              "name": "hasRangeContaining"
+            },
+            {
+              "kind": "function",
+              "name": "hasThread"
+            },
+            {
+              "kind": "function",
+              "name": "removeFileDescriptor"
+            },
+            {
+              "kind": "function",
+              "name": "removeThread"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Cloak"
+        ],
+        "module": "cloak"
+      },
+      "gumquickcmodule.c": {
+        "classes": [
+          "CModule"
+        ],
+        "functionLists": {
+          "gumjs_cmodule_entries": [
+            {
+              "kind": "function",
+              "name": "dispose"
+            }
+          ],
+          "gumjs_cmodule_module_entries": [
+            {
+              "kind": "property",
+              "name": "builtins"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "cmodule"
+      },
+      "gumquickcoderelocator.c": {
+        "classes": [
+          "Arm64Relocator"
+        ],
+        "functionLists": {
+          "gumjs_arm64_relocator_entries": [
+            {
+              "kind": "function",
+              "name": "dispose"
+            },
+            {
+              "kind": "property",
+              "name": "eob"
+            },
+            {
+              "kind": "property",
+              "name": "eoi"
+            },
+            {
+              "kind": "property",
+              "name": "input"
+            },
+            {
+              "kind": "function",
+              "name": "peekNextWriteInsn"
+            },
+            {
+              "kind": "function",
+              "name": "peekNextWriteSource"
+            },
+            {
+              "kind": "function",
+              "name": "readOne"
+            },
+            {
+              "kind": "function",
+              "name": "reset"
+            },
+            {
+              "kind": "function",
+              "name": "skipOne"
+            },
+            {
+              "kind": "function",
+              "name": "writeAll"
+            },
+            {
+              "kind": "function",
+              "name": "writeOne"
+            }
+          ]
+        },
+        "generatedArm64Bindings": true,
+        "globalLiterals": [],
+        "module": "code_relocator"
+      },
+      "gumquickcodewriter.c": {
+        "classes": [
+          "Arm64Writer"
+        ],
+        "functionLists": {
+          "gumjs_arm64_writer_entries": [
+            {
+              "kind": "property",
+              "name": "base"
+            },
+            {
+              "kind": "function",
+              "name": "canBranchDirectlyBetween"
+            },
+            {
+              "kind": "property",
+              "name": "code"
+            },
+            {
+              "kind": "function",
+              "name": "dispose"
+            },
+            {
+              "kind": "function",
+              "name": "flush"
+            },
+            {
+              "kind": "property",
+              "name": "offset"
+            },
+            {
+              "kind": "property",
+              "name": "pc"
+            },
+            {
+              "kind": "function",
+              "name": "putAddRegRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putAddRegRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putAdrpRegAddress"
+            },
+            {
+              "kind": "function",
+              "name": "putAndRegRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putBCondLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putBImm"
+            },
+            {
+              "kind": "function",
+              "name": "putBLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putBlImm"
+            },
+            {
+              "kind": "function",
+              "name": "putBlLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putBlrReg"
+            },
+            {
+              "kind": "function",
+              "name": "putBlrRegNoAuth"
+            },
+            {
+              "kind": "function",
+              "name": "putBrReg"
+            },
+            {
+              "kind": "function",
+              "name": "putBrRegNoAuth"
+            },
+            {
+              "kind": "function",
+              "name": "putBranchAddress"
+            },
+            {
+              "kind": "function",
+              "name": "putBrkImm"
+            },
+            {
+              "kind": "function",
+              "name": "putBytes"
+            },
+            {
+              "kind": "function",
+              "name": "putCallAddressWithArguments"
+            },
+            {
+              "kind": "function",
+              "name": "putCallRegWithArguments"
+            },
+            {
+              "kind": "function",
+              "name": "putCbnzRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putCbnzRegLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putCbzRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putCbzRegLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putCmpRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putEorRegRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putInstruction"
+            },
+            {
+              "kind": "function",
+              "name": "putLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putLdpRegRegRegOffset"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegAddress"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegRef"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegRegOffset"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegRegOffsetMode"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegU32"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegU32Ptr"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegU64"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegU64Ptr"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrRegValue"
+            },
+            {
+              "kind": "function",
+              "name": "putLdrswRegRegOffset"
+            },
+            {
+              "kind": "function",
+              "name": "putLslRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putLsrRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putMovNzcvReg"
+            },
+            {
+              "kind": "function",
+              "name": "putMovRegNzcv"
+            },
+            {
+              "kind": "function",
+              "name": "putMovRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putMrs"
+            },
+            {
+              "kind": "function",
+              "name": "putNop"
+            },
+            {
+              "kind": "function",
+              "name": "putPopAllQRegisters"
+            },
+            {
+              "kind": "function",
+              "name": "putPopAllXRegisters"
+            },
+            {
+              "kind": "function",
+              "name": "putPopRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putPushAllQRegisters"
+            },
+            {
+              "kind": "function",
+              "name": "putPushAllXRegisters"
+            },
+            {
+              "kind": "function",
+              "name": "putPushRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putRet"
+            },
+            {
+              "kind": "function",
+              "name": "putRetReg"
+            },
+            {
+              "kind": "function",
+              "name": "putStpRegRegRegOffset"
+            },
+            {
+              "kind": "function",
+              "name": "putStrRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putStrRegRegOffset"
+            },
+            {
+              "kind": "function",
+              "name": "putStrRegRegOffsetMode"
+            },
+            {
+              "kind": "function",
+              "name": "putSubRegRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putSubRegRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putTbnzRegImmImm"
+            },
+            {
+              "kind": "function",
+              "name": "putTbnzRegImmLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putTbzRegImmImm"
+            },
+            {
+              "kind": "function",
+              "name": "putTbzRegImmLabel"
+            },
+            {
+              "kind": "function",
+              "name": "putTstRegImm"
+            },
+            {
+              "kind": "function",
+              "name": "putUbfm"
+            },
+            {
+              "kind": "function",
+              "name": "putUxtwRegReg"
+            },
+            {
+              "kind": "function",
+              "name": "putXpaciReg"
+            },
+            {
+              "kind": "function",
+              "name": "reset"
+            },
+            {
+              "kind": "function",
+              "name": "sign"
+            },
+            {
+              "kind": "function",
+              "name": "skip"
+            }
+          ]
+        },
+        "generatedArm64Bindings": true,
+        "globalLiterals": [],
+        "module": "code_writer"
+      },
+      "gumquickcontrolflowgraph.c": {
+        "classes": [
+          "BasicBlock",
+          "ControlFlowGraph"
+        ],
+        "functionLists": {
+          "gumjs_basic_block_entries": [
+            {
+              "kind": "property",
+              "name": "end"
+            },
+            {
+              "kind": "property",
+              "name": "immediateDominator"
+            },
+            {
+              "kind": "property",
+              "name": "instructions"
+            },
+            {
+              "kind": "property",
+              "name": "predecessors"
+            },
+            {
+              "kind": "property",
+              "name": "start"
+            },
+            {
+              "kind": "property",
+              "name": "successors"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            }
+          ],
+          "gumjs_control_flow_graph_entries": [
+            {
+              "kind": "property",
+              "name": "blocks"
+            },
+            {
+              "kind": "function",
+              "name": "dominates"
+            },
+            {
+              "kind": "property",
+              "name": "entryBlock"
+            },
+            {
+              "kind": "property",
+              "name": "entrypoint"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateDominatingSites"
+            },
+            {
+              "kind": "function",
+              "name": "findBlockContaining"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "control_flow_graph"
+      },
+      "gumquickcore.c": {
+        "classes": [
+          "CallbackContext",
+          "CpuContext",
+          "Int64",
+          "KernelResource",
+          "MatchPattern",
+          "NativeCallback",
+          "NativeFunction",
+          "NativePointer",
+          "NativeResource",
+          "SourceMap",
+          "SystemFunction",
+          "UInt64",
+          "WeakRef",
+          "_Worker"
+        ],
+        "functionLists": {
+          "gumjs_array_buffer_class_entries": [
+            {
+              "kind": "function",
+              "name": "wrap"
+            }
+          ],
+          "gumjs_array_buffer_instance_entries": [
+            {
+              "kind": "function",
+              "name": "unwrap"
+            }
+          ],
+          "gumjs_callback_context_entries": [
+            {
+              "kind": "property",
+              "name": "context"
+            },
+            {
+              "kind": "property",
+              "name": "returnAddress"
+            }
+          ],
+          "gumjs_cpu_context_entries": [
+            {
+              "kind": "function",
+              "name": "toJSON"
+            }
+          ],
+          "gumjs_frida_entries": [
+            {
+              "kind": "property",
+              "name": "heapSize"
+            },
+            {
+              "kind": "property",
+              "name": "version"
+            }
+          ],
+          "gumjs_int64_entries": [
+            {
+              "kind": "function",
+              "name": "add"
+            },
+            {
+              "kind": "function",
+              "name": "and"
+            },
+            {
+              "kind": "function",
+              "name": "compare"
+            },
+            {
+              "kind": "function",
+              "name": "not"
+            },
+            {
+              "kind": "function",
+              "name": "or"
+            },
+            {
+              "kind": "function",
+              "name": "shl"
+            },
+            {
+              "kind": "function",
+              "name": "shr"
+            },
+            {
+              "kind": "function",
+              "name": "sub"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            },
+            {
+              "kind": "function",
+              "name": "toNumber"
+            },
+            {
+              "kind": "function",
+              "name": "toString"
+            },
+            {
+              "kind": "function",
+              "name": "valueOf"
+            },
+            {
+              "kind": "function",
+              "name": "xor"
+            }
+          ],
+          "gumjs_native_function_entries": [
+            {
+              "kind": "function",
+              "name": "apply"
+            },
+            {
+              "kind": "function",
+              "name": "call"
+            }
+          ],
+          "gumjs_native_pointer_entries": [
+            {
+              "kind": "function",
+              "name": "add"
+            },
+            {
+              "kind": "function",
+              "name": "and"
+            },
+            {
+              "kind": "function",
+              "name": "blend"
+            },
+            {
+              "kind": "function",
+              "name": "compare"
+            },
+            {
+              "kind": "function",
+              "name": "isNull"
+            },
+            {
+              "kind": "function",
+              "name": "not"
+            },
+            {
+              "kind": "function",
+              "name": "or"
+            },
+            {
+              "kind": "function",
+              "name": "readAnsiString"
+            },
+            {
+              "kind": "function",
+              "name": "readByteArray"
+            },
+            {
+              "kind": "function",
+              "name": "readCString"
+            },
+            {
+              "kind": "function",
+              "name": "readDouble"
+            },
+            {
+              "kind": "function",
+              "name": "readFloat"
+            },
+            {
+              "kind": "function",
+              "name": "readInt"
+            },
+            {
+              "kind": "function",
+              "name": "readLong"
+            },
+            {
+              "kind": "function",
+              "name": "readPointer"
+            },
+            {
+              "kind": "function",
+              "name": "readS16"
+            },
+            {
+              "kind": "function",
+              "name": "readS32"
+            },
+            {
+              "kind": "function",
+              "name": "readS64"
+            },
+            {
+              "kind": "function",
+              "name": "readS8"
+            },
+            {
+              "kind": "function",
+              "name": "readShort"
+            },
+            {
+              "kind": "function",
+              "name": "readU16"
+            },
+            {
+              "kind": "function",
+              "name": "readU32"
+            },
+            {
+              "kind": "function",
+              "name": "readU64"
+            },
+            {
+              "kind": "function",
+              "name": "readU8"
+            },
+            {
+              "kind": "function",
+              "name": "readUInt"
+            },
+            {
+              "kind": "function",
+              "name": "readULong"
+            },
+            {
+              "kind": "function",
+              "name": "readUShort"
+            },
+            {
+              "kind": "function",
+              "name": "readUtf16String"
+            },
+            {
+              "kind": "function",
+              "name": "readUtf8String"
+            },
+            {
+              "kind": "function",
+              "name": "readVolatile"
+            },
+            {
+              "kind": "function",
+              "name": "shl"
+            },
+            {
+              "kind": "function",
+              "name": "shr"
+            },
+            {
+              "kind": "function",
+              "name": "sign"
+            },
+            {
+              "kind": "function",
+              "name": "strip"
+            },
+            {
+              "kind": "function",
+              "name": "sub"
+            },
+            {
+              "kind": "function",
+              "name": "toInt32"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            },
+            {
+              "kind": "function",
+              "name": "toMatchPattern"
+            },
+            {
+              "kind": "function",
+              "name": "toString"
+            },
+            {
+              "kind": "function",
+              "name": "toUInt32"
+            },
+            {
+              "kind": "function",
+              "name": "writeAnsiString"
+            },
+            {
+              "kind": "function",
+              "name": "writeByteArray"
+            },
+            {
+              "kind": "function",
+              "name": "writeDouble"
+            },
+            {
+              "kind": "function",
+              "name": "writeFloat"
+            },
+            {
+              "kind": "function",
+              "name": "writeInt"
+            },
+            {
+              "kind": "function",
+              "name": "writeLong"
+            },
+            {
+              "kind": "function",
+              "name": "writePointer"
+            },
+            {
+              "kind": "function",
+              "name": "writeS16"
+            },
+            {
+              "kind": "function",
+              "name": "writeS32"
+            },
+            {
+              "kind": "function",
+              "name": "writeS64"
+            },
+            {
+              "kind": "function",
+              "name": "writeS8"
+            },
+            {
+              "kind": "function",
+              "name": "writeShort"
+            },
+            {
+              "kind": "function",
+              "name": "writeU16"
+            },
+            {
+              "kind": "function",
+              "name": "writeU32"
+            },
+            {
+              "kind": "function",
+              "name": "writeU64"
+            },
+            {
+              "kind": "function",
+              "name": "writeU8"
+            },
+            {
+              "kind": "function",
+              "name": "writeUInt"
+            },
+            {
+              "kind": "function",
+              "name": "writeULong"
+            },
+            {
+              "kind": "function",
+              "name": "writeUShort"
+            },
+            {
+              "kind": "function",
+              "name": "writeUtf16String"
+            },
+            {
+              "kind": "function",
+              "name": "writeUtf8String"
+            },
+            {
+              "kind": "function",
+              "name": "writeVolatile"
+            },
+            {
+              "kind": "function",
+              "name": "xor"
+            }
+          ],
+          "gumjs_root_entries": [
+            {
+              "kind": "function",
+              "name": "_send"
+            },
+            {
+              "kind": "function",
+              "name": "_setIncomingMessageCallback"
+            },
+            {
+              "kind": "function",
+              "name": "_setInterval"
+            },
+            {
+              "kind": "function",
+              "name": "_setTimeout"
+            },
+            {
+              "kind": "function",
+              "name": "_setUnhandledExceptionCallback"
+            },
+            {
+              "kind": "function",
+              "name": "_waitForEvent"
+            },
+            {
+              "kind": "function",
+              "name": "clearInterval"
+            },
+            {
+              "kind": "function",
+              "name": "clearTimeout"
+            },
+            {
+              "kind": "function",
+              "name": "gc"
+            }
+          ],
+          "gumjs_script_entries": [
+            {
+              "kind": "function",
+              "name": "_derefWeak"
+            },
+            {
+              "kind": "function",
+              "name": "_findSourceMap"
+            },
+            {
+              "kind": "function",
+              "name": "_load"
+            },
+            {
+              "kind": "function",
+              "name": "_nextTick"
+            },
+            {
+              "kind": "function",
+              "name": "bindWeak"
+            },
+            {
+              "kind": "function",
+              "name": "evaluate"
+            },
+            {
+              "kind": "function",
+              "name": "pin"
+            },
+            {
+              "kind": "function",
+              "name": "registerSourceMap"
+            },
+            {
+              "kind": "property",
+              "name": "runtime"
+            },
+            {
+              "kind": "function",
+              "name": "setGlobalAccessHandler"
+            },
+            {
+              "kind": "function",
+              "name": "unbindWeak"
+            },
+            {
+              "kind": "function",
+              "name": "unpin"
+            }
+          ],
+          "gumjs_source_map_entries": [
+            {
+              "kind": "function",
+              "name": "_resolve"
+            }
+          ],
+          "gumjs_system_function_entries": [
+            {
+              "kind": "function",
+              "name": "apply"
+            },
+            {
+              "kind": "function",
+              "name": "call"
+            }
+          ],
+          "gumjs_uint64_entries": [
+            {
+              "kind": "function",
+              "name": "add"
+            },
+            {
+              "kind": "function",
+              "name": "and"
+            },
+            {
+              "kind": "function",
+              "name": "compare"
+            },
+            {
+              "kind": "function",
+              "name": "not"
+            },
+            {
+              "kind": "function",
+              "name": "or"
+            },
+            {
+              "kind": "function",
+              "name": "shl"
+            },
+            {
+              "kind": "function",
+              "name": "shr"
+            },
+            {
+              "kind": "function",
+              "name": "sub"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            },
+            {
+              "kind": "function",
+              "name": "toNumber"
+            },
+            {
+              "kind": "function",
+              "name": "toString"
+            },
+            {
+              "kind": "function",
+              "name": "valueOf"
+            },
+            {
+              "kind": "function",
+              "name": "xor"
+            }
+          ],
+          "gumjs_worker_entries": [
+            {
+              "kind": "function",
+              "name": "post"
+            },
+            {
+              "kind": "function",
+              "name": "terminate"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Frida",
+          "Script"
+        ],
+        "module": "core"
+      },
+      "gumquickdatabase.c": {
+        "classes": [
+          "SqliteDatabase",
+          "SqliteStatement"
+        ],
+        "functionLists": {
+          "gumjs_database_entries": [
+            {
+              "kind": "function",
+              "name": "close"
+            },
+            {
+              "kind": "function",
+              "name": "dump"
+            },
+            {
+              "kind": "function",
+              "name": "exec"
+            },
+            {
+              "kind": "function",
+              "name": "prepare"
+            }
+          ],
+          "gumjs_database_module_entries": [
+            {
+              "kind": "function",
+              "name": "_open"
+            },
+            {
+              "kind": "function",
+              "name": "openInline"
+            }
+          ],
+          "gumjs_statement_entries": [
+            {
+              "kind": "function",
+              "name": "bindBlob"
+            },
+            {
+              "kind": "function",
+              "name": "bindFloat"
+            },
+            {
+              "kind": "function",
+              "name": "bindInteger"
+            },
+            {
+              "kind": "function",
+              "name": "bindNull"
+            },
+            {
+              "kind": "function",
+              "name": "bindText"
+            },
+            {
+              "kind": "property",
+              "name": "columnNames"
+            },
+            {
+              "kind": "property",
+              "name": "columnTypes"
+            },
+            {
+              "kind": "property",
+              "name": "declaredTypes"
+            },
+            {
+              "kind": "property",
+              "name": "paramsCount"
+            },
+            {
+              "kind": "function",
+              "name": "reset"
+            },
+            {
+              "kind": "function",
+              "name": "step"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "database"
+      },
+      "gumquickfile.c": {
+        "classes": [
+          "File"
+        ],
+        "functionLists": {
+          "gumjs_file_entries": [
+            {
+              "kind": "function",
+              "name": "close"
+            },
+            {
+              "kind": "function",
+              "name": "flush"
+            },
+            {
+              "kind": "function",
+              "name": "readBytes"
+            },
+            {
+              "kind": "function",
+              "name": "readLine"
+            },
+            {
+              "kind": "function",
+              "name": "readText"
+            },
+            {
+              "kind": "function",
+              "name": "seek"
+            },
+            {
+              "kind": "function",
+              "name": "tell"
+            },
+            {
+              "kind": "function",
+              "name": "write"
+            }
+          ],
+          "gumjs_file_module_entries": [
+            {
+              "kind": "property",
+              "name": "SEEK_CUR"
+            },
+            {
+              "kind": "property",
+              "name": "SEEK_END"
+            },
+            {
+              "kind": "property",
+              "name": "SEEK_SET"
+            },
+            {
+              "kind": "function",
+              "name": "readAllBytes"
+            },
+            {
+              "kind": "function",
+              "name": "readAllText"
+            },
+            {
+              "kind": "function",
+              "name": "writeAllBytes"
+            },
+            {
+              "kind": "function",
+              "name": "writeAllText"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "file"
+      },
+      "gumquickinstruction.c": {
+        "classes": [
+          "Instruction"
+        ],
+        "functionLists": {
+          "gumjs_instruction_entries": [
+            {
+              "kind": "property",
+              "name": "address"
+            },
+            {
+              "kind": "property",
+              "name": "groups"
+            },
+            {
+              "kind": "property",
+              "name": "mnemonic"
+            },
+            {
+              "kind": "property",
+              "name": "next"
+            },
+            {
+              "kind": "property",
+              "name": "opStr"
+            },
+            {
+              "kind": "property",
+              "name": "operands"
+            },
+            {
+              "kind": "property",
+              "name": "regsAccessed"
+            },
+            {
+              "kind": "property",
+              "name": "regsRead"
+            },
+            {
+              "kind": "property",
+              "name": "regsWritten"
+            },
+            {
+              "kind": "property",
+              "name": "size"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            },
+            {
+              "kind": "function",
+              "name": "toString"
+            }
+          ],
+          "gumjs_instruction_module_entries": [
+            {
+              "kind": "function",
+              "name": "_parse"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "instruction"
+      },
+      "gumquickinterceptor.c": {
+        "classes": [
+          "InvocationArguments",
+          "InvocationContext",
+          "InvocationListener",
+          "InvocationReturnValue"
+        ],
+        "functionLists": {
+          "gumjs_interceptor_entries": [
+            {
+              "kind": "function",
+              "name": "_attach"
+            },
+            {
+              "kind": "function",
+              "name": "_replace"
+            },
+            {
+              "kind": "function",
+              "name": "_replaceFast"
+            },
+            {
+              "kind": "property",
+              "name": "defaults"
+            },
+            {
+              "kind": "function",
+              "name": "detachAll"
+            },
+            {
+              "kind": "function",
+              "name": "flush"
+            },
+            {
+              "kind": "function",
+              "name": "revert"
+            }
+          ],
+          "gumjs_invocation_context_entries": [
+            {
+              "kind": "property",
+              "name": "context"
+            },
+            {
+              "kind": "property",
+              "name": "depth"
+            },
+            {
+              "kind": "property",
+              "name": "returnAddress"
+            },
+            {
+              "kind": "property",
+              "name": "threadId"
+            }
+          ],
+          "gumjs_invocation_listener_entries": [
+            {
+              "kind": "function",
+              "name": "detach"
+            }
+          ],
+          "gumjs_invocation_retval_entries": [
+            {
+              "kind": "function",
+              "name": "replace"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Interceptor"
+        ],
+        "module": "interceptor"
+      },
+      "gumquickkernel.c": {
+        "classes": [],
+        "functionLists": {
+          "gumjs_kernel_entries": [
+            {
+              "kind": "function",
+              "name": "_enumerateRanges"
+            },
+            {
+              "kind": "function",
+              "name": "_scan"
+            },
+            {
+              "kind": "function",
+              "name": "alloc"
+            },
+            {
+              "kind": "property",
+              "name": "available"
+            },
+            {
+              "kind": "property",
+              "name": "base"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateModuleRanges"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateModules"
+            },
+            {
+              "kind": "function",
+              "name": "protect"
+            },
+            {
+              "kind": "function",
+              "name": "scanSync"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Kernel"
+        ],
+        "module": "kernel"
+      },
+      "gumquickmemory.c": {
+        "classes": [
+          "MemoryAccessDetails"
+        ],
+        "functionLists": {
+          "gumjs_memory_access_details_entries": [
+            {
+              "kind": "property",
+              "name": "address"
+            },
+            {
+              "kind": "property",
+              "name": "from"
+            },
+            {
+              "kind": "property",
+              "name": "operation"
+            },
+            {
+              "kind": "property",
+              "name": "pageIndex"
+            },
+            {
+              "kind": "property",
+              "name": "pagesCompleted"
+            },
+            {
+              "kind": "property",
+              "name": "pagesTotal"
+            },
+            {
+              "kind": "property",
+              "name": "rangeIndex"
+            },
+            {
+              "kind": "property",
+              "name": "threadId"
+            }
+          ],
+          "gumjs_memory_access_monitor_entries": [
+            {
+              "kind": "function",
+              "name": "disable"
+            },
+            {
+              "kind": "function",
+              "name": "enable"
+            }
+          ],
+          "gumjs_memory_entries": [
+            {
+              "kind": "function",
+              "name": "_alloc"
+            },
+            {
+              "kind": "function",
+              "name": "_checkCodePointer"
+            },
+            {
+              "kind": "function",
+              "name": "_patchCode"
+            },
+            {
+              "kind": "function",
+              "name": "_scan"
+            },
+            {
+              "kind": "function",
+              "name": "allocAnsiString"
+            },
+            {
+              "kind": "function",
+              "name": "allocUtf16String"
+            },
+            {
+              "kind": "function",
+              "name": "allocUtf8String"
+            },
+            {
+              "kind": "function",
+              "name": "copy"
+            },
+            {
+              "kind": "function",
+              "name": "findPointers"
+            },
+            {
+              "kind": "function",
+              "name": "protect"
+            },
+            {
+              "kind": "function",
+              "name": "queryProtection"
+            },
+            {
+              "kind": "function",
+              "name": "scanSync"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Memory",
+          "MemoryAccessMonitor"
+        ],
+        "module": "memory"
+      },
+      "gumquickmodule.c": {
+        "classes": [
+          "Module",
+          "ModuleMap"
+        ],
+        "functionLists": {
+          "gumjs_module_entries": [
+            {
+              "kind": "property",
+              "name": "base"
+            },
+            {
+              "kind": "function",
+              "name": "ensureInitialized"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateDependencies"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateExports"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateImports"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateRanges"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateSections"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateSymbols"
+            },
+            {
+              "kind": "function",
+              "name": "findExportByName"
+            },
+            {
+              "kind": "function",
+              "name": "findSymbolByName"
+            },
+            {
+              "kind": "property",
+              "name": "name"
+            },
+            {
+              "kind": "property",
+              "name": "path"
+            },
+            {
+              "kind": "property",
+              "name": "size"
+            },
+            {
+              "kind": "property",
+              "name": "version"
+            }
+          ],
+          "gumjs_module_map_entries": [
+            {
+              "kind": "function",
+              "name": "find"
+            },
+            {
+              "kind": "function",
+              "name": "findName"
+            },
+            {
+              "kind": "function",
+              "name": "findPath"
+            },
+            {
+              "kind": "property",
+              "name": "handle"
+            },
+            {
+              "kind": "function",
+              "name": "has"
+            },
+            {
+              "kind": "function",
+              "name": "update"
+            },
+            {
+              "kind": "function",
+              "name": "values"
+            }
+          ],
+          "gumjs_module_static_entries": [
+            {
+              "kind": "function",
+              "name": "findGlobalExportByName"
+            },
+            {
+              "kind": "function",
+              "name": "load"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "module"
+      },
+      "gumquickprocess.c": {
+        "classes": [
+          "ModuleObserver",
+          "ThreadObserver"
+        ],
+        "functionLists": {
+          "gumjs_module_observer_entries": [
+            {
+              "kind": "function",
+              "name": "detach"
+            }
+          ],
+          "gumjs_process_entries": [
+            {
+              "kind": "function",
+              "name": "_enumerateRanges"
+            },
+            {
+              "kind": "function",
+              "name": "_runOnThread"
+            },
+            {
+              "kind": "property",
+              "name": "arch"
+            },
+            {
+              "kind": "function",
+              "name": "attachModuleObserver"
+            },
+            {
+              "kind": "function",
+              "name": "attachThreadObserver"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateMallocRanges"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateModules"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateSystemRanges"
+            },
+            {
+              "kind": "function",
+              "name": "enumerateThreads"
+            },
+            {
+              "kind": "function",
+              "name": "findFunctionRange"
+            },
+            {
+              "kind": "function",
+              "name": "findModuleByAddress"
+            },
+            {
+              "kind": "function",
+              "name": "findModuleByName"
+            },
+            {
+              "kind": "function",
+              "name": "findRangeByAddress"
+            },
+            {
+              "kind": "function",
+              "name": "findThreadById"
+            },
+            {
+              "kind": "function",
+              "name": "getCurrentDir"
+            },
+            {
+              "kind": "function",
+              "name": "getCurrentThreadId"
+            },
+            {
+              "kind": "function",
+              "name": "getHomeDir"
+            },
+            {
+              "kind": "function",
+              "name": "getTmpDir"
+            },
+            {
+              "kind": "function",
+              "name": "isDebuggerAttached"
+            },
+            {
+              "kind": "property",
+              "name": "mainModule"
+            },
+            {
+              "kind": "property",
+              "name": "platform"
+            },
+            {
+              "kind": "property",
+              "name": "pointerSize"
+            },
+            {
+              "kind": "function",
+              "name": "setExceptionHandler"
+            }
+          ],
+          "gumjs_thread_observer_entries": [
+            {
+              "kind": "function",
+              "name": "detach"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Process"
+        ],
+        "module": "process"
+      },
+      "gumquickprofiler.c": {
+        "classes": [
+          "Profiler"
+        ],
+        "functionLists": {
+          "gumjs_profiler_functions": [
+            {
+              "kind": "function",
+              "name": "generateReport"
+            },
+            {
+              "kind": "function",
+              "name": "instrument"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "profiler"
+      },
+      "gumquicksampler.c": {
+        "classes": [
+          "BusyCycleSampler",
+          "CallCountSampler",
+          "CycleSampler",
+          "MallocCountSampler",
+          "Sampler",
+          "UserTimeSampler",
+          "WallClockSampler"
+        ],
+        "functionLists": {
+          "gumjs_sampler_functions": [
+            {
+              "kind": "function",
+              "name": "sample"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "sampler"
+      },
+      "gumquicksocket.c": {
+        "classes": [
+          "SocketConnection",
+          "SocketListener"
+        ],
+        "functionLists": {
+          "gumjs_socket_connection_entries": [
+            {
+              "kind": "function",
+              "name": "_setNoDelay"
+            }
+          ],
+          "gumjs_socket_entries": [
+            {
+              "kind": "function",
+              "name": "_connect"
+            },
+            {
+              "kind": "function",
+              "name": "_listen"
+            },
+            {
+              "kind": "function",
+              "name": "localAddress"
+            },
+            {
+              "kind": "function",
+              "name": "peerAddress"
+            },
+            {
+              "kind": "function",
+              "name": "type"
+            }
+          ],
+          "gumjs_socket_listener_entries": [
+            {
+              "kind": "function",
+              "name": "_accept"
+            },
+            {
+              "kind": "function",
+              "name": "_close"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Socket"
+        ],
+        "module": "socket"
+      },
+      "gumquickstalker.c": {
+        "classes": [
+          "DefaultIterator",
+          "ProbeArguments",
+          "SpecialIterator"
+        ],
+        "functionLists": {
+          "gumjs_default_iterator_entries": [
+            {
+              "kind": "function",
+              "name": "keep"
+            },
+            {
+              "kind": "property",
+              "name": "memoryAccess"
+            },
+            {
+              "kind": "function",
+              "name": "next"
+            },
+            {
+              "kind": "function",
+              "name": "putCallout"
+            },
+            {
+              "kind": "function",
+              "name": "putChainingReturn"
+            }
+          ],
+          "gumjs_special_iterator_entries": [
+            {
+              "kind": "function",
+              "name": "keep"
+            },
+            {
+              "kind": "property",
+              "name": "memoryAccess"
+            },
+            {
+              "kind": "function",
+              "name": "next"
+            },
+            {
+              "kind": "function",
+              "name": "putCallout"
+            },
+            {
+              "kind": "function",
+              "name": "putChainingReturn"
+            }
+          ],
+          "gumjs_stalker_entries": [
+            {
+              "kind": "function",
+              "name": "_exclude"
+            },
+            {
+              "kind": "function",
+              "name": "_follow"
+            },
+            {
+              "kind": "function",
+              "name": "_parse"
+            },
+            {
+              "kind": "function",
+              "name": "addCallProbe"
+            },
+            {
+              "kind": "function",
+              "name": "flush"
+            },
+            {
+              "kind": "function",
+              "name": "garbageCollect"
+            },
+            {
+              "kind": "function",
+              "name": "invalidate"
+            },
+            {
+              "kind": "property",
+              "name": "queueCapacity"
+            },
+            {
+              "kind": "property",
+              "name": "queueDrainInterval"
+            },
+            {
+              "kind": "function",
+              "name": "removeCallProbe"
+            },
+            {
+              "kind": "property",
+              "name": "trustThreshold"
+            },
+            {
+              "kind": "function",
+              "name": "unfollow"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Stalker"
+        ],
+        "module": "stalker"
+      },
+      "gumquickstream.c": {
+        "classes": [
+          "IOStream",
+          "InputStream",
+          "OutputStream"
+        ],
+        "functionLists": {
+          "gumjs_input_stream_entries": [
+            {
+              "kind": "function",
+              "name": "_close"
+            },
+            {
+              "kind": "function",
+              "name": "_read"
+            },
+            {
+              "kind": "function",
+              "name": "_readAll"
+            }
+          ],
+          "gumjs_io_stream_entries": [
+            {
+              "kind": "function",
+              "name": "_close"
+            },
+            {
+              "kind": "property",
+              "name": "input"
+            },
+            {
+              "kind": "property",
+              "name": "output"
+            }
+          ],
+          "gumjs_output_stream_entries": [
+            {
+              "kind": "function",
+              "name": "_close"
+            },
+            {
+              "kind": "function",
+              "name": "_write"
+            },
+            {
+              "kind": "function",
+              "name": "_writeAll"
+            },
+            {
+              "kind": "function",
+              "name": "_writeMemoryRegion"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "stream"
+      },
+      "gumquicksymbol.c": {
+        "classes": [
+          "DebugSymbol"
+        ],
+        "functionLists": {
+          "gumjs_symbol_entries": [
+            {
+              "kind": "property",
+              "name": "address"
+            },
+            {
+              "kind": "property",
+              "name": "column"
+            },
+            {
+              "kind": "property",
+              "name": "fileName"
+            },
+            {
+              "kind": "property",
+              "name": "lineNumber"
+            },
+            {
+              "kind": "property",
+              "name": "moduleName"
+            },
+            {
+              "kind": "property",
+              "name": "name"
+            },
+            {
+              "kind": "function",
+              "name": "toJSON"
+            },
+            {
+              "kind": "function",
+              "name": "toString"
+            }
+          ],
+          "gumjs_symbol_module_entries": [
+            {
+              "kind": "function",
+              "name": "findFunctionsMatching"
+            },
+            {
+              "kind": "function",
+              "name": "findFunctionsNamed"
+            },
+            {
+              "kind": "function",
+              "name": "fromAddress"
+            },
+            {
+              "kind": "function",
+              "name": "fromName"
+            },
+            {
+              "kind": "function",
+              "name": "getFunctionByName"
+            },
+            {
+              "kind": "function",
+              "name": "load"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [],
+        "module": "symbol"
+      },
+      "gumquickthread.c": {
+        "classes": [
+          "Thread"
+        ],
+        "functionLists": {
+          "gumjs_backtracer_entries": [
+            {
+              "kind": "property",
+              "name": "ACCURATE"
+            },
+            {
+              "kind": "property",
+              "name": "FUZZY"
+            }
+          ],
+          "gumjs_thread_entries": [
+            {
+              "kind": "function",
+              "name": "setHardwareBreakpoint"
+            },
+            {
+              "kind": "function",
+              "name": "setHardwareWatchpoint"
+            },
+            {
+              "kind": "function",
+              "name": "unsetHardwareBreakpoint"
+            },
+            {
+              "kind": "function",
+              "name": "unsetHardwareWatchpoint"
+            }
+          ],
+          "gumjs_thread_module_entries": [
+            {
+              "kind": "function",
+              "name": "_backtrace"
+            },
+            {
+              "kind": "function",
+              "name": "sleep"
+            }
+          ]
+        },
+        "generatedArm64Bindings": false,
+        "globalLiterals": [
+          "Backtracer"
+        ],
+        "module": "thread"
+      }
+    },
+    "typesVersion": "19.9.0"
+  }
+}

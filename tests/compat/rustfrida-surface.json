@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "baselineRevision": "c7daef081b7965ce7e578e16b134a21a168d7646",
+  "documentedGlobals": [
+    "console",
+    "ptr",
+    "Memory",
+    "File",
+    "Process",
+    "Module",
+    "Interceptor",
+    "Stalker",
+    "CModule",
+    "NativeFunction",
+    "hook",
+    "hookNative",
+    "attachNative",
+    "unhook",
+    "callNative",
+    "qbdi",
+    "Java",
+    "Jni"
+  ],
+  "globals": [
+    { "name": "console", "type": "object", "classification": "compatible" },
+    { "name": "ptr", "type": "function", "classification": "compatible" },
+    { "name": "NULL", "type": "object", "classification": "compatible" },
+    { "name": "Memory", "type": "object", "classification": "partial" },
+    { "name": "File", "type": "function", "classification": "partial" },
+    { "name": "Process", "type": "object", "classification": "partial" },
+    { "name": "Module", "type": "object", "classification": "legacy" },
+    { "name": "Hook", "type": "object", "classification": "extension" },
+    { "name": "Interceptor", "type": "object", "classification": "partial" },
+    { "name": "Stalker", "type": "object", "classification": "partial" },
+    { "name": "CModule", "type": "function", "classification": "partial" },
+    { "name": "NativeFunction", "type": "function", "classification": "partial" },
+    { "name": "hook", "type": "function", "classification": "extension" },
+    { "name": "hookNative", "type": "function", "classification": "extension" },
+    { "name": "attachNative", "type": "function", "classification": "extension" },
+    { "name": "unhook", "type": "function", "classification": "extension" },
+    { "name": "callNative", "type": "function", "classification": "extension" },
+    { "name": "recompHook", "type": "function", "classification": "extension" },
+    { "name": "Java", "type": "object", "classification": "partial" },
+    { "name": "Jni", "type": "object", "classification": "extension" },
+    { "name": "rpc", "type": "object", "classification": "compatible" }
+  ],
+  "optionalGlobals": [
+    { "name": "qbdi", "type": "object", "classification": "extension", "feature": "qbdi" }
+  ],
+  "probes": [
+    { "path": "console.log", "type": "function" },
+    { "path": "NULL.isNull", "type": "function" },
+    { "path": "Memory.alloc", "type": "function" },
+    { "path": "Memory.copy", "type": "function" },
+    { "path": "Memory.dup", "type": "function" },
+    { "path": "Memory.protect", "type": "function" },
+    { "path": "Memory.queryProtection", "type": "function" },
+    { "path": "Memory.scanSync", "type": "function" },
+    { "path": "Memory.flushCodeCache", "type": "function" },
+    { "path": "File.readAllBytes", "type": "function" },
+    { "path": "File.writeAllBytes", "type": "function" },
+    { "path": "Process.id", "type": "number" },
+    { "path": "Process.arch", "type": "string" },
+    { "path": "Process.pointerSize", "type": "number" },
+    { "path": "Process.enumerateModules", "type": "function" },
+    { "path": "Process.enumerateThreads", "type": "function" },
+    { "path": "Process.findModuleByName", "type": "function" },
+    { "path": "Module.findExportByName", "type": "function" },
+    { "path": "Module.enumerateExports", "type": "function" },
+    { "path": "Module.enumerateSymbols", "type": "function" },
+    { "path": "Interceptor.attach", "type": "function" },
+    { "path": "Interceptor.replace", "type": "function" },
+    { "path": "Interceptor.revert", "type": "function" },
+    { "path": "Interceptor.flush", "type": "function" },
+    { "path": "Stalker.supported", "type": "boolean" },
+    { "path": "Stalker.follow", "type": "function" },
+    { "path": "Stalker.addCallProbe", "type": "function" },
+    { "path": "Stalker.parse", "type": "function" },
+    { "path": "Hook.NORMAL", "type": "number" },
+    { "path": "Hook.WXSHADOW", "type": "number" },
+    { "path": "Java.use", "type": "function" },
+    { "path": "Java.ready", "type": "function" },
+    { "path": "Java.choose", "type": "function" },
+    { "path": "Java.enumerateClassLoadersSync", "type": "function" },
+    { "path": "Jni.addr", "type": "function" },
+    { "path": "rpc.exports", "type": "object" }
+  ],
+  "compatibilityAreas": [
+    {
+      "area": "Core runtime",
+      "status": "partial",
+      "goal": "07",
+      "missing": ["Frida", "Script", "send", "recv", "timers", "Worker", "hexdump"]
+    },
+    {
+      "area": "Native ABI",
+      "status": "partial",
+      "goal": "04",
+      "missing": ["NativeCallback", "SystemFunction", "variadic", "struct-by-value", "options"]
+    },
+    {
+      "area": "Diagnostics",
+      "status": "missing",
+      "goal": "02",
+      "missing": ["DebugSymbol", "Thread", "Backtracer", "ApiResolver", "Instruction.parse"]
+    },
+    {
+      "area": "Module and Process",
+      "status": "partial",
+      "goal": "03",
+      "missing": ["Module instances", "ModuleMap", "observers", "runOnThread", "exception handler"]
+    },
+    {
+      "area": "Memory",
+      "status": "partial",
+      "goal": "06",
+      "missing": ["patchCode", "async scan", "findPointers", "MemoryAccessMonitor", "alloc options"]
+    },
+    {
+      "area": "Stalker",
+      "status": "partial",
+      "goal": "05",
+      "missing": ["Arm64Writer", "Arm64Relocator", "drop statistics"]
+    },
+    {
+      "area": "Java facade",
+      "status": "partial",
+      "goal": "08",
+      "missing": ["perform", "performNow", "ClassFactory", "retain", "cast", "array"]
+    },
+    {
+      "area": "Optional modules",
+      "status": "missing",
+      "goal": "09",
+      "missing": ["Cloak", "Checksum", "Socket", "Stream", "SQLite", "Sampler", "Profiler"]
+    }
+  ]
+}

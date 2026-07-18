@@ -1,7 +1,11 @@
 /target/
 /loader/build/
 .idea/
+__pycache__/
+*.py[cod]
 *.md
+!doc/frida-upgrade-roadmap.md
+!doc/frida-api-surface.md
 *.lock
 qbdi/libQBDI.a
 loader/loader_check.o

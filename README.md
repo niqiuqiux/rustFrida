@@ -2,6 +2,8 @@
 
 ARM64 Android 动态插桩框架。
 
+Frida 兼容性差异、上游源码基线和后续分步升级计划见 [Frida 17.15.5 差异与升级路线](doc/frida-upgrade-roadmap.md)。
+
 ## 环境要求
 
 - Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
