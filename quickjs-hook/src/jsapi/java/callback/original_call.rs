@@ -277,6 +277,7 @@ unsafe fn js_byte_buffer_to_java_byte_array(
     if !buf_ptr.is_null() {
         return new_java_byte_array_from_bytes(env, std::slice::from_raw_parts(buf_ptr, size));
     }
+    crate::jsapi::callback_util::discard_pending_exception(ctx);
 
     let mut byte_offset: usize = 0;
     let mut byte_length: usize = 0;
@@ -1191,7 +1192,12 @@ unsafe extern "C" fn js_call_original(
         };
     }
 
-    if use_blr
+    // The BLR router invokes the original only after this callback returns.
+    // JNI locals created while marshaling explicit JS arguments must therefore
+    // stay on the synchronous Call*MethodA path, where we can release them
+    // after the original has consumed them.
+    if supplied_owned_refs.is_empty()
+        && use_blr
         && quick_trampoline != 0
         && prepare_fast_orig_router_frame(env, hook_ctx, is_static, param_count, &param_types)
     {

@@ -124,6 +124,7 @@ unsafe fn extract_bytes(ctx: *mut ffi::JSContext, val: JSValue) -> Result<Vec<u8
     if !buf_ptr.is_null() {
         return Ok(std::slice::from_raw_parts(buf_ptr, size).to_vec());
     }
+    crate::jsapi::callback_util::discard_pending_exception(ctx);
 
     let mut byte_offset: usize = 0;
     let mut byte_length: usize = 0;

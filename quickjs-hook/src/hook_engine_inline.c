@@ -206,18 +206,23 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     /* x16 = trampoline (scratch).
      *
      * 规则:
-     *   on_leave == NULL → 必然 tail-jump, 不读 intercept_leave. 无 leave 时写 1 无效.
-     *   on_leave != NULL → wrap: BLR 原函数, 返回后走 on_leave + 出 thunk RET.
+     *   on_leave == NULL → 必然 tail-jump.
+     *   on_leave != NULL 且 intercept_leave == 0 → 本次调用 tail-jump.
+     *   on_leave != NULL 且 intercept_leave != 0 → wrap 原函数并在返回后调用 on_leave.
      *
      * tail-jump 路径省掉 thunk 栈帧在 BLR 期间的驻留, 原函数阻塞时 PC 已脱离 thunk,
      * full cleanup munmap pool 安全 (对标 "miss 不留栈帧" 的性能+安全优化). */
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)entry->trampoline);
 
-    uint64_t lbl_tail = 0;
-    bool support_tail_jump = (on_leave == NULL);
-    if (support_tail_jump) {
-        lbl_tail = arm64_writer_new_label_id(&w);
+    uint64_t lbl_tail = arm64_writer_new_label_id(&w);
+    if (on_leave == NULL) {
         arm64_writer_put_b_label(&w, lbl_tail);
+    } else {
+        /* on_enter may disable leave interception for this invocation. This is
+         * used by the address-level Interceptor dispatcher when no active JS
+         * listener has an onLeave callback. */
+        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 344);
+        arm64_writer_put_cbz_reg_label(&w, ARM64_REG_X17, lbl_tail);
     }
 
     /* --- wrap path (intercept leave) --- */
@@ -226,16 +231,24 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
                                              ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
 
-    /* Save return value (x0) back to context */
-    arm64_writer_put_str_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    /* Snapshot all caller-saved integer and FP return registers before invoking
+     * on_leave. The callback is free to clobber these registers, and AAPCS64 may
+     * return aggregates through x0-x7 or d0-d7 instead of x0 alone. */
+    for (int i = 0; i < 16; i += 2) {
+        arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
+                                                ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
+    }
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_stp_offset(&w, i, i + 1, ARM64_REG_SP, 280 + i * 8);
+    }
 
     /* Call on_leave callback if set */
     if (on_leave) {
         emit_callback_call(&w, on_leave, user_data);
     }
 
-    /* Restore x0 (return value, possibly modified by on_leave) */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    /* Restore return registers, including any changes made by on_leave. */
+    emit_restore_caller_regs(&w);
 
     /* Restore x30 (LR) */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
@@ -250,24 +263,22 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     arm64_writer_put_ret(&w);
 
     /* --- tail-jump path (no-intercept-leave) --- */
-    if (support_tail_jump) {
-        arm64_writer_put_label(&w, lbl_tail);
+    arm64_writer_put_label(&w, lbl_tail);
 
-        /* 恢复 caller's LR (x30), 让原函数 RET 直接回到 caller */
-        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+    /* 恢复 caller's LR (x30), 让原函数 RET 直接回到 caller */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
 
-        /* Restore NZCV using x17 as scratch (x17 稍后从 ctx 重载真值) */
-        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
-        arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17);
+    /* Restore NZCV using x17 as scratch (x17 稍后从 ctx 重载真值) */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
+    arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17);
 
-        /* 恢复真实 x17,x18 (覆盖 NZCV scratch) */
-        arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
-                                                 ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
+    /* 恢复真实 x17,x18 (覆盖 NZCV scratch) */
+    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
+                                             ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
 
-        /* Deallocate stack + tail-jump */
-        arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
-        arm64_writer_put_br_reg(&w, ARM64_REG_X16);
-    }
+    /* Deallocate stack + tail-jump */
+    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+    arm64_writer_put_br_reg(&w, ARM64_REG_X16);
 
     /* Flush any pending labels */
     arm64_writer_flush(&w);
@@ -568,6 +579,39 @@ int hook_remove(void* target) {
             /* Move to free list for reuse instead of discarding */
             free_entry(entry);
 
+            hook_unlock(&g_engine.lock);
+            return HOOK_OK;
+        }
+        prev = entry;
+        entry = entry->next;
+    }
+
+    hook_unlock(&g_engine.lock);
+    return HOOK_ERROR_NOT_FOUND;
+}
+
+int hook_discard(void* target) {
+    if (!g_engine.initialized) {
+        return HOOK_ERROR_NOT_INITIALIZED;
+    }
+
+    if (!target) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
+    hook_lock(&g_engine.lock);
+
+    HookEntry* prev = NULL;
+    HookEntry* entry = g_engine.hooks;
+    while (entry) {
+        if (entry->target == target) {
+            if (prev) {
+                prev->next = entry->next;
+            } else {
+                g_engine.hooks = entry->next;
+            }
+            free_entry(entry);
+            hook_log("hook_discard: forgot target=%p without restoring code", target);
             hook_unlock(&g_engine.lock);
             return HOOK_OK;
         }

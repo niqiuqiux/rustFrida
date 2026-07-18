@@ -141,6 +141,153 @@ unsafe fn write_primitive_return_to_context(
     (*ctx_ptr).x[0] = ret_raw;
 }
 
+struct NormalizedHookRefs {
+    env: JniEnv,
+    refs: Vec<*mut std::ffi::c_void>,
+    return_ref: std::cell::Cell<u64>,
+}
+
+impl NormalizedHookRefs {
+    fn preserve_return_ref(&self, raw: u64) {
+        if self.refs.iter().any(|local| *local as u64 == raw) {
+            self.return_ref.set(raw);
+        }
+    }
+}
+
+impl Drop for NormalizedHookRefs {
+    fn drop(&mut self) {
+        unsafe {
+            for local in self.refs.drain(..) {
+                // A local returned from the native replacement must remain live
+                // until ART consumes it. ART releases it with the JNI frame.
+                if local as u64 != self.return_ref.get() {
+                    raw_delete_local_ref(self.env, local);
+                }
+            }
+        }
+    }
+}
+
+unsafe fn decode_transition_frame_ref(reference: u64, stack_pointer: u64) -> Option<u64> {
+    const MAX_FRAME_DISTANCE: u64 = 256 * 1024;
+
+    if reference & 0x3 != 0
+        || reference.abs_diff(stack_pointer) > MAX_FRAME_DISTANCE
+        || !crate::jsapi::util::is_addr_accessible(reference, std::mem::size_of::<u32>())
+    {
+        return None;
+    }
+
+    // API 36 JNI transition refs point at a StackReference<Object>, whose
+    // only field is ART's 32-bit compressed mirror::Object pointer.
+    let mirror = std::ptr::read_volatile(reference as *const u32) as u64;
+    if mirror < 0x10000
+        || mirror & 0x7 != 0
+        || !crate::jsapi::util::is_addr_accessible(mirror, std::mem::size_of::<u32>())
+    {
+        return None;
+    }
+
+    Some(mirror)
+}
+
+unsafe fn normalize_hook_object_slot(
+    env: JniEnv,
+    stack_pointer: u64,
+    slot: *mut u64,
+    refs: &mut Vec<*mut std::ffi::c_void>,
+) {
+    let original = *slot;
+    if original == 0 {
+        return;
+    }
+
+    let Some(mirror) = super::art_class::decode_jobject(env, original as *mut std::ffi::c_void)
+        .or_else(|| decode_transition_frame_ref(original, stack_pointer))
+    else {
+        crate::jsapi::console::output_verbose(&format!(
+            "[java hook] unable to normalize object reference {:#x}",
+            original
+        ));
+        return;
+    };
+    let local = raw_mirror_to_local_ref(env, mirror);
+    if local.is_null() {
+        crate::jsapi::console::output_verbose(&format!(
+            "[java hook] unable to create local ref for mirror {:#x}",
+            mirror
+        ));
+        return;
+    }
+
+    *slot = local as u64;
+    refs.push(local);
+}
+
+/// Android 16 may pass object arguments as transition-frame references backed
+/// by the caller's quick stack frame. Our replacement trampoline adds a native
+/// frame, so CheckJNI no longer accepts those references as belonging to the
+/// current frame. Decode their live roots and create ordinary local refs before
+/// making any nested JNI/executor call.
+unsafe fn normalize_hook_transition_refs(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    env: JniEnv,
+    is_static: bool,
+    param_count: usize,
+    param_types: &[String],
+) -> NormalizedHookRefs {
+    let mut normalized = NormalizedHookRefs {
+        env,
+        refs: Vec::new(),
+        return_ref: std::cell::Cell::new(0),
+    };
+    if env.is_null() {
+        return normalized;
+    }
+
+    super::art_class::with_runnable_thread(env, || {
+        let hook_ctx = &mut *ctx_ptr;
+        let stack_pointer = hook_ctx.sp;
+        if !is_static {
+            normalize_hook_object_slot(
+                env,
+                stack_pointer,
+                &mut hook_ctx.x[1],
+                &mut normalized.refs,
+            );
+        }
+
+        let mut gp_index = 0usize;
+        let mut fp_index = 0usize;
+        let mut stack_index = 0usize;
+        for type_sig in param_types.iter().take(param_count) {
+            if is_floating_point_type(Some(type_sig.as_str())) {
+                if fp_index >= 8 {
+                    stack_index += 1;
+                }
+                fp_index += 1;
+                continue;
+            }
+
+            let slot = if gp_index < 6 {
+                &mut hook_ctx.x[2 + gp_index] as *mut u64
+            } else {
+                let slot = (hook_ctx.sp as usize + stack_index * 8) as *mut u64;
+                stack_index += 1;
+                slot
+            };
+            gp_index += 1;
+
+            if is_object_sig(Some(type_sig.as_str())) {
+                normalize_hook_object_slot(env, stack_pointer, slot, &mut normalized.refs);
+            }
+        }
+    });
+
+    normalized
+}
+
 // ============================================================================
 // Hook callback (runs in hooked thread, called by ART JNI trampoline)
 // ============================================================================
@@ -213,6 +360,13 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     }; // lock released
 
     let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
+    let _normalized_refs = normalize_hook_transition_refs(
+        ctx_ptr,
+        hook_ctx_env,
+        is_static,
+        param_count,
+        &param_types,
+    );
     let drained = drain_raw_clone_executor(hook_ctx_env);
     if drained != 0 {
         crate::jsapi::console::output_verbose(&format!("[java executor] drained {} raw-clone task(s)", drained));
@@ -393,6 +547,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         }
     }
 
+    if matches!(return_type, b'L' | b'[') {
+        _normalized_refs.preserve_return_ref((*ctx_ptr).x[0]);
+    }
 }
 
 /// Callback for @CriticalNative registered entries.

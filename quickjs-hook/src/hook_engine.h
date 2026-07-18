@@ -137,6 +137,10 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
  */
 int hook_remove(void* target);
 
+/* Forget a hook without restoring the target prologue. Use this when the
+ * target module is being unloaded and its mapping is no longer writable. */
+int hook_discard(void* target);
+
 /*
  * Get the trampoline for a hooked function
  *

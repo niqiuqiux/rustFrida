@@ -18,8 +18,6 @@
     var _releaseInstanceRefs = Java._releaseInstanceRefs;
     var _methodListCache = Object.create(null);
     var _classLoaderListCache = null;
-    var _directHookImpls = Object.create(null);
-    var _directHookBypass = Object.create(null);
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
@@ -80,37 +78,6 @@
         );
     }
 
-    function _methodKey(cls, name, sig) {
-        return cls + "." + name + sig;
-    }
-
-    function _withDirectHookBypass(key, fn) {
-        _directHookBypass[key] = (_directHookBypass[key] || 0) + 1;
-        try {
-            return fn();
-        } finally {
-            var n = (_directHookBypass[key] || 1) - 1;
-            if (n > 0) _directHookBypass[key] = n;
-            else delete _directHookBypass[key];
-        }
-    }
-
-    function _withDirectHookBypassMany(keys, fn) {
-        for (var i = 0; i < keys.length; i++) {
-            _directHookBypass[keys[i]] = (_directHookBypass[keys[i]] || 0) + 1;
-        }
-        try {
-            return fn();
-        } finally {
-            for (var j = 0; j < keys.length; j++) {
-                var key = keys[j];
-                var n = (_directHookBypass[key] || 1) - 1;
-                if (n > 0) _directHookBypass[key] = n;
-                else delete _directHookBypass[key];
-            }
-        }
-    }
-
     function _throwWithMessageStack(e) {
         if (e && e.stack && e.message) {
             var message = String(e);
@@ -122,52 +89,6 @@
             }
         }
         throw e;
-    }
-
-    function _maybeInvokeDirectInstanceHook(target, cls, name, sig, args, fallback) {
-        var key = _methodKey(cls, name, sig);
-        var fn = _directHookImpls[key];
-        if (!fn || _directHookBypass[key]) return fallback();
-
-        var orig = function() {
-            var origArgs = arguments.length ? _argsFrom(arguments) : args;
-            return _withDirectHookBypass(key, function() {
-                return _invokeJavaMethod(target, cls, name, sig, origArgs);
-            });
-        };
-        var thisObj = _wrapJavaObjOnTarget({
-            __jptr: target.__jptr,
-            __jclass: target.__jclass,
-            __jraw: target.__jraw === true,
-            __jglobal: target.__jglobal === true,
-            __$orig: orig
-        });
-        var ret = _withDirectHookBypass(key, function() {
-            return fn.apply(thisObj, args);
-        });
-        return _wrapJavaReturn(ret);
-    }
-
-    function _maybeInvokeDirectStaticHook(cls, name, sig, args, fallback) {
-        var key = _methodKey(cls, name, sig);
-        var fn = _directHookImpls[key];
-        if (!fn || _directHookBypass[key]) return fallback();
-
-        var orig = function() {
-            var origArgs = arguments.length ? _argsFrom(arguments) : args;
-            return _withDirectHookBypass(key, function() {
-                return _invokeJavaStaticMethod(cls, name, sig, origArgs);
-            });
-        };
-        var fnThis = {
-            $orig: orig,
-            $className: cls,
-            $static: true
-        };
-        var ret = _withDirectHookBypass(key, function() {
-            return fn.apply(fnThis, args);
-        });
-        return _wrapJavaReturn(ret);
     }
 
     function _getMethodList(jcls) {
@@ -593,21 +514,12 @@
             } else {
                 sig = _resolveInstanceMethodSig(target.__jclass, name, args);
             }
-            return _maybeInvokeDirectInstanceHook(
+            return _invokeJavaMethod(
                 target,
                 target.__jclass,
                 name,
                 sig,
-                args,
-                function() {
-                    return _invokeJavaMethod(
-                        target,
-                        target.__jclass,
-                        name,
-                        sig,
-                        args
-                    );
-                }
+                args
             );
         };
 
@@ -788,21 +700,12 @@
                 if (typeof prop !== "string") return undefined;
                 if (prop === "toString") return function() {
                     try {
-                        return _maybeInvokeDirectInstanceHook(
+                        return _invokeJavaMethod(
                             target,
                             target.__jclass,
                             "toString",
                             "()Ljava/lang/String;",
-                            [],
-                            function() {
-                                return _invokeJavaMethod(
-                                    target,
-                                    target.__jclass,
-                                    "toString",
-                                    "()Ljava/lang/String;",
-                                    []
-                                );
-                            }
+                            []
                         );
                     } catch(e) {
                         return "[JavaObject:" + target.__jclass + "]";
@@ -1057,14 +960,10 @@
             if (fn === null || fn === undefined) {
                 for (var i = 0; i < sigs.length; i++) {
                     _unhook(cls, name, sigs[i]);
-                    delete _directHookImpls[_methodKey(cls, name, sigs[i])];
                 }
                 this._fn = null;
             } else {
                 var userFn = fn;
-                var bypassKeys = sigs.map(function(sig) {
-                    return _methodKey(cls, name, sig);
-                });
                 // wrapCallback 的 ctx 是 Rust 侧注入的内部 hook-ctx 对象，
                 // 保留用于 origCallOriginal.apply(ctx, ...) 让 js_call_original 读到
                 // __hookCtxPtr / __hookArtMethod，用户层不再可见。
@@ -1113,14 +1012,11 @@
                             $static: true
                         };
                     }
-                    return _withDirectHookBypassMany(bypassKeys, function() {
-                        return userFn.apply(fnThis, wrappedArgs);
-                    });
+                    return userFn.apply(fnThis, wrappedArgs);
                     };
                 };
                 for (var i = 0; i < sigs.length; i++) {
                     _hook(cls, name, sigs[i], makeWrapCallback(sigs[i]));
-                    _directHookImpls[_methodKey(cls, name, sigs[i])] = userFn;
                 }
                 this._fn = fn;
             }
@@ -1355,19 +1251,11 @@
         }
 
         var name = wrapper._m === "$init" ? "<init>" : wrapper._m;
-        return _maybeInvokeDirectStaticHook(
+        return _invokeJavaStaticMethod(
             wrapper._c,
             name,
             sig,
-            args,
-            function() {
-                return _invokeJavaStaticMethod(
-                    wrapper._c,
-                    name,
-                    sig,
-                    args
-                );
-            }
+            args
         );
     }
 
@@ -1652,7 +1540,7 @@
         try {
             var Inst = Java.use("android.app.Instrumentation");
             Inst.newApplication.overload(_readyGateSig).impl = function(classLoader, className, context) {
-                var app = this.$orig(classLoader, className, context);
+                var app = this.$orig();
 
                 if (classLoader !== null && classLoader !== undefined) {
                     var clPtr = classLoader;
@@ -1678,7 +1566,7 @@
                     } catch (_) {}
                 }
                 _fireReadyCallbacks();
-                return this.$orig(app);
+                return this.$orig();
             };
             _gateInstalled = true;
         } catch(e) {

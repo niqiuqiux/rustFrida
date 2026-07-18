@@ -34,10 +34,17 @@ const JS_MAX_SAFE_INTEGER: u64 = 1u64 << 53;
 pub(crate) struct HotAtoms {
     // ─── native hook (replace + attach) ──────────────────────────
     pub x: [ffi::JSAtom; 31],
+    pub d: [ffi::JSAtom; 8],
     pub sp: ffi::JSAtom,
     pub pc: ffi::JSAtom,
+    pub fp: ffi::JSAtom,
     pub lr: ffi::JSAtom,
+    pub nzcv: ffi::JSAtom,
     pub return_address: ffi::JSAtom,
+    pub context: ffi::JSAtom,
+    pub errno: ffi::JSAtom,
+    pub thread_id: ffi::JSAtom,
+    pub depth: ffi::JSAtom,
     pub trampoline: ffi::JSAtom,
     pub hook_ctx_ptr: ffi::JSAtom,
     pub hook_trampoline: ffi::JSAtom,
@@ -48,16 +55,26 @@ pub(crate) struct HotAtoms {
     pub args: ffi::JSAtom,
     pub orig_jobject: ffi::JSAtom,
     pub jptr: ffi::JSAtom,
+    // ─── Stalker transform ────────────────────────────────────────
+    pub stalker_dispatch_transform: ffi::JSAtom,
+    pub stalker_dispatch_callout: ffi::JSAtom,
 }
 
 impl HotAtoms {
     const fn zeros() -> Self {
         Self {
             x: [0; 31],
+            d: [0; 8],
             sp: 0,
             pc: 0,
+            fp: 0,
             lr: 0,
+            nzcv: 0,
             return_address: 0,
+            context: 0,
+            errno: 0,
+            thread_id: 0,
+            depth: 0,
             trampoline: 0,
             hook_ctx_ptr: 0,
             hook_trampoline: 0,
@@ -67,6 +84,8 @@ impl HotAtoms {
             args: 0,
             orig_jobject: 0,
             jptr: 0,
+            stalker_dispatch_transform: 0,
+            stalker_dispatch_callout: 0,
         }
     }
 }
@@ -94,10 +113,19 @@ pub(crate) unsafe fn init_hot_atoms(ctx: *mut ffi::JSContext) {
     for i in 0..31 {
         atoms.x[i] = new_atom_cstr(ctx, &format!("x{}", i));
     }
+    for i in 0..8 {
+        atoms.d[i] = new_atom_cstr(ctx, &format!("d{}", i));
+    }
     atoms.sp = new_atom_cstr(ctx, "sp");
     atoms.pc = new_atom_cstr(ctx, "pc");
+    atoms.fp = new_atom_cstr(ctx, "fp");
     atoms.lr = new_atom_cstr(ctx, "lr");
+    atoms.nzcv = new_atom_cstr(ctx, "nzcv");
     atoms.return_address = new_atom_cstr(ctx, "returnAddress");
+    atoms.context = new_atom_cstr(ctx, "context");
+    atoms.errno = new_atom_cstr(ctx, "errno");
+    atoms.thread_id = new_atom_cstr(ctx, "threadId");
+    atoms.depth = new_atom_cstr(ctx, "depth");
     atoms.trampoline = new_atom_cstr(ctx, "trampoline");
     atoms.hook_ctx_ptr = new_atom_cstr(ctx, "__hookCtxPtr");
     atoms.hook_trampoline = new_atom_cstr(ctx, "__hookTrampoline");
@@ -107,6 +135,8 @@ pub(crate) unsafe fn init_hot_atoms(ctx: *mut ffi::JSContext) {
     atoms.args = new_atom_cstr(ctx, "args");
     atoms.orig_jobject = new_atom_cstr(ctx, "__origJobject");
     atoms.jptr = new_atom_cstr(ctx, "__jptr");
+    atoms.stalker_dispatch_transform = new_atom_cstr(ctx, "__rf_stalker_dispatch_transform");
+    atoms.stalker_dispatch_callout = new_atom_cstr(ctx, "__rf_stalker_dispatch_callout");
     HOT_ATOMS_READY.store(true, Ordering::Release);
 }
 
@@ -123,6 +153,12 @@ pub(crate) unsafe fn free_hot_atoms(ctx: *mut ffi::JSContext) {
             atoms.x[i] = 0;
         }
     }
+    for i in 0..8 {
+        if atoms.d[i] != 0 {
+            ffi::JS_FreeAtom(ctx, atoms.d[i]);
+            atoms.d[i] = 0;
+        }
+    }
     macro_rules! free_field {
         ($($f:ident),+ $(,)?) => {
             $(
@@ -136,8 +172,14 @@ pub(crate) unsafe fn free_hot_atoms(ctx: *mut ffi::JSContext) {
     free_field!(
         sp,
         pc,
+        fp,
         lr,
+        nzcv,
         return_address,
+        context,
+        errno,
+        thread_id,
+        depth,
         trampoline,
         hook_ctx_ptr,
         hook_trampoline,
@@ -147,6 +189,8 @@ pub(crate) unsafe fn free_hot_atoms(ctx: *mut ffi::JSContext) {
         args,
         orig_jobject,
         jptr,
+        stalker_dispatch_transform,
+        stalker_dispatch_callout,
     );
 }
 

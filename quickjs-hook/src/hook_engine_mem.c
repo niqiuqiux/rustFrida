@@ -191,21 +191,14 @@ HookEntry* alloc_entry(void) {
     HookEntry* entry = NULL;
 
     if (g_engine.free_list) {
-        /* Reuse from free list, preserving pool memory allocations */
+        /* Reuse HookEntry metadata only. Never recycle published executable
+         * blocks here: a detached attach thunk may still be waiting for the
+         * original function to return. Rewriting its thunk/trampoline would
+         * turn a valid in-flight return into use-after-reuse. Exec pools are
+         * bump-allocated and reclaimed only by the global safepoint cleanup. */
         entry = g_engine.free_list;
         g_engine.free_list = entry->next;
-
-        void* saved_trampoline = entry->trampoline;
-        size_t saved_trampoline_alloc = entry->trampoline_alloc;
-        void* saved_thunk = entry->thunk;
-        size_t saved_thunk_alloc = entry->thunk_alloc;
-
         memset(entry, 0, sizeof(HookEntry));
-
-        entry->trampoline = saved_trampoline;
-        entry->trampoline_alloc = saved_trampoline_alloc;
-        entry->thunk = saved_thunk;
-        entry->thunk_alloc = saved_thunk_alloc;
     } else {
         entry = (HookEntry*)hook_alloc(sizeof(HookEntry));
         if (entry) memset(entry, 0, sizeof(HookEntry));

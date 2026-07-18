@@ -125,7 +125,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         .flatten()
         .unwrap_or(hook_data);
 
-    // Step 7: 移除 native trampoline 并释放资源。
+    // Step 7: 移除 native trampoline，释放 JS/JNI 资源并退休 ART-visible methods。
     super::super::remove_native_trampoline(&hook_data);
     let env_opt = if crate::is_raw_clone_js_thread() {
         None

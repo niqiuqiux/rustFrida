@@ -40,8 +40,8 @@ const VDEX_MAGIC: &[u8; 4] = b"vdex";
 const ART_IMAGE_MAGIC: &[u8; 4] = b"art\n";
 const OAT_MAGIC: &[u8; 4] = b"oat\n";
 const ART_METHOD_DEX_METHOD_INDEX_CANDIDATE_OFFSETS: [usize; 3] = [8, 4, 12];
-const ART_METHOD_ARRAY_FIRST_ELEMENT_OFFSETS: [usize; 2] = [0, 8];
-const ART_METHOD_SIZE_CANDIDATES: [usize; 6] = [40, 32, 48, 24, 56, 64];
+const ART_METHOD_ARRAY_FIRST_ELEMENT_OFFSETS: [usize; 2] = [8, 0];
+const ART_METHOD_SIZE_CANDIDATES: [usize; 6] = [32, 40, 48, 24, 56, 64];
 const ART_FIELD_DEX_FIELD_INDEX_CANDIDATE_OFFSETS: [usize; 3] = [8, 16, 12];
 const K_ACC_STATIC: u32 = 0x0008;
 
@@ -2413,26 +2413,92 @@ fn resolve_from_methods_array(
     signature: &str,
     force_static: bool,
 ) -> Option<(u64, bool)> {
+    let mut layouts = Vec::with_capacity(
+        ART_METHOD_ARRAY_FIRST_ELEMENT_OFFSETS.len() * ART_METHOD_SIZE_CANDIDATES.len(),
+    );
     for first_method_offset in ART_METHOD_ARRAY_FIRST_ELEMENT_OFFSETS {
         for method_size in ART_METHOD_SIZE_CANDIDATES {
-            if let Some(resolved) = resolve_from_methods_array_with_layout(
+            let score = score_methods_array_layout(
                 methods_array,
                 methods_len,
                 first_method_offset,
                 method_size,
                 images,
                 class_descriptor,
-                class_name,
-                method_name,
-                signature,
-                force_static,
-            ) {
-                return Some(resolved);
-            }
+            );
+            layouts.push((score, first_method_offset, method_size));
+        }
+    }
+    layouts.sort_by(|left, right| right.0.cmp(&left.0));
+
+    if let Some((score, first_method_offset, method_size)) = layouts.first().copied() {
+        output_verbose(&format!(
+            "[dex resolver] selected ArtMethod layout: array={:#x}, first={}, size={}, class_matches={}",
+            methods_array, first_method_offset, method_size, score
+        ));
+    }
+
+    for (_score, first_method_offset, method_size) in layouts {
+        if let Some(resolved) = resolve_from_methods_array_with_layout(
+            methods_array,
+            methods_len,
+            first_method_offset,
+            method_size,
+            images,
+            class_descriptor,
+            class_name,
+            method_name,
+            signature,
+            force_static,
+        ) {
+            return Some(resolved);
         }
     }
 
     None
+}
+
+fn score_methods_array_layout(
+    methods_array: u64,
+    methods_len: u32,
+    first_method_offset: usize,
+    method_size: usize,
+    images: &[DexImage],
+    class_descriptor: &str,
+) -> usize {
+    let mut declared = HashMap::new();
+    for image in images {
+        if let Some(methods) = image.declared_method_indices_for_class(class_descriptor) {
+            for (dex_method_index, access_flags) in methods {
+                declared.entry(dex_method_index).or_insert(access_flags);
+            }
+        }
+    }
+    if declared.is_empty() {
+        return 0;
+    }
+
+    let mut matched = std::collections::HashSet::new();
+    for index in 0..methods_len as usize {
+        let art_method = methods_array + first_method_offset as u64 + (index * method_size) as u64;
+        if !super::safe_mem::is_readable(art_method, method_size) {
+            continue;
+        }
+
+        for dex_offset in ART_METHOD_DEX_METHOD_INDEX_CANDIDATE_OFFSETS {
+            if dex_offset + 4 > method_size {
+                continue;
+            }
+            let dex_method_index =
+                unsafe { super::safe_mem::safe_read_u32(art_method + dex_offset as u64) };
+            if declared.contains_key(&dex_method_index) {
+                matched.insert(dex_method_index);
+                break;
+            }
+        }
+    }
+
+    matched.len()
 }
 
 fn resolve_from_methods_array_with_layout(

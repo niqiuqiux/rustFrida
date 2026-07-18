@@ -1619,7 +1619,13 @@ pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     hook_ffi::hook_remove_redirect(data.art_method);
 }
 
-/// 释放 replacement/clone ArtMethod 堆内存 + JNI global ref + JS callback。
+/// 释放 JNI global ref + JS callback，并退休 ART 已见过的 ArtMethod 副本。
+///
+/// replacement/clone 可能被 JIT code cache、ProfileSaver 或 obsolete-method
+/// 元数据长期保存。即使 hook callback 已 drain，立即 free 仍会留下跨线程悬空
+/// ArtMethod；Android 16 的 ProfileSaver 会在稍后读取 declaring_class_ 并崩溃。
+/// 这些小块分配因此保留到进程退出，安装失败且尚未发布给 ART 的分配仍由
+/// JavaHookInstallGuard 正常释放。
 pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
         callback::HookType::NativeEntry => 0,
@@ -1628,11 +1634,11 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
         }
         callback::HookType::Managed { sentinel_addr, .. } => *sentinel_addr,
     };
-    if replacement_addr != 0 {
-        libc::free(replacement_addr as *mut std::ffi::c_void);
-    }
-    if data.clone_addr != 0 {
-        libc::free(data.clone_addr as *mut std::ffi::c_void);
+    if replacement_addr != 0 || data.clone_addr != 0 {
+        output_verbose(&format!(
+            "[java cleanup] retired ART-visible methods: replacement={:#x}, clone={:#x}",
+            replacement_addr, data.clone_addr
+        ));
     }
 
     if data.class_global_ref != 0 {
@@ -1759,10 +1765,11 @@ pub fn drain_thunk_in_flight() -> bool {
     }
 }
 
-/// Phase 3 - 释放 Java hook 资源（clone/replacement ArtMethod、JNI global ref、JS callback）。
+/// Phase 3 - 释放 Java hook 资源（JNI global ref、JS callback），并退休
+/// clone/replacement ArtMethod 到进程退出。
 ///
 /// 必须在 `drain_thunk_in_flight` 之后调用。此时无任何线程在 thunk 或其 callee 中，
-/// 释放 ArtMethod 堆内存 + JNI ref 安全。router 表最后清空。
+/// 可以释放 JS/JNI 资源；ART-visible methods 仍按上面的退休规则保留。router 表最后清空。
 pub fn free_java_hooks() {
     if !java_cleanup_needed() {
         return;

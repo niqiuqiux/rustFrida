@@ -8,6 +8,7 @@ use crate::jsapi::callback_util::{
     throw_internal_error,
 };
 use crate::jsapi::ptr::create_native_pointer;
+use crate::jsapi::stalker::with_stalker_native_call;
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 
@@ -16,7 +17,10 @@ use super::callback::{
     native_attach_on_leave_wrapper, NativeAttachCallbacks,
 };
 use super::cmodule::is_cmodule_code_address;
-use super::registry::{hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY};
+use super::registry::{
+    self, hook_error_message, init_registry, HookData, HookKind, InterceptorListenerData, StealthMode, HOOK_OK,
+    HOOK_REGISTRY,
+};
 use crate::jsapi::callback_util::with_registry_mut;
 
 unsafe fn finalize_recomp_hook_slot(
@@ -118,8 +122,10 @@ unsafe fn install_hook(
         super::remove_single_hook(addr, &old_data);
         // 短 wait 给当前在 thunk 内的 callback 退出；超时就放弃 free（old callback
         // 泄漏一次，callback_wrapper 自带 "not a function" 校验不会崩）。
-        if super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20)) {
-            super::free_hook_callback(&old_data);
+        if old_data.kind == HookKind::Interceptor
+            || super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20))
+        {
+            super::free_hook_callback(addr, &old_data);
         }
     }
 
@@ -214,7 +220,7 @@ pub(crate) unsafe extern "C" fn js_unhook(
 
     if let Some(data) = registry_data {
         super::remove_single_hook(addr, &data);
-        super::free_hook_callback(&data);
+        super::free_hook_callback(addr, &data);
         return JSValue::bool(true).raw();
     }
 
@@ -286,7 +292,11 @@ pub(crate) unsafe extern "C" fn js_call_native(
     }
 
     let func: unsafe extern "C" fn(u64, u64, u64, u64, u64, u64) -> i64 = std::mem::transmute(addr as usize);
-    let result = func(args[0], args[1], args[2], args[3], args[4], args[5]);
+    let result =
+        match with_stalker_native_call(ctx, addr, || func(args[0], args[1], args[2], args[3], args[4], args[5])) {
+            Ok(result) => result,
+            Err(error) => return throw_internal_error(ctx, &format!("callNative: {error}")),
+        };
 
     js_i64_to_js_number_or_bigint(ctx, result)
 }
@@ -338,8 +348,10 @@ pub(crate) unsafe extern "C" fn js_hook_native(
 
     if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&target)).flatten() {
         super::remove_single_hook(target, &old_data);
-        if super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20)) {
-            super::free_hook_callback(&old_data);
+        if old_data.kind == HookKind::Interceptor
+            || super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20))
+        {
+            super::free_hook_callback(target, &old_data);
         }
     }
 
@@ -514,8 +526,10 @@ pub(crate) unsafe extern "C" fn js_attach_native(
     init_registry();
     if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&target)).flatten() {
         super::remove_single_hook(target, &old_data);
-        if super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20)) {
-            super::free_hook_callback(&old_data);
+        if old_data.kind == HookKind::Interceptor
+            || super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20))
+        {
+            super::free_hook_callback(target, &old_data);
         }
     }
 
@@ -627,6 +641,13 @@ enum NativeRetKind {
     Int = 1,     // 整数类型 (bool/char/int/long/size_t/pointer)，从 x0 读
     Double = 2,  // double / float64，从 d0 读
     Float32 = 3, // float (32-bit)，从 s0 读（必须用独立的 extern -> f32 签名）
+}
+
+enum NativeCallResult {
+    Void,
+    Int(u64),
+    Double(f64),
+    Float32(f32),
 }
 
 impl NativeRetKind {
@@ -800,23 +821,38 @@ pub(crate) unsafe extern "C" fn js_native_call(
     let fn_ptr = addr as *const std::ffi::c_void;
     let stk_ptr = stk.as_ptr();
 
-    match kind {
+    let result = match with_stalker_native_call(ctx, addr, || match kind {
         NativeRetKind::Void => {
             native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            JSValue::undefined().raw()
+            NativeCallResult::Void
         }
         NativeRetKind::Int => {
-            let r = native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            js_i64_to_js_number_or_bigint(ctx, r as i64)
+            NativeCallResult::Int(native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len))
         }
-        NativeRetKind::Double => {
-            let r = native_call_shim_f64(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            ffi::qjs_new_float64(ctx, r)
-        }
-        NativeRetKind::Float32 => {
-            let r = native_call_shim_f32(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            ffi::qjs_new_float64(ctx, r as f64)
-        }
+        NativeRetKind::Double => NativeCallResult::Double(native_call_shim_f64(
+            fn_ptr,
+            gpr.as_ptr(),
+            fpr.as_ptr(),
+            stk_ptr,
+            stk_len,
+        )),
+        NativeRetKind::Float32 => NativeCallResult::Float32(native_call_shim_f32(
+            fn_ptr,
+            gpr.as_ptr(),
+            fpr.as_ptr(),
+            stk_ptr,
+            stk_len,
+        )),
+    }) {
+        Ok(result) => result,
+        Err(error) => return throw_internal_error(ctx, &format!("NativeFunction: {error}")),
+    };
+
+    match result {
+        NativeCallResult::Void => JSValue::undefined().raw(),
+        NativeCallResult::Int(value) => js_i64_to_js_number_or_bigint(ctx, value as i64),
+        NativeCallResult::Double(value) => ffi::qjs_new_float64(ctx, value),
+        NativeCallResult::Float32(value) => ffi::qjs_new_float64(ctx, value as f64),
     }
 }
 
@@ -861,6 +897,22 @@ fn hook_error_str(code: i32) -> String {
         .unwrap_or_else(|_| "hook engine error".to_string())
 }
 
+fn is_executable_hook_target(addr: u64) -> bool {
+    if addr < 0x10000 || !is_addr_accessible(addr, 4) {
+        return false;
+    }
+
+    crate::jsapi::util::query_page_protection(addr).is_some_and(|protection| protection & libc::PROT_EXEC != 0)
+}
+
+unsafe fn create_interceptor_listener_object(ctx: *mut ffi::JSContext, target: u64, listener_id: u64) -> ffi::JSValue {
+    let listener = ffi::JS_NewObject(ctx);
+    set_js_u64_property(ctx, listener, "__addr", target);
+    set_js_u64_property(ctx, listener, "__listenerId", listener_id);
+    set_js_cfunction_property(ctx, listener, "detach", js_listener_detach, 0);
+    listener
+}
+
 /// Interceptor.attach(target, callbacks, mode?)
 /// callbacks: `{ onEnter?(args) { ... }, onLeave?(retval) { ... } }`
 ///   - `this` 在 onEnter/onLeave 之间共享，用户可挂自定义字段跨阶段传状态
@@ -893,6 +945,17 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
         Err(e) => return e,
     };
 
+    if !is_executable_hook_target(addr) {
+        // Gum's module-removal notification is asynchronous. Retire an exact
+        // stale registry entry now so an immediate reload can reuse the same
+        // virtual address without colliding with the old hook-engine entry.
+        super::discard_native_hooks_in_range(addr, 1);
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.attach: target address is not executable\0".as_ptr() as *const _,
+        );
+    }
+
     if !callbacks_arg.is_object() {
         return ffi::JS_ThrowTypeError(
             ctx,
@@ -916,12 +979,37 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
 
     init_registry();
 
-    // 同地址重复 attach: 先拆老 hook + 等 in-flight + 释放老 callback
-    if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |r| r.remove(&addr)).flatten() {
-        super::remove_single_hook(addr, &old_data);
-        if super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20)) {
-            super::free_hook_callback(&old_data);
+    let existing = with_registry_mut(&HOOK_REGISTRY, |registry| registry.get(&addr).copied()).flatten();
+    if let Some(existing) = existing {
+        if existing.kind != HookKind::Interceptor {
+            on_enter_val.free(ctx);
+            on_leave_val.free(ctx);
+            return throw_internal_error(
+                ctx,
+                "Interceptor.attach: target is already owned by an incompatible hook",
+            );
         }
+
+        let listener_id = registry::add_interceptor_listener(InterceptorListenerData {
+            id: 0,
+            target: addr,
+            ctx: ctx as usize,
+            on_enter_bytes: if has_on_enter {
+                dup_callback_to_bytes(ctx, on_enter_val.raw())
+            } else {
+                [0; 16]
+            },
+            on_leave_bytes: if has_on_leave {
+                dup_callback_to_bytes(ctx, on_leave_val.raw())
+            } else {
+                [0; 16]
+            },
+            has_on_enter,
+            has_on_leave,
+        });
+        on_enter_val.free(ctx);
+        on_leave_val.free(ctx);
+        return create_interceptor_listener_object(ctx, addr, listener_id);
     }
 
     // Recomp 模式：先重编译页 + 分配 slot
@@ -944,48 +1032,66 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
         _ => (addr, 0),
     };
 
-    let on_enter_bytes = if has_on_enter {
-        dup_callback_to_bytes(ctx, on_enter_val.raw())
-    } else {
-        [0u8; 16]
-    };
-    let on_leave_bytes = if has_on_leave {
-        dup_callback_to_bytes(ctx, on_leave_val.raw())
-    } else {
-        [0u8; 16]
+    let listener_data = InterceptorListenerData {
+        id: 0,
+        target: addr,
+        ctx: ctx as usize,
+        on_enter_bytes: if has_on_enter {
+            dup_callback_to_bytes(ctx, on_enter_val.raw())
+        } else {
+            [0; 16]
+        },
+        on_leave_bytes: if has_on_leave {
+            dup_callback_to_bytes(ctx, on_leave_val.raw())
+        } else {
+            [0; 16]
+        },
+        has_on_enter,
+        has_on_leave,
     };
     on_enter_val.free(ctx);
     on_leave_val.free(ctx);
+
+    let listener_id = registry::add_interceptor_listener(listener_data);
+    let hook_data = HookData {
+        ctx: ctx as usize,
+        callback_bytes: [0; 16],
+        on_leave_bytes: [0; 16],
+        has_on_enter: false,
+        has_on_leave: false,
+        trampoline: 0,
+        kind: HookKind::Interceptor,
+        mode,
+        recomp_addr,
+        native_attach_data: 0,
+    };
+    with_registry_mut(&HOOK_REGISTRY, |registry| {
+        registry.insert(addr, hook_data);
+    });
 
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
         _ => 0,
     };
 
-    // 即使 user 只给了 onLeave，也要装 on_enter wrapper —— 它负责给 onLeave 准备 `this`。
-    let c_on_enter: hook_ffi::HookCallback = Some(attach_on_enter_wrapper);
-    let c_on_leave: hook_ffi::HookCallback = if has_on_leave {
-        Some(attach_on_leave_wrapper)
-    } else {
-        None
-    };
-
     let result = hook_ffi::hook_attach(
         hook_addr as *mut std::ffi::c_void,
-        c_on_enter,
-        c_on_leave,
+        Some(attach_on_enter_wrapper),
+        Some(attach_on_leave_wrapper),
         addr as *mut std::ffi::c_void,
         stealth_flag,
     );
 
     if result != HOOK_OK {
-        if has_on_enter {
-            let v: ffi::JSValue = std::ptr::read(on_enter_bytes.as_ptr() as *const ffi::JSValue);
-            ffi::qjs_free_value(ctx, v);
+        with_registry_mut(&HOOK_REGISTRY, |registry| {
+            registry.remove(&addr);
+        });
+        let (removed, _) = registry::remove_interceptor_listener(addr, listener_id);
+        if let Some(listener) = removed {
+            super::free_interceptor_listener_callback(&listener);
         }
-        if has_on_leave {
-            let v: ffi::JSValue = std::ptr::read(on_leave_bytes.as_ptr() as *const ffi::JSValue);
-            ffi::qjs_free_value(ctx, v);
+        if mode == StealthMode::Recomp {
+            let _ = crate::recomp::try_revert_slot_patch(addr as usize);
         }
         return throw_internal_error(ctx, &format!("hook_attach: {}", hook_error_str(result)));
     }
@@ -994,42 +1100,19 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
     if mode == StealthMode::Recomp {
         let trampoline = hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void);
         if let Err(e) = finalize_recomp_hook_slot(hook_addr, addr, trampoline) {
-            if has_on_enter {
-                let v: ffi::JSValue = std::ptr::read(on_enter_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, v);
+            with_registry_mut(&HOOK_REGISTRY, |registry| {
+                registry.remove(&addr);
+            });
+            let (removed, _) = registry::remove_interceptor_listener(addr, listener_id);
+            if let Some(listener) = removed {
+                super::free_interceptor_listener_callback(&listener);
             }
-            if has_on_leave {
-                let v: ffi::JSValue = std::ptr::read(on_leave_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, v);
-            }
-            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            super::remove_single_hook(addr, &hook_data);
             return throw_internal_error(ctx, &format!("hook_attach(recomp): {}", e));
         }
     }
 
-    with_registry_mut(&HOOK_REGISTRY, |registry| {
-        registry.insert(
-            addr,
-            HookData {
-                ctx: ctx as usize,
-                callback_bytes: on_enter_bytes,
-                on_leave_bytes,
-                has_on_enter,
-                has_on_leave,
-                trampoline: 0,
-                kind: HookKind::Attach,
-                mode,
-                recomp_addr,
-                native_attach_data: 0,
-            },
-        );
-    });
-
-    // 返回 listener { __addr, detach() }
-    let listener = ffi::JS_NewObject(ctx);
-    set_js_u64_property(ctx, listener, "__addr", addr);
-    set_js_cfunction_property(ctx, listener, "detach", js_listener_detach, 0);
-    listener
+    create_interceptor_listener_object(ctx, addr, listener_id)
 }
 
 /// Interceptor.replace(target, replacement, mode?) — 等价现有 hook()（replace 模式）
@@ -1052,17 +1135,66 @@ pub(crate) unsafe extern "C" fn js_interceptor_replace(
     } else {
         StealthMode::Normal
     };
-    install_hook(ctx, ptr_arg, replacement_arg, mode)
+    let result = install_hook(ctx, ptr_arg, replacement_arg, mode);
+    if ffi::qjs_is_exception(result) != 0 {
+        return result;
+    }
+    ffi::qjs_free_value(ctx, result);
+    JSValue::undefined().raw()
 }
 
-/// Interceptor.detachAll() — 拆除所有 hook（replace + attach 一起）
+/// Interceptor.revert(target) — 还原 replace 安装的替换；不存在时静默返回。
+pub(crate) unsafe extern "C" fn js_interceptor_revert(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"Interceptor.revert requires target\0".as_ptr() as *const _);
+    }
+    let target = match extract_pointer_address(ctx, JSValue(*argv), "Interceptor.revert") {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let data = with_registry_mut(&HOOK_REGISTRY, |registry| {
+        if registry.get(&target).is_some_and(|data| data.kind == HookKind::Replace) {
+            registry.remove(&target)
+        } else {
+            None
+        }
+    })
+    .flatten();
+    if let Some(data) = data {
+        super::remove_single_hook(target, &data);
+        super::free_hook_callback(target, &data);
+    }
+    JSValue::undefined().raw()
+}
+
+/// Interceptor.detachAll() — 仅拆除 attach listener；replace 由 revert 管理。
 pub(crate) unsafe extern "C" fn js_interceptor_detach_all(
     _ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    super::cleanup_hooks();
+    let hooks = with_registry_mut(&HOOK_REGISTRY, |registry| {
+        let targets = registry
+            .iter()
+            .filter_map(|(target, data)| (data.kind == HookKind::Interceptor).then_some(*target))
+            .collect::<Vec<_>>();
+        targets
+            .into_iter()
+            .filter_map(|target| registry.remove(&target).map(|data| (target, data)))
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    for (target, data) in hooks {
+        super::remove_single_hook(target, &data);
+    }
+    let listeners = registry::take_all_interceptor_listeners();
+    super::free_interceptor_listeners(&listeners);
     JSValue::undefined().raw()
 }
 
@@ -1084,15 +1216,32 @@ unsafe extern "C" fn js_listener_detach(
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let addr = get_js_u64_property(ctx, this_val, "__addr");
-    if addr == 0 {
-        return JSValue::bool(false).raw();
+    let listener_id = get_js_u64_property(ctx, this_val, "__listenerId");
+    if addr == 0 || listener_id == 0 {
+        return JSValue::undefined().raw();
     }
-    let data = with_registry_mut(&HOOK_REGISTRY, |r| r.remove(&addr)).flatten();
-    if let Some(data) = data {
-        super::remove_single_hook(addr, &data);
-        super::free_hook_callback(&data);
-        JSValue::bool(true).raw()
-    } else {
-        JSValue::bool(false).raw()
+
+    set_js_u64_property(ctx, this_val, "__listenerId", 0);
+    let (removed, target_is_empty) = registry::remove_interceptor_listener(addr, listener_id);
+    if target_is_empty {
+        let data = with_registry_mut(&HOOK_REGISTRY, |registry| {
+            if registry
+                .get(&addr)
+                .is_some_and(|data| data.kind == HookKind::Interceptor)
+            {
+                registry.remove(&addr)
+            } else {
+                None
+            }
+        })
+        .flatten();
+        if let Some(data) = data {
+            super::remove_single_hook(addr, &data);
+        }
     }
+    if let Some(listener) = removed {
+        super::free_interceptor_listener_callback(&listener);
+    }
+
+    JSValue::undefined().raw()
 }

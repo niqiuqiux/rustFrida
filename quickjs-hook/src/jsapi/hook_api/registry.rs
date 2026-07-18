@@ -2,6 +2,7 @@
 
 use crate::jsapi::callback_util::ensure_registry_initialized;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // Error codes from hook_engine.h
@@ -69,6 +70,8 @@ pub(crate) enum HookKind {
     Replace,
     /// hook_attach: Frida-style，thunk 自动 BLR 原函数；on_enter 观察/改参数，on_leave 观察/改返回值
     Attach,
+    /// Interceptor.attach: 一个地址级底层 hook，可承载多个独立 JS listener
+    Interceptor,
 }
 
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
@@ -94,7 +97,143 @@ unsafe impl Sync for HookData {}
 /// Global hook registry
 pub(crate) static HOOK_REGISTRY: Mutex<Option<HashMap<u64, HookData>>> = Mutex::new(None);
 
+/// Interceptor listener 是地址级底层 hook 之上的逻辑观察者。
+///
+/// JSValue 以原始字节保存，所有复制和释放都必须在持有 JS engine 锁时完成。
+#[derive(Clone, Copy)]
+pub(crate) struct InterceptorListenerData {
+    pub(crate) id: u64,
+    pub(crate) target: u64,
+    pub(crate) ctx: usize,
+    pub(crate) on_enter_bytes: [u8; 16],
+    pub(crate) on_leave_bytes: [u8; 16],
+    pub(crate) has_on_enter: bool,
+    pub(crate) has_on_leave: bool,
+}
+
+unsafe impl Send for InterceptorListenerData {}
+unsafe impl Sync for InterceptorListenerData {}
+
+/// 按 target 保持 attach 顺序，onEnter/onLeave 均按该顺序分发。
+static INTERCEPTOR_LISTENERS: Mutex<Option<HashMap<u64, Vec<InterceptorListenerData>>>> = Mutex::new(None);
+static NEXT_INTERCEPTOR_LISTENER_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Initialize hook registry
 pub(crate) fn init_registry() {
     ensure_registry_initialized(&HOOK_REGISTRY);
+    ensure_registry_initialized(&INTERCEPTOR_LISTENERS);
+}
+
+fn next_interceptor_listener_id() -> u64 {
+    loop {
+        let id = NEXT_INTERCEPTOR_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+pub(crate) fn add_interceptor_listener(mut listener: InterceptorListenerData) -> u64 {
+    init_registry();
+    listener.id = next_interceptor_listener_id();
+    let id = listener.id;
+    let mut guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_mut()
+        .expect("interceptor listener registry initialized")
+        .entry(listener.target)
+        .or_default()
+        .push(listener);
+    id
+}
+
+pub(crate) fn interceptor_listener_snapshot(target: u64) -> Vec<InterceptorListenerData> {
+    let guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|registry| registry.get(&target).cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn interceptor_listener_is_active(target: u64, listener_id: u64) -> bool {
+    let guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|registry| registry.get(&target))
+        .is_some_and(|listeners| listeners.iter().any(|listener| listener.id == listener_id))
+}
+
+/// 返回 `(被移除的 listener, 该 target 是否已没有 listener)`。
+pub(crate) fn remove_interceptor_listener(target: u64, listener_id: u64) -> (Option<InterceptorListenerData>, bool) {
+    let mut guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(registry) = guard.as_mut() else {
+        return (None, true);
+    };
+    let Some(listeners) = registry.get_mut(&target) else {
+        return (None, true);
+    };
+    let removed = listeners
+        .iter()
+        .position(|listener| listener.id == listener_id)
+        .map(|index| listeners.remove(index));
+    let target_is_empty = listeners.is_empty();
+    if target_is_empty {
+        registry.remove(&target);
+    }
+    (removed, target_is_empty)
+}
+
+pub(crate) fn take_interceptor_listeners(target: u64) -> Vec<InterceptorListenerData> {
+    let mut guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_mut()
+        .and_then(|registry| registry.remove(&target))
+        .unwrap_or_default()
+}
+
+pub(crate) fn take_all_interceptor_listeners() -> Vec<InterceptorListenerData> {
+    let mut guard = INTERCEPTOR_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .take()
+        .into_iter()
+        .flat_map(|registry| registry.into_values().flatten())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listener(target: u64) -> InterceptorListenerData {
+        InterceptorListenerData {
+            id: 0,
+            target,
+            ctx: 1,
+            on_enter_bytes: [0; 16],
+            on_leave_bytes: [0; 16],
+            has_on_enter: false,
+            has_on_leave: false,
+        }
+    }
+
+    #[test]
+    fn interceptor_listeners_keep_order_and_detach_independently() {
+        let target = 0xf000_0000_0000_0101;
+        let first = add_interceptor_listener(listener(target));
+        let second = add_interceptor_listener(listener(target));
+
+        let snapshot = interceptor_listener_snapshot(target);
+        assert_eq!(snapshot.iter().map(|item| item.id).collect::<Vec<_>>(), [first, second]);
+
+        let (removed, empty) = remove_interceptor_listener(target, first);
+        assert_eq!(removed.map(|item| item.id), Some(first));
+        assert!(!empty);
+        assert!(!interceptor_listener_is_active(target, first));
+        assert!(interceptor_listener_is_active(target, second));
+
+        let (removed, empty) = remove_interceptor_listener(target, second);
+        assert_eq!(removed.map(|item| item.id), Some(second));
+        assert!(empty);
+        assert!(interceptor_listener_snapshot(target).is_empty());
+    }
 }
