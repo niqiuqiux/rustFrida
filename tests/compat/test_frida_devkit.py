@@ -57,6 +57,15 @@ class FridaDevkitTests(unittest.TestCase):
         self.assertIn("FRIDA_GUM_DEVKIT_DIR", build_script)
         self.assertIn('"FRIDA_GUM_DEVKIT.json"', devkit_script)
 
+    def test_selected_devkits_use_the_modern_interceptor_abi(self):
+        build_script = (REPO_ROOT / "frida-gum-sys" / "build.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'if include_dir.is_some() {\n        println!("cargo:rustc-cfg=frida_gum_modern_interceptor")',
+            build_script,
+        )
+
     @unittest.skipUnless(FRIDA_SOURCE.exists(), "local Frida source checkout is unavailable")
     def test_local_source_matches_manifest_and_contains_required_fix(self):
         gum_source = FRIDA_SOURCE / "subprojects" / "frida-gum"

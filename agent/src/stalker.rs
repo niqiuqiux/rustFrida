@@ -323,7 +323,14 @@ fn install_module_unload_observer() -> Result<(), String> {
     }
     let gum = retain_gum()?;
     let observer = ModuleRegistryObserver::on_removed(&gum, |range| {
-        quickjs_hook::discard_native_hooks_in_range(range.base_address().0 as u64, range.size());
+        let base = range.base_address().0 as u64;
+        let size = range.size();
+        log_msg(format!("[stalker] module removed base=0x{base:x} size=0x{size:x}\n"));
+        let retired_hfollow_target = retire_hfollow_in_range(base, size);
+        if let Err(error) = retire_stalker_state_in_range(base, size, retired_hfollow_target) {
+            log_msg(format!("[stalker] failed to retire module tracing state: {error}\n"));
+        }
+        quickjs_hook::discard_native_hooks_in_range(base, size);
     })
     .ok_or_else(|| "failed to observe Gum module removals".to_string())?;
     *slot = Some(observer);
@@ -924,6 +931,39 @@ fn restore_current_execution_state(runtime: &mut StalkerRuntime, was_active: boo
     }
 }
 
+fn address_is_in_range(address: u64, base: u64, size: usize) -> bool {
+    address.wrapping_sub(base) < size as u64
+}
+
+fn retire_stalker_state_in_range(base: u64, size: usize, retired_hfollow_target: Option<u64>) -> Result<usize, String> {
+    let mut slot = lock_runtime()?;
+    let Some(runtime) = slot.runtime.as_mut() else {
+        return Ok(0);
+    };
+    let anchors = runtime
+        .call_probe_anchors
+        .iter()
+        .filter_map(|(&address, &gum_id)| address_is_in_range(address, base, size).then_some((address, gum_id)))
+        .collect::<Vec<_>>();
+    if anchors.is_empty() && retired_hfollow_target.is_none() {
+        return Ok(0);
+    }
+
+    let current_execution_was_active = current_execution_is_active(runtime);
+    for (address, gum_id) in &anchors {
+        runtime.call_probe_anchors.remove(address);
+        runtime.stalker.remove_call_probe(*gum_id);
+    }
+    if let Some(address) = retired_hfollow_target {
+        let address = NativePointer(address as *mut c_void);
+        for thread_id in runtime.active.keys().copied().collect::<Vec<_>>() {
+            runtime.stalker.invalidate_for_thread(thread_id as usize, address);
+        }
+    }
+    restore_current_execution_state(runtime, current_execution_was_active);
+    Ok(anchors.len())
+}
+
 unsafe extern "C" fn call_probe_anchor_callback(_details: *mut c_void, _data: *mut c_void) {}
 
 fn ensure_call_probe_anchor(runtime: &mut StalkerRuntime, target_address: u64) {
@@ -1213,17 +1253,43 @@ fn shutdown_hfollow() -> bool {
     let state = HFOLLOW_RUNTIME.get_or_init(|| Mutex::new(None));
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(mut runtime) = state.take() {
-        runtime.interceptor.revert(NativePointer(runtime.target as *mut c_void));
+        if crate::linker::is_address_mapped(runtime.target) {
+            runtime.interceptor.revert(NativePointer(runtime.target as *mut c_void));
+        } else {
+            let range = MemoryRange::new(NativePointer(runtime.target as *mut c_void), 1);
+            frida_gum::discard_interceptor_hooks_in_range(&range);
+        }
     }
     HFOLLOW_ORIGINAL.store(0, Ordering::Release);
     true
+}
+
+fn retire_hfollow_in_range(base: u64, size: usize) -> Option<u64> {
+    let state = HFOLLOW_RUNTIME.get_or_init(|| Mutex::new(None));
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let target = state.as_ref().map(|runtime| runtime.target)?;
+    if !address_is_in_range(target as u64, base, size) {
+        return None;
+    }
+
+    // Gum discards the native interceptor context before emitting
+    // module-removed. Do not call revert: it resolves and decodes the target
+    // before looking up the context, which would read unmapped code.
+    drop(state.take().expect("hfollow runtime disappeared under lock"));
+    HFOLLOW_ORIGINAL.store(0, Ordering::Release);
+    Some(target as u64)
 }
 
 pub fn hfollow(_module: &str, addr: usize) {
     let state = HFOLLOW_RUNTIME.get_or_init(|| Mutex::new(None));
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(mut old) = state.take() {
-        old.interceptor.revert(NativePointer(old.target as *mut c_void));
+        if crate::linker::is_address_mapped(old.target) {
+            old.interceptor.revert(NativePointer(old.target as *mut c_void));
+        } else {
+            let range = MemoryRange::new(NativePointer(old.target as *mut c_void), 1);
+            frida_gum::discard_interceptor_hooks_in_range(&range);
+        }
     }
 
     let gum = match retain_gum() {
@@ -1254,6 +1320,16 @@ pub fn hfollow(_module: &str, addr: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_range_membership_handles_bounds_and_overflow() {
+        assert!(address_is_in_range(0x1000, 0x1000, 0x100));
+        assert!(address_is_in_range(0x10ff, 0x1000, 0x100));
+        assert!(!address_is_in_range(0x1100, 0x1000, 0x100));
+        assert!(!address_is_in_range(0x0fff, 0x1000, 0x100));
+        assert!(address_is_in_range(u64::MAX, u64::MAX - 1, 2));
+        assert!(!address_is_in_range(0, u64::MAX - 1, 2));
+    }
 
     fn follow_config(thread_id: u64, queue_drain_interval: u32) -> StalkerFollowConfig {
         StalkerFollowConfig {

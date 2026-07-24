@@ -463,7 +463,7 @@ impl Stalker {
 
     /// Enable (experimental) unwind hooking
     pub fn enable_unwind_hooking(&mut self) {
-        unsafe { gum_sys::gum_stalker_activate_experimental_unwind_support() }
+        unsafe { gum_sys::gum_rs_stalker_activate_experimental_unwind_support() }
     }
 
     #[cfg(feature = "stalker-observer")]

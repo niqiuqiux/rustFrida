@@ -33,9 +33,9 @@ use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
-use injection::{inject_via_bootstrapper, InjectionResult};
 #[cfg(feature = "watch-so")]
 use injection::watch_and_inject;
+use injection::{inject_via_bootstrapper, InjectionResult};
 use nix::sys::ptrace;
 use nix::unistd::Pid;
 use process::{attach_to_process, call_target_function, find_pid_by_name};

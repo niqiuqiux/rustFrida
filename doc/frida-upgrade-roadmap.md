@@ -1,8 +1,8 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 已完成，Goal 01 devkit 阶段已完成）
+> 状态：执行中（Goal 00 和 Goal 01 已完成）
 >
-> 更新日期：2026-07-19
+> 更新日期：2026-07-24
 >
 > 目标平台：Android ARM64
 >
@@ -169,7 +169,15 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 
 ### Goal 01：受控同步 Gum tag 后修复（P0）
 
-状态：**执行中（可复现 devkit 已落地，设备卸载/重载回归待完成）**。
+状态：**已完成（2026-07-24）**。
+
+落地证据：
+
+- 本地 devkit 固定 Gum `867975dc` 和必需修复 `8f514005`；构建时校验 manifest/artifact，并以唯一名称 `libfrida-gum-pinned.a` 链接，避免旧缓存 archive 污染。
+- Gum Interceptor、自研 native hook 和 Stalker probe anchor 均覆盖模块卸载、换址重载和再次安装；未映射 target 的 hfollow 清理不再解码已卸载代码。
+- `tests/device/run_goal01_module_unload.py --mode hfollow` 在 PLC110 实机完成两轮 hfollow 卸载/重载回归。
+- `tests/device/run_goal01_module_unload.py --mode full` 在同一设备完成 `%reload` 前后各两轮完整回归，最后一枚 probe 与 call/ret sink 均继续产出事件。
+- 两种设备回归最终 shutdown 均正常，目标进程存活且无新增 tombstone；兼容测试 10 项、API 快照、devkit `--check`、rustfmt 和 diff 检查均通过。
 
 当前 devkit 证据：
 

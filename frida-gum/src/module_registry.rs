@@ -25,6 +25,22 @@ pub struct ModuleRegistryObserver {
 
 unsafe impl Send for ModuleRegistryObserver {}
 
+/// Configure Android linker call-site offsets before the module registry is
+/// first obtained. Bionic builds without a usable `r_debug.r_brk` notifier
+/// need these offsets for load/unload synchronization.
+pub fn set_rtld_notifier_offsets(offsets: &[u32]) {
+    unsafe {
+        gum_sys::gum_module_registry_set_rtld_notifier_offsets(offsets.as_ptr(), offsets.len() as u32);
+    }
+}
+
+/// Discard interceptor contexts in `range` without restoring code bytes.
+pub fn discard_interceptor_hooks_in_range(range: &MemoryRange) {
+    unsafe {
+        gum_sys::gum_rs_interceptor_discard_hooks_in_range(&range.memory_range);
+    }
+}
+
 impl ModuleRegistryObserver {
     /// Observe modules immediately before Gum reports that their mappings have
     /// been removed from the process module registry.

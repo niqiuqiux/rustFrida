@@ -10,11 +10,12 @@ use ring::digest::{Context, SHA256};
 use serde::Deserialize;
 use std::env;
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const LOCAL_DEVKIT_ENV: &str = "FRIDA_GUM_DEVKIT_DIR";
+const INTERCEPTOR_DISCARD_FIX: &str = "8f51400554b0d16a4a383a901b01040687fd7f80";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,7 +90,7 @@ fn validate_artifact(devkit_dir: &Path, artifact: &DevkitArtifact) {
     );
 }
 
-fn use_local_devkit(devkit_dir: PathBuf, target_os: &str, target_arch: &str, use_gum_js: bool) -> PathBuf {
+fn use_local_devkit(devkit_dir: PathBuf, target_os: &str, target_arch: &str, use_gum_js: bool) -> (PathBuf, bool) {
     assert!(!use_gum_js, "{LOCAL_DEVKIT_ENV} currently provides a Gum-only devkit");
 
     let manifest: DevkitManifest =
@@ -119,21 +120,32 @@ fn use_local_devkit(devkit_dir: PathBuf, target_os: &str, target_arch: &str, use
     validate_artifact(&devkit_dir, &manifest.artifacts.header);
     validate_artifact(&devkit_dir, &manifest.artifacts.archive);
 
-    println!("cargo:rustc-link-search=native={}", devkit_dir.display());
-    println!("cargo:rustc-link-lib=static=frida-gum");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
+    let pinned_archive = out_dir.join("libfrida-gum-pinned.a");
+    fs::copy(devkit_dir.join(&manifest.artifacts.archive.path), &pinned_archive).unwrap_or_else(|error| {
+        panic!(
+            "failed to stage pinned Gum archive {}: {error}",
+            pinned_archive.display()
+        )
+    });
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!(
         "cargo:warning=Using pinned local Gum devkit at {} (Gum revision {})",
         devkit_dir.display(),
         manifest.gum_revision
     );
 
-    devkit_dir
+    let has_interceptor_discard_fix = manifest.required_fixes.iter().any(|fix| fix == INTERCEPTOR_DISCARD_FIX);
+
+    (devkit_dir, has_interceptor_discard_fix)
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=FRIDA_GUM_DEVKIT.json");
     println!("cargo:rerun-if-env-changed={LOCAL_DEVKIT_ENV}");
+    println!("cargo:rustc-check-cfg=cfg(frida_gum_modern_interceptor)");
+    println!("cargo:rustc-check-cfg=cfg(frida_gum_interceptor_discard)");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
@@ -160,6 +172,7 @@ fn main() {
     {
         println!("cargo:rerun-if-changed=invocation_listener.c");
         println!("cargo:rerun-if-changed=invocation_listener.h");
+        println!("cargo:rerun-if-changed=interceptor_discard.c");
         println!("cargo:rerun-if-changed=probe_listener.c");
         println!("cargo:rerun-if-changed=probe_listener.h");
     }
@@ -178,28 +191,34 @@ fn main() {
 
     println!("cargo:rustc-link-search={}", env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    let include_dir = if let Some(devkit_dir) = env::var_os(LOCAL_DEVKIT_ENV) {
-        Some(use_local_devkit(
-            PathBuf::from(devkit_dir),
-            &target_os,
-            &target_arch,
-            use_gum_js,
-        ))
+    let (include_dir, has_interceptor_discard_fix) = if let Some(devkit_dir) = env::var_os(LOCAL_DEVKIT_ENV) {
+        let (include_dir, has_interceptor_discard_fix) =
+            use_local_devkit(PathBuf::from(devkit_dir), &target_os, &target_arch, use_gum_js);
+        (Some(include_dir), has_interceptor_discard_fix)
     } else {
         #[cfg(feature = "auto-download")]
         {
             use frida_build::download_and_use_devkit;
             let kind = if cfg!(feature = "js") { "gumjs" } else { "gum" };
-            Some(PathBuf::from(download_and_use_devkit(
-                kind,
-                include_str!("FRIDA_VERSION").trim(),
-            )))
+            (
+                Some(PathBuf::from(download_and_use_devkit(
+                    kind,
+                    include_str!("FRIDA_VERSION").trim(),
+                ))),
+                false,
+            )
         }
         #[cfg(not(feature = "auto-download"))]
         {
-            None
+            (None, false)
         }
     };
+    if include_dir.is_some() {
+        println!("cargo:rustc-cfg=frida_gum_modern_interceptor");
+    }
+    if has_interceptor_discard_fix {
+        println!("cargo:rustc-cfg=frida_gum_interceptor_discard");
+    }
 
     #[cfg(not(feature = "auto-download"))]
     if include_dir.is_none() {
@@ -223,17 +242,17 @@ fn main() {
     } else if docs {
         bindings.clang_arg("-Iinclude")
     } else {
-        bindings
+        bindings.clang_arg("-I.")
     };
 
     let bindings = if use_gum_js {
         bindings
             .clang_arg("-DUSE_GUM_JS=1")
-            .header_contents("gum.h", "#include \"frida-gumjs.h\"")
+            .header_contents("gum.h", "#include <frida-gumjs.h>")
     } else {
         bindings
             .clang_arg("-DUSE_GUM_JS=0")
-            .header_contents("gum.h", "#include \"frida-gum.h\"")
+            .header_contents("gum.h", "#include <frida-gum.h>")
     };
 
     let bindings = bindings
@@ -263,8 +282,9 @@ fn main() {
             builder.include(include_dir);
         } else if docs {
             builder.include("include");
+        } else {
+            builder.include(".");
         }
-
         builder
             .file("event_sink.c")
             .opt_level(3)
@@ -280,10 +300,12 @@ fn main() {
             builder.include(include_dir);
         } else if docs {
             builder.include("include");
+        } else {
+            builder.include(".");
         }
-
         builder
             .file("invocation_listener.c")
+            .file("interceptor_discard.c")
             .opt_level(3)
             .define("USE_GUM_JS", use_gum_js_env)
             .compile("invocation_listener");
@@ -294,6 +316,8 @@ fn main() {
             builder.include(include_dir);
         } else if docs {
             builder.include("include");
+        } else {
+            builder.include(".");
         }
         builder
             .file("probe_listener.c")
@@ -310,6 +334,8 @@ fn main() {
             builder.include(include_dir);
         } else if docs {
             builder.include("include");
+        } else {
+            builder.include(".");
         }
 
         builder
@@ -327,6 +353,8 @@ fn main() {
             builder.include(include_dir);
         } else if docs {
             builder.include("include");
+        } else {
+            builder.include(".");
         }
 
         builder
@@ -334,6 +362,12 @@ fn main() {
             .opt_level(3)
             .define("USE_GUM_JS", use_gum_js_env)
             .compile("stalker_params");
+    }
+
+    // Keep the Gum archive after the C compatibility libraries. The fixed
+    // devkit also has a direct Rust FFI reference to its private discard helper.
+    if env::var_os(LOCAL_DEVKIT_ENV).is_some() {
+        println!("cargo:rustc-link-lib=static=frida-gum-pinned");
     }
 
     if target_os == "windows" {

@@ -7,9 +7,9 @@
 #pragma once
 
 #if USE_GUM_JS == 1
-# include "frida-gumjs.h"
+# include <frida-gumjs.h>
 #else
-# include "frida-gum.h"
+# include <frida-gum.h>
 #endif
 
 G_BEGIN_DECLS

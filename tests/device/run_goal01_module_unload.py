@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+
+import argparse
+import queue
+import re
+import shlex
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = REPO_ROOT / "tests" / "device" / "fixtures"
+SCRIPT = REPO_ROOT / "tests" / "device" / "rfhook_goal01_module_unload.js"
+AB_HFOLLOW_SCRIPT = REPO_ROOT / "tests" / "device" / "rfhook_goal01_ab_hfollow.js"
+DEVICE_ROOT = "/data/local/tmp"
+
+
+class Session:
+    def __init__(self, command):
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.lines = queue.Queue()
+        self.output = []
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        for line in self.process.stdout:
+            print(line, end="")
+            self.output.append(line)
+            self.lines.put(line)
+
+    def send(self, command):
+        if self.process.poll() is not None:
+            raise RuntimeError(f"rustfrida exited before command: {command}")
+        self.process.stdin.write(command + "\n")
+        self.process.stdin.flush()
+
+    def wait_for(self, pattern, timeout=30):
+        matcher = re.compile(pattern)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None and self.lines.empty():
+                raise RuntimeError(f"rustfrida exited while waiting for {pattern}")
+            try:
+                line = self.lines.get(timeout=min(0.25, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
+                continue
+            if "[JS error]" in line:
+                raise RuntimeError(line.strip())
+            match = matcher.search(line)
+            if match is not None:
+                return match
+        raise TimeoutError(f"timed out waiting for {pattern}")
+
+    def finish(self, timeout=30):
+        return self.process.wait(timeout=timeout)
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.send("exit")
+                self.process.wait(timeout=10)
+            except (BrokenPipeError, RuntimeError, subprocess.TimeoutExpired):
+                self.process.kill()
+
+
+def run(command, check=True, **kwargs):
+    return subprocess.run(command, check=check, text=True, **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run Goal 01 module unload device regression")
+    parser.add_argument("--device", help="adb serial")
+    parser.add_argument(
+        "--ndk",
+        type=Path,
+        default=Path("/home/qiu/Android/Sdk/ndk/29.0.14206865"),
+    )
+    parser.add_argument(
+        "--rustfrida",
+        type=Path,
+        default=REPO_ROOT / "target" / "aarch64-linux-android" / "release" / "rustfrida",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("full", "hfollow"),
+        default="full",
+        help="regression variant; hfollow isolates Gum replacement from the full lifecycle test",
+    )
+    args = parser.parse_args()
+
+    adb = ["adb"] + (["-s", args.device] if args.device else [])
+
+    def adb_run(*command, **kwargs):
+        return run([*adb, *command], **kwargs)
+
+    def root_shell(command, capture=False, check=True):
+        return adb_run(
+            "shell",
+            f"su -c {shlex.quote(command)}",
+            capture_output=capture,
+            check=check,
+        )
+
+    toolchain = args.ndk / "toolchains" / "llvm" / "prebuilt" / "linux-x86_64" / "bin"
+    clang = toolchain / "aarch64-linux-android21-clang"
+    if not clang.is_file():
+        raise RuntimeError(f"missing Android compiler: {clang}")
+    if not args.rustfrida.is_file():
+        raise RuntimeError(f"missing rustfrida binary: {args.rustfrida}")
+
+    script = SCRIPT if args.mode == "full" else AB_HFOLLOW_SCRIPT
+
+    with tempfile.TemporaryDirectory(prefix="rf-goal01-") as temporary:
+        temporary = Path(temporary)
+        target_so = temporary / "librf_goal01_unload.so"
+        control_so = temporary / "librf_goal01_control.so"
+        host = temporary / "rf_g01_host"
+        run(
+            [
+                str(clang),
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-Wl,--build-id=none",
+                "-Wl,-soname,librf_goal01_unload.so",
+                str(FIXTURES / "module_unload_target.c"),
+                "-o",
+                str(target_so),
+            ]
+        )
+        run(
+            [
+                str(clang),
+                "-shared",
+                "-fPIC",
+                "-O2",
+                "-Wl,--build-id=none",
+                "-Wl,-soname,librf_goal01_control.so",
+                str(FIXTURES / "module_unload_control.c"),
+                "-ldl",
+                "-o",
+                str(control_so),
+            ]
+        )
+        run(
+            [
+                str(clang),
+                "-fPIE",
+                "-pie",
+                "-O2",
+                "-Wl,--build-id=none",
+                str(FIXTURES / "module_unload_host.c"),
+                "-ldl",
+                "-o",
+                str(host),
+            ]
+        )
+
+        device_rustfrida = f"{DEVICE_ROOT}/rustfrida-goal01"
+        device_script = f"{DEVICE_ROOT}/{script.name}"
+        adb_run("push", str(target_so), f"{DEVICE_ROOT}/{target_so.name}")
+        adb_run("push", str(control_so), f"{DEVICE_ROOT}/{control_so.name}")
+        adb_run("push", str(host), f"{DEVICE_ROOT}/{host.name}")
+        adb_run("push", str(script), device_script)
+        adb_run("push", str(args.rustfrida), device_rustfrida)
+        root_shell(
+            f"chmod 755 {device_rustfrida} {DEVICE_ROOT}/{host.name}; "
+            f"chmod 644 {DEVICE_ROOT}/{target_so.name} {DEVICE_ROOT}/{control_so.name} {device_script}"
+        )
+
+    root_shell("kill $(pidof rf_g01_host) 2>/dev/null || true")
+    tombstones_before = root_shell(
+        "for f in /data/tombstones/*; do [ -f \"$f\" ] && stat -c '%n:%Y:%s' \"$f\"; done; true",
+        capture=True,
+    ).stdout.splitlines()
+    start = root_shell(
+        f"sh -c 'nohup {DEVICE_ROOT}/rf_g01_host >{DEVICE_ROOT}/rf_g01_host.log 2>&1 & echo $!'",
+        capture=True,
+    )
+    host_pid = int(start.stdout.strip().splitlines()[-1])
+    session = None
+
+    failure = None
+    try:
+        rustfrida_command = f"{device_rustfrida} --pid {host_pid} -l {device_script}"
+        command = [
+            *adb,
+            "shell",
+            "-tt",
+            f"su -c {shlex.quote(rustfrida_command)}",
+        ]
+        session = Session(command)
+
+        if args.mode == "hfollow":
+            for cycle in (1, 2):
+                target = session.wait_for(
+                    rf"\[goal01-ab\]\[TARGET\] cycle={cycle} (0x[0-9a-f]+)",
+                    timeout=45,
+                )
+                session.send(f"hfl librf_goal01_unload.so {target.group(1)}")
+                session.wait_for(r"Frida Interceptor replacement installed at")
+                session.send("jseval goal01Ab.verify()")
+                session.wait_for(rf"\[goal01-ab\]\[PASS\] hfollow cycle {cycle}=1007")
+                session.send("jseval goal01Ab.close()")
+                session.wait_for(rf"\[goal01-ab\]\[CLOSED\] cycle={cycle}")
+                if cycle == 1:
+                    session.send("jseval goal01Ab.open()")
+            session.send("exit")
+        else:
+            for reload_round in range(2):
+                first = session.wait_for(r"\[goal01\]\[GUM_TARGET\] (0x[0-9a-f]+)", timeout=45)
+                session.send(f"hfl librf_goal01_unload.so {first.group(1)}")
+                session.wait_for(r"Frida Interceptor replacement installed at")
+                session.send("jseval goal01.verifyGumHook()")
+                session.wait_for(r"\[goal01\]\[GUM_VERIFIED\] cycle=1")
+                session.send("jseval goal01.unloadCycle()")
+                session.wait_for(r"\[goal01\]\[UNLOADED\] cycle=1")
+                session.send("jseval goal01.reloadCycle()")
+                second = session.wait_for(r"\[goal01\]\[GUM_TARGET\] (0x[0-9a-f]+)")
+                session.send(f"hfl librf_goal01_unload.so {second.group(1)}")
+                session.wait_for(r"Frida Interceptor replacement installed at")
+                session.send("jseval goal01.verifyGumHook()")
+                session.wait_for(r"\[goal01\]\[GUM_VERIFIED\] cycle=2")
+                session.send("jseval goal01.finish()")
+                session.wait_for(r"\[goal01\]\[READY\] unload/reload/re-hook complete")
+                if reload_round == 0:
+                    session.send("%reload")
+            session.send("exit")
+        if session.finish(timeout=30) != 0:
+            raise RuntimeError("rustfrida exited with a non-zero status")
+
+        output = "".join(session.output)
+        fatal_markers = ("Fatal signal", "SIGSEGV", "SIGABRT", "cleanup timeout")
+        for marker in fatal_markers:
+            if marker in output:
+                raise RuntimeError(f"fatal marker in output: {marker}")
+    except BaseException as error:
+        failure = error
+    finally:
+        if session is not None:
+            session.close()
+        host_survived = root_shell(f"kill -0 {host_pid}", check=False).returncode == 0
+        tombstones_after = root_shell(
+            "for f in /data/tombstones/*; do [ -f \"$f\" ] && stat -c '%n:%Y:%s' \"$f\"; done; true",
+            capture=True,
+        ).stdout.splitlines()
+        new_tombstones = sorted(set(tombstones_after) - set(tombstones_before))
+        root_shell(f"kill {host_pid} 2>/dev/null || true")
+
+    if new_tombstones:
+        raise RuntimeError("new tombstone(s): " + ", ".join(new_tombstones)) from failure
+    if not host_survived:
+        raise RuntimeError(f"target pid {host_pid} did not survive") from failure
+    if failure is not None:
+        raise failure
+    print(f"[goal01-runner][PASS] target pid {host_pid} survived; no new tombstone")
+
+
+if __name__ == "__main__":
+    main()

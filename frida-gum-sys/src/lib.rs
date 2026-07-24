@@ -16,6 +16,92 @@ mod bindings {
 
 pub use bindings::*;
 
+#[inline]
+pub unsafe fn gum_rs_interceptor_attach(
+    interceptor: *mut GumInterceptor,
+    function: gpointer,
+    listener: *mut GumInvocationListener,
+) -> GumAttachReturn {
+    #[cfg(frida_gum_modern_interceptor)]
+    {
+        gum_interceptor_attach(interceptor, function, listener, core::ptr::null())
+    }
+    #[cfg(not(frida_gum_modern_interceptor))]
+    {
+        gum_interceptor_attach(interceptor, function, listener, core::ptr::null_mut(), 0)
+    }
+}
+
+/// Drop Gum interceptor contexts in a range without restoring unmapped code.
+/// Fixed local devkits link the helper directly; older release devkits use a
+/// weak C bridge that safely becomes a no-op.
+#[inline]
+pub unsafe fn gum_rs_interceptor_discard_hooks_in_range(range: *const GumMemoryRange) {
+    #[cfg(all(feature = "invocation-listener", frida_gum_interceptor_discard))]
+    _gum_interceptor_forget_all_hooks_in_range(range);
+    #[cfg(all(feature = "invocation-listener", not(frida_gum_interceptor_discard)))]
+    gum_rs_interceptor_discard_hooks_in_range_c(range);
+}
+
+#[cfg(all(feature = "invocation-listener", frida_gum_interceptor_discard))]
+extern "C" {
+    fn _gum_interceptor_forget_all_hooks_in_range(range: *const GumMemoryRange);
+}
+
+#[cfg(all(feature = "invocation-listener", not(frida_gum_interceptor_discard)))]
+extern "C" {
+    fn gum_rs_interceptor_discard_hooks_in_range_c(range: *const GumMemoryRange);
+}
+
+#[inline]
+pub unsafe fn gum_rs_interceptor_replace(
+    interceptor: *mut GumInterceptor,
+    function: gpointer,
+    replacement: gpointer,
+    replacement_data: gpointer,
+    original: *mut gpointer,
+) -> GumReplaceReturn {
+    #[cfg(frida_gum_modern_interceptor)]
+    {
+        let mut options: GumReplaceOptions = core::mem::zeroed();
+        options.replacement_data = replacement_data;
+        gum_interceptor_replace(interceptor, function, replacement, original, &options)
+    }
+    #[cfg(not(frida_gum_modern_interceptor))]
+    {
+        gum_interceptor_replace(interceptor, function, replacement, replacement_data, original)
+    }
+}
+
+#[inline]
+pub unsafe fn gum_rs_interceptor_replace_fast(
+    interceptor: *mut GumInterceptor,
+    function: gpointer,
+    replacement: gpointer,
+    original: *mut gpointer,
+) -> GumReplaceReturn {
+    #[cfg(frida_gum_modern_interceptor)]
+    {
+        gum_interceptor_replace_fast(interceptor, function, replacement, original, core::ptr::null())
+    }
+    #[cfg(not(frida_gum_modern_interceptor))]
+    {
+        gum_interceptor_replace_fast(interceptor, function, replacement, original)
+    }
+}
+
+#[inline]
+pub unsafe fn gum_rs_stalker_activate_experimental_unwind_support() {
+    #[cfg(frida_gum_modern_interceptor)]
+    {
+        // Gum's unwind broker makes generated-code translation always-on.
+    }
+    #[cfg(not(frida_gum_modern_interceptor))]
+    {
+        gum_stalker_activate_experimental_unwind_support();
+    }
+}
+
 #[cfg(not(any(target_os = "windows", target_vendor = "apple",)))]
 pub use {_frida_g_object_ref as g_object_ref, _frida_g_object_unref as g_object_unref};
 

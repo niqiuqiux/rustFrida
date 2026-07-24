@@ -130,6 +130,11 @@ pub(crate) fn is_addr_in_memfd(addr: usize) -> bool {
     }
 }
 
+pub(crate) fn is_address_mapped(addr: usize) -> bool {
+    let maps = parse_maps();
+    find_map_for_addr(addr, &maps).is_some()
+}
+
 pub(crate) fn memfd_ranges(limit: usize) -> Vec<(usize, usize)> {
     parse_maps()
         .into_iter()

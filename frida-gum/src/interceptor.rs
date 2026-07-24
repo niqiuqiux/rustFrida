@@ -62,7 +62,7 @@ impl Interceptor {
     #[cfg_attr(docsrs, doc(cfg(feature = "invocation-listener")))]
     pub fn attach<I: InvocationListener>(&mut self, f: NativePointer, listener: &mut I) -> Result<Listener> {
         let listener = invocation_listener_transform(listener);
-        match unsafe { gum_sys::gum_interceptor_attach(self.interceptor, f.0, listener, ptr::null_mut(), 0) } {
+        match unsafe { gum_sys::gum_rs_interceptor_attach(self.interceptor, f.0, listener) } {
             gum_sys::GumAttachReturn_GUM_ATTACH_OK => Ok(Listener(NativePointer(listener as *mut c_void))),
             gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
             gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => Err(Error::InterceptorAlreadyAttached),
@@ -81,7 +81,7 @@ impl Interceptor {
     #[cfg_attr(docsrs, doc(cfg(feature = "invocation-listener")))]
     pub fn attach_instruction<I: ProbeListener>(&mut self, instr: NativePointer, listener: &mut I) -> Result<Listener> {
         let listener = probe_listener_transform(listener);
-        match unsafe { gum_sys::gum_interceptor_attach(self.interceptor, instr.0, listener, ptr::null_mut(), 0) } {
+        match unsafe { gum_sys::gum_rs_interceptor_attach(self.interceptor, instr.0, listener) } {
             gum_sys::GumAttachReturn_GUM_ATTACH_OK => Ok(Listener(NativePointer(listener as *mut c_void))),
             gum_sys::GumAttachReturn_GUM_ATTACH_WRONG_SIGNATURE => Err(Error::InterceptorBadSignature),
             gum_sys::GumAttachReturn_GUM_ATTACH_ALREADY_ATTACHED => Err(Error::InterceptorAlreadyAttached),
@@ -118,7 +118,7 @@ impl Interceptor {
     ) -> Result<NativePointer> {
         let mut original_function = NativePointer(ptr::null_mut());
         unsafe {
-            match gum_sys::gum_interceptor_replace(
+            match gum_sys::gum_rs_interceptor_replace(
                 self.interceptor,
                 function.0,
                 replacement.0,
@@ -149,7 +149,7 @@ impl Interceptor {
     pub fn replace_fast(&mut self, function: NativePointer, replacement: NativePointer) -> Result<NativePointer> {
         let mut original_function = NativePointer(ptr::null_mut());
         unsafe {
-            match gum_sys::gum_interceptor_replace_fast(
+            match gum_sys::gum_rs_interceptor_replace_fast(
                 self.interceptor,
                 function.0,
                 replacement.0,
