@@ -54,7 +54,12 @@ class Session:
                 line = self.lines.get(timeout=min(0.25, max(0.01, deadline - time.monotonic())))
             except queue.Empty:
                 continue
-            if "[JS error]" in line or "[module observer" in line or "[thread observer" in line:
+            if (
+                "[JS error]" in line
+                or "[goal03][STALE-CALLBACK]" in line
+                or "[module observer" in line
+                or "[thread observer" in line
+            ):
                 raise RuntimeError(line.strip())
             match = matcher.search(line)
             if match is not None:
@@ -187,6 +192,8 @@ def main():
         output = "".join(session.output)
         if output.count("[goal03][READY]") != 2:
             raise RuntimeError("Goal 03 did not complete exactly once per runtime")
+        if "[goal03][STALE-CALLBACK]" in output:
+            raise RuntimeError("an observer callback from the previous runtime was invoked")
         for marker in ("Fatal signal", "SIGSEGV", "SIGABRT", "cleanup timeout", "process observer shutdown failed"):
             if marker in output:
                 raise RuntimeError(f"fatal marker in output: {marker}")

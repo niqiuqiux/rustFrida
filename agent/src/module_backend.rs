@@ -63,6 +63,12 @@ fn enumerate_modules() -> Vec<ModuleDetails> {
     modules
 }
 
+fn find_global_export_by_name(symbol: &str) -> Result<Option<u64>, String> {
+    let symbol = c_string(symbol, "symbol name")?;
+    let address = unsafe { gum_sys::gum_module_find_global_export_by_name(symbol.as_ptr()) };
+    Ok((address != 0).then_some(address))
+}
+
 struct OwnedModule(*mut gum_sys::GumModule);
 
 impl Drop for OwnedModule {
@@ -625,6 +631,7 @@ fn detach_thread_observer() -> Result<(), String> {
 pub fn install_quickjs_backend() {
     quickjs_hook::install_module_backend(ModuleBackend {
         enumerate_modules,
+        find_global_export_by_name,
         ensure_initialized,
         enumerate_sections,
         enumerate_dependencies,

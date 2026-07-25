@@ -76,6 +76,33 @@ Object.defineProperties(globalThis, {
         }.items():
             self.assertEqual(probes_by_path[path]["type"], expected_type)
 
+    def test_goal03_module_process_surface_is_pinned(self):
+        spec = frida_surface.load_json(frida_surface.SPEC_PATH)
+        globals_by_name = {entry["name"]: entry for entry in spec["globals"]}
+        probes_by_path = {entry["path"]: entry for entry in spec["probes"]}
+        areas_by_name = {entry["area"]: entry for entry in spec["compatibilityAreas"]}
+
+        self.assertEqual(globals_by_name["Module"]["type"], "function")
+        self.assertEqual(globals_by_name["Module"]["classification"], "compatible")
+        for path in {
+            "Process.getModuleByAddress",
+            "Process.attachModuleObserver",
+            "Process.attachThreadObserver",
+            "Module.findGlobalExportByName",
+            "Module.prototype.enumerateSections",
+            "Module.prototype.enumerateDependencies",
+            "Module.prototype.ensureInitialized",
+            "Module.prototype.findSymbolByName",
+            "ModuleMap",
+            "ModuleMap.prototype.update",
+        }:
+            self.assertEqual(probes_by_path[path]["type"], "function")
+
+        self.assertEqual(
+            areas_by_name["Module and Process"]["missing"],
+            ["runOnThread", "exception handler"],
+        )
+
     @unittest.skipUnless(FRIDA_SOURCE.exists(), "local Frida source checkout is unavailable")
     def test_extracts_arm64_generated_writer_surface(self):
         baseline = frida_surface.build_baseline(FRIDA_SOURCE)

@@ -121,7 +121,7 @@ assertEqual("same B observer added once", moduleEvents.filter(function (event) {
     return event.indexOf("add:" + sameB.path + ":") === 0;
 }).length, 1);
 assertEqual("memfd observer added once", moduleEvents.filter(function (event) {
-    return event.indexOf("add:" + memfd.path + ":") === 0;
+    return event === "add:" + memfd.path + ":" + memfd.base;
 }).length, 1);
 
 var threadInitial = 0;
@@ -170,6 +170,31 @@ assertEqual("fixture reopen after detach", controlOpen(), 0);
 assertEqual("fixture reclose after detach", controlClose(), 0);
 assertEqual("module observer detached", moduleEvents.length, eventsBeforeDetach);
 assertEqual("module observer detach idempotent", moduleObserver.detach(), undefined);
+
+Process.attachModuleObserver({
+    onAdded(module) {
+        if (module.path === "/data/local/tmp/librf_goal03_module.so")
+            console.log("[goal03][STALE-CALLBACK] module added");
+    },
+    onRemoved(module) {
+        if (module.path === "/data/local/tmp/librf_goal03_module.so")
+            console.log("[goal03][STALE-CALLBACK] module removed");
+    }
+});
+Process.attachThreadObserver({
+    onAdded(thread) {
+        if (thread.name === "goal03-control")
+            console.log("[goal03][STALE-CALLBACK] thread added");
+    },
+    onRemoved(thread) {
+        if (thread.name === "goal03-control" || thread.name === "rf-g03-renamed")
+            console.log("[goal03][STALE-CALLBACK] thread removed");
+    },
+    onRenamed(thread) {
+        if (thread.name === "rf-g03-renamed")
+            console.log("[goal03][STALE-CALLBACK] thread renamed");
+    }
+});
 
 console.log("[goal03][READY] module/process verified events=" + moduleEvents.length + " threads=" + threadInitial +
     " added=" + threadAdded + " renamed=" + threadRenamed + " removed=" + threadRemoved);

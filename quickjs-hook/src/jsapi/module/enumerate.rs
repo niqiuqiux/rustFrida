@@ -114,7 +114,11 @@ fn section_name_from_data(data: &[u8], strings: &std::ops::Range<usize>, offset:
 
 unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDependencyDetails> {
     const MAX_DYNAMIC_ENTRIES: usize = 4096;
-    if !is_addr_accessible(base_address, std::mem::size_of::<Elf64Ehdr>()) {
+    if !crate::jsapi::util::range_has_protection(
+        base_address,
+        std::mem::size_of::<Elf64Ehdr>(),
+        libc::PROT_READ,
+    ) {
         return Vec::new();
     }
     let ehdr = &*(base_address as *const Elf64Ehdr);
@@ -122,7 +126,6 @@ unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDepe
         return Vec::new();
     }
 
-    let load_bias = elf_compute_load_bias(base_address);
     let phnum = ehdr.e_phnum as usize;
     let phentsize = ehdr.e_phentsize as usize;
     if phnum == 0 || phnum > MAX_ELF_PHDRS || phentsize < std::mem::size_of::<Elf64Phdr>() {
@@ -134,26 +137,37 @@ unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDepe
     let Some(phdr_bytes) = phnum.checked_mul(phentsize) else {
         return Vec::new();
     };
-    if !is_addr_accessible(phdr_base, phdr_bytes) {
+    if !crate::jsapi::util::range_has_protection(phdr_base, phdr_bytes, libc::PROT_READ) {
         return Vec::new();
     }
 
-    let mut dynamic_address = 0u64;
+    let mut load_vaddr = None;
+    let mut dynamic_vaddr = None;
     let mut dynamic_size = 0usize;
     for index in 0..phnum {
         let Some(address) = checked_indexed_addr(phdr_base, index, phentsize) else {
             return Vec::new();
         };
         let phdr = &*(address as *const Elf64Phdr);
+        if phdr.p_type == PT_LOAD && load_vaddr.is_none() {
+            load_vaddr = Some(phdr.p_vaddr);
+        }
         if phdr.p_type == PT_DYNAMIC {
             let Some(size) = usize::try_from(phdr._p_memsz).ok() else {
                 return Vec::new();
             };
-            dynamic_address = load_bias.wrapping_add(phdr.p_vaddr);
+            dynamic_vaddr = Some(phdr.p_vaddr);
             dynamic_size = size;
-            break;
         }
     }
+    let Some(load_vaddr) = load_vaddr else {
+        return Vec::new();
+    };
+    let Some(dynamic_vaddr) = dynamic_vaddr else {
+        return Vec::new();
+    };
+    let load_bias = base_address.wrapping_sub(load_vaddr);
+    let dynamic_address = load_bias.wrapping_add(dynamic_vaddr);
     if dynamic_address == 0 || dynamic_size < std::mem::size_of::<Elf64Dyn>() {
         return Vec::new();
     }
@@ -161,7 +175,7 @@ unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDepe
     let Some(dynamic_bytes) = count.checked_mul(std::mem::size_of::<Elf64Dyn>()) else {
         return Vec::new();
     };
-    if !is_addr_accessible(dynamic_address, dynamic_bytes) {
+    if !crate::jsapi::util::range_has_protection(dynamic_address, dynamic_bytes, libc::PROT_READ) {
         return Vec::new();
     }
 
@@ -181,12 +195,23 @@ unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDepe
     if string_table == 0
         || string_table_size == 0
         || string_table_size > MAX_MEMORY_STRTAB_BYTES
-        || !is_addr_accessible(string_table, string_table_size)
+        || !crate::jsapi::util::range_has_protection(string_table, string_table_size, libc::PROT_READ)
     {
         return Vec::new();
     }
 
     let strings = std::slice::from_raw_parts(string_table as *const u8, string_table_size);
+    dependencies_from_dynamic_tables(entries, strings)
+}
+
+fn dependencies_from_dynamic_tables(
+    entries: &[Elf64Dyn],
+    strings: &[u8],
+) -> Vec<ModuleDependencyDetails> {
+    let needed = entries
+        .iter()
+        .take_while(|entry| entry.d_tag != DT_NULL)
+        .filter_map(|entry| (entry.d_tag == DT_NEEDED).then_some(entry.d_val as usize));
     let mut result = Vec::new();
     let mut seen = HashSet::new();
     for offset in needed {

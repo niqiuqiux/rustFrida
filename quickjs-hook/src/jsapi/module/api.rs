@@ -114,7 +114,13 @@ unsafe extern "C" fn js_module_find_export(
     };
 
     let addr: *mut std::ffi::c_void = if arg0.is_null() || arg0.is_undefined() {
-        find_export_in_loaded_modules(&symbol_name)
+        match module_backend() {
+            Some(backend) => (backend.find_global_export_by_name)(&symbol_name)
+                .ok()
+                .flatten()
+                .map_or(std::ptr::null_mut(), |address| address as *mut std::ffi::c_void),
+            None => find_export_in_loaded_modules(&symbol_name),
+        }
     } else {
         // Specific module
         let module_name = match arg0.to_string(ctx) {
@@ -361,7 +367,9 @@ unsafe extern "C" fn js_module_enumerate_dependencies_instance(
     if !module_identity_is_current(&identity) {
         return crate::jsapi::callback_util::throw_internal_error(ctx, "module is no longer loaded");
     }
-    let dependencies = module_backend()
+    let dependencies = module_has_readable_file_image(&identity.path)
+        .then(module_backend)
+        .flatten()
         .and_then(|backend| (backend.enumerate_dependencies)(&identity).ok())
         .filter(|dependencies| !dependencies.is_empty())
         .unwrap_or_else(|| elf_module_enumerate_dependencies(identity.base));
@@ -374,6 +382,12 @@ unsafe extern "C" fn js_module_enumerate_dependencies_instance(
         ffi::JS_SetPropertyUint32(ctx, result, index as u32, item);
     }
     result
+}
+
+fn module_has_readable_file_image(path: &str) -> bool {
+    !is_memfd_path(path)
+        && !path.ends_with(" (deleted)")
+        && std::fs::File::open(normalized_module_path(path)).is_ok()
 }
 
 unsafe extern "C" fn js_module_find_symbol_instance(

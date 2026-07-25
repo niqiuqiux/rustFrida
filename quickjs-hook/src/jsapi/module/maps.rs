@@ -797,4 +797,53 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
 
         assert_eq!(merge_backend_and_mapped_modules(backend, mapped.clone()), mapped);
     }
+
+    #[test]
+    fn maps_only_modules_skip_file_backed_dependency_backend() {
+        assert!(!module_has_readable_file_image("/memfd:fixture (deleted)"));
+        assert!(!module_has_readable_file_image("/tmp/libfixture.so (deleted)"));
+        assert!(!module_has_readable_file_image("/path/that/does/not/exist/libfixture.so"));
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_dependencies_preserve_order_and_remove_duplicates() {
+        let entries = [
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 1 },
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 11 },
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 1 },
+            Elf64Dyn { d_tag: DT_NULL, d_val: 0 },
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 21 },
+        ];
+        let strings = b"\0libfirst.so\0libsecond.so\0ignored.so\0";
+
+        assert_eq!(
+            dependencies_from_dynamic_tables(&entries, strings),
+            vec![
+                ModuleDependencyDetails {
+                    name: "libfirst.so".to_string(),
+                    kind: "regular".to_string(),
+                },
+                ModuleDependencyDetails {
+                    name: "libsecond.so".to_string(),
+                    kind: "regular".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dynamic_dependencies_ignore_invalid_names() {
+        let entries = [
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 99 },
+            Elf64Dyn { d_tag: DT_NEEDED, d_val: 1 },
+            Elf64Dyn { d_tag: DT_NULL, d_val: 0 },
+        ];
+
+        assert!(dependencies_from_dynamic_tables(&entries, b"\0unterminated").is_empty());
+    }
 }

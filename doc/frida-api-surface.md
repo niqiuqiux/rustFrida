@@ -30,7 +30,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `Memory` | `object` | partial |
 | `File` | `function` | partial |
 | `Process` | `object` | partial |
-| `Module` | `object` | legacy |
+| `Module` | `function` | compatible |
 | `DebugSymbol` | `function` | compatible |
 | `Thread` | `object` | partial |
 | `Backtracer` | `object` | compatible |
@@ -59,7 +59,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Core runtime | partial | Goal 07 | `Frida`, `Script`, `send`, `recv`, `timers`, `Worker`, `hexdump` |
 | Native ABI | partial | Goal 04 | `NativeCallback`, `SystemFunction`, `variadic`, `struct-by-value`, `options` |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
-| Module and Process | partial | Goal 03 | `Module instances`, `ModuleMap`, `observers`, `runOnThread`, `exception handler` |
+| Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
 | Memory | partial | Goal 06 | `patchCode`, `async scan`, `findPointers`, `MemoryAccessMonitor`, `alloc options` |
 | Stalker | partial | Goal 05 | `Arm64Writer`, `Arm64Relocator`, `drop statistics` |
 | Java facade | partial | Goal 08 | `perform`, `performNow`, `ClassFactory`, `retain`, `cast`, `array` |

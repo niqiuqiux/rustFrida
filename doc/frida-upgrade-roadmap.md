@@ -72,9 +72,9 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | Native 调用 | ARM64 `NativeFunction`，标量/指针/浮点和栈参数 | 另有 ABI/options、struct、variadic、`SystemFunction` | 部分 | P1 |
 | Native callback | CModule 函数指针可用于高频 callback | 通用 `NativeCallback` | 缺失 | P0/P1 |
 | Memory | 同步读写、分配、protect、copy/dup、scanSync、queryProtection、stealth patch | 另有 alloc options、patchCode、异步 scan、findPointers、MemoryAccessMonitor | 部分 | P1 |
-| Module | 旧式静态 `Module.findExportByName(module, name)` 和 ELF 枚举 | `Module` 实例、ModuleMap、sections/dependencies、ensureInitialized、version | 部分 | P1 |
-| Process | 基本属性、模块/范围/线程枚举和目录查询 | 另有 observer、findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
-| Thread/符号诊断 | Stalker 内有 instruction snapshot | `Thread`、Backtracer、DebugSymbol、ApiResolver、Instruction、CFG | 缺失 | P0/P1 |
+| Module | 实例 API、ModuleMap、sections/dependencies/ensureInitialized/findSymbol；保留旧式静态入口 | 最新实例 API；旧式静态入口已由上游移除 | 已有/扩展 | P1 |
+| Process | 基本属性、模块/范围/线程枚举和目录查询、module/thread observer | 另有 findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
+| Thread/符号诊断 | `Thread.backtrace()`、Backtracer、DebugSymbol、ApiResolver(module)、Instruction | 另有非 module resolver、硬件断点/观察点、CFG | 部分 | P0/P1 |
 | Interceptor | 自研 engine 的 attach/replace/revert/detachAll；`flush` 是兼容 no-op；支持 stealth | Gum Interceptor defaults/options、replaceFast、事务 flush、完整 invocation context | 部分/扩展 | P1 |
 | Stalker | follow/unfollow、事件、parse、transform 遍历、callout、probe、native sink、reload cleanup | transform iterator 同时暴露架构 writer，和 Instruction/Writer/Relocator 深度集成 | 部分 | P0/P1 |
 | CModule | TinyCC、symbol 注入、导出指针、metadata 回收 | 官方 CModule builtins、dispose 和完整 ownership 语义 | 部分/扩展 | P2 |
@@ -89,6 +89,8 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 - NativePointer 的基础算术、比较、格式化和常用内存读写。
 - Memory 的同步访问、UTF-8/UTF-16、保护查询、同步 pattern scan。
 - ARM64 NativeFunction 的常见标量调用。
+- Module 实例/ModuleMap、全局导出查询以及 module/thread observer 生命周期。
+- Int64/UInt64、DebugSymbol、Thread.backtrace、Backtracer、Instruction 和 module ApiResolver。
 - Interceptor 双阶段回调、CModule native callback 和自研 stealth 模式。
 - Android Java hook 的常用 `use/overload/implementation/choose` 路径，以及项目特有的 managed DSL。
 - Stalker 的事件队列、JS/native callback、call probe、callout、reload/shutdown 生命周期。
@@ -96,11 +98,9 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
 1. 缺少 `NativeCallback`，导致大量标准 `Interceptor.replace()`、C API callback 和 Stalker callback 脚本必须改写成 CModule。
-2. 缺少 `DebugSymbol`、`Thread.backtrace()`、`Backtracer`、`ApiResolver` 和全局 `Instruction.parse()`，诊断脚本迁移成本高。
-3. `Module` 仍是旧式静态 facade，不是最新版 GumJS 的实例模型；官方脚本常用的 `Process.getModuleByName(...).enumerateExports()` 无法直接复用。
-4. Stalker transform 只能遍历、keep、callout 和 chaining return，不能调用 ARM64 writer 发射或替换指令。
-5. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
-6. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
+2. Stalker transform 只能遍历、keep、callout 和 chaining return，不能调用 ARM64 writer 发射或替换指令。
+3. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
+4. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
 
 ## 5. 架构与稳定性风险
 
@@ -242,6 +242,18 @@ cargo build --offline --release --target aarch64-linux-android
 - 输出结构与上游同名 API 的关键字段一致。
 
 ### Goal 03：升级 Module/Process 对象模型（P1）
+
+状态：**已完成（2026-07-26）**。
+
+落地证据：
+
+- `Process.get/findModuleByName/Address()` 和 `Process.mainModule` 均返回最新版实例式 `Module`；旧式静态枚举/查询入口继续保留，实例与静态导出查询结果一致。
+- Module 实例已提供 ranges/imports/exports/symbols、sections、dependencies、`ensureInitialized()` 和 `find/getSymbolByName()`；`Module.find/getGlobalExportByName()` 使用 Gum 的 unrestricted `RTLD_DEFAULT` 语义，加载顺序与 reload 不改变结果。
+- `ModuleMap` 提供过滤快照、地址/名称/路径查询和显式 `update()`；卸载模块会从实时 Process 查询移除，同时旧 ModuleMap 快照保持不变直到更新。
+- module/thread observer 支持初始快照、added/removed/renamed、幂等 detach 和 reload 清理；Gum 信号缺失时由实时 modules/threads 快照 reconcile，并以 `{path, base}` 或 thread id 去重。
+- `tests/device/run_goal03_module_process.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成两轮 `%reload`，覆盖普通 SO load/unload、同 SONAME 不同完整路径、memfd、隐藏 soinfo 和线程创建/改名/退出；目标进程存活且没有新增 tombstone。
+- maps-only/memfd 的 dependencies 使用带可读 VMA 边界校验的内存 `PT_DYNAMIC` / `DT_NEEDED` 解析，避免 Gum 在线 ELF 解析越过不可读映射；兼容 surface、交叉构建、rustfmt 和 diff 检查均通过。
+- `runOnThread` 与 exception handler 按本 Goal 的既定范围继续保留为显式缺口，后续需独立 feature gate 和重入/生命周期验收。
 
 目标：支持最新版实例式 Module API，同时保留旧式静态 API。
 

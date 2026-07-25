@@ -42,9 +42,6 @@
         "area": "Module and Process",
         "goal": "03",
         "missing": [
-          "Module instances",
-          "ModuleMap",
-          "observers",
           "runOnThread",
           "exception handler"
         ],
@@ -169,9 +166,9 @@
         "type": "object"
       },
       {
-        "classification": "legacy",
+        "classification": "compatible",
         "name": "Module",
-        "type": "object"
+        "type": "function"
       },
       {
         "classification": "compatible",
@@ -355,7 +352,23 @@
         "type": "function"
       },
       {
+        "path": "Process.getModuleByAddress",
+        "type": "function"
+      },
+      {
+        "path": "Process.attachModuleObserver",
+        "type": "function"
+      },
+      {
+        "path": "Process.attachThreadObserver",
+        "type": "function"
+      },
+      {
         "path": "Module.findExportByName",
+        "type": "function"
+      },
+      {
+        "path": "Module.findGlobalExportByName",
         "type": "function"
       },
       {
@@ -364,6 +377,30 @@
       },
       {
         "path": "Module.enumerateSymbols",
+        "type": "function"
+      },
+      {
+        "path": "Module.prototype.enumerateSections",
+        "type": "function"
+      },
+      {
+        "path": "Module.prototype.enumerateDependencies",
+        "type": "function"
+      },
+      {
+        "path": "Module.prototype.ensureInitialized",
+        "type": "function"
+      },
+      {
+        "path": "Module.prototype.findSymbolByName",
+        "type": "function"
+      },
+      {
+        "path": "ModuleMap",
+        "type": "function"
+      },
+      {
+        "path": "ModuleMap.prototype.update",
         "type": "function"
       },
       {

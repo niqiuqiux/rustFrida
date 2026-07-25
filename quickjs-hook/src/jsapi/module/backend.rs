@@ -59,6 +59,7 @@ pub enum ThreadObserverEvent {
 #[derive(Clone, Copy)]
 pub struct ModuleBackend {
     pub enumerate_modules: fn() -> Vec<ModuleDetails>,
+    pub find_global_export_by_name: fn(&str) -> Result<Option<u64>, String>,
     pub ensure_initialized: fn(&ModuleIdentity) -> Result<(), String>,
     pub enumerate_sections: fn(&ModuleIdentity) -> Result<Vec<ModuleSectionDetails>, String>,
     pub enumerate_dependencies: fn(&ModuleIdentity) -> Result<Vec<ModuleDependencyDetails>, String>,
