@@ -25,10 +25,14 @@ pub struct Backtracer;
 impl Backtracer {
     /// Generate a backtrace
     fn generate(backtracer: *mut gum_sys::GumBacktracer, context: *const gum_sys::GumCpuContext) -> Vec<usize> {
+        if backtracer.is_null() {
+            return Vec::new();
+        }
         let mut return_address_array = MaybeUninit::<gum_sys::_GumReturnAddressArray>::uninit();
 
         unsafe {
             gum_sys::gum_backtracer_generate(backtracer, context, return_address_array.as_mut_ptr());
+            gum_sys::g_object_unref(backtracer as *mut _);
             let return_address_array = return_address_array.assume_init();
             let mut result = vec![];
             for i in 0..return_address_array.len {

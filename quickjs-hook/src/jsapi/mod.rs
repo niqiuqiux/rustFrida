@@ -2,8 +2,10 @@
 
 pub(crate) mod callback_util;
 pub mod console;
+pub mod diagnostics;
 pub mod file;
 pub mod hook_api;
+pub mod int64;
 pub mod java;
 pub mod jni;
 pub mod memory;
@@ -14,8 +16,10 @@ pub mod stalker;
 pub(crate) mod util;
 
 pub use console::register_console;
+pub use diagnostics::register_diagnostics_api;
 pub use file::register_file_api;
 pub use hook_api::register_hook_api;
+pub use int64::register_int64_api;
 pub use java::deferred_java_init;
 pub use java::register_lazy_java_api;
 pub use jni::register_jni_api;
@@ -32,6 +36,8 @@ pub fn register_all_apis(ctx: &JSContext) {
     register_console(ctx);
     register_file_api(ctx);
     register_ptr(ctx);
+    register_int64_api(ctx);
+    register_diagnostics_api(ctx);
     register_hook_api(ctx);
     register_jni_api(ctx);
     register_memory_api(ctx);

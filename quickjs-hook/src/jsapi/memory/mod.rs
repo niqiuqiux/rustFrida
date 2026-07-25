@@ -16,6 +16,9 @@ use alloc::*;
 use operations::*;
 use read::*;
 use scan::memory_scan_sync;
+pub(crate) fn safe_read_exact(address: u64, output: &mut [u8]) -> Result<(), String> {
+    safe_access::read_exact(address, output).map_err(|error| error.to_string())
+}
 pub use write::cleanup_wxshadow_patches;
 pub(crate) use write::untrack_wxshadow_addr;
 use write::*;

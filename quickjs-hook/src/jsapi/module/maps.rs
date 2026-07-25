@@ -400,6 +400,57 @@ fn collect_module_ranges<'a>(entries: impl IntoIterator<Item = &'a ModuleMapEntr
     modules
 }
 
+fn collect_executable_module_clusters(entries: &[ModuleMapEntry]) -> Vec<ModuleInfo> {
+    const MAX_MODULE_CLUSTER_GAP: u64 = 64 * 1024 * 1024;
+
+    let mut entries_by_path: HashMap<&str, Vec<&ModuleMapEntry>> = HashMap::new();
+    for entry in entries {
+        entries_by_path.entry(entry.path.as_str()).or_default().push(entry);
+    }
+
+    let mut result = Vec::new();
+    for (path, mut path_entries) in entries_by_path {
+        path_entries.sort_by_key(|entry| entry.start);
+        let mut cluster_base = 0u64;
+        let mut cluster_end = 0u64;
+        let mut cluster_has_exec = false;
+
+        for entry in path_entries {
+            if cluster_end == 0 || entry.start > cluster_end.saturating_add(MAX_MODULE_CLUSTER_GAP) {
+                if cluster_has_exec {
+                    result.push(ModuleInfo::from_path_range(
+                        path.to_string(),
+                        cluster_base,
+                        cluster_end,
+                    ));
+                }
+                cluster_base = entry.start;
+                cluster_end = entry.end;
+                cluster_has_exec = entry.is_executable();
+            } else {
+                cluster_end = cluster_end.max(entry.end);
+                cluster_has_exec |= entry.is_executable();
+            }
+        }
+
+        if cluster_has_exec {
+            result.push(ModuleInfo::from_path_range(
+                path.to_string(),
+                cluster_base,
+                cluster_end,
+            ));
+        }
+    }
+
+    result.sort_by_key(|module| module.base);
+    result
+}
+
+fn enumerate_executable_module_clusters_from_maps() -> Vec<ModuleInfo> {
+    let snapshot = ModuleSnapshot::load_current();
+    collect_executable_module_clusters(&snapshot.entries)
+}
+
 fn normalized_module_path(path: &str) -> &str {
     path.strip_suffix(" (deleted)").unwrap_or(path)
 }
@@ -605,5 +656,27 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
         assert_eq!(cache.snapshot.find_module_base("libgone.so"), None);
         assert_eq!(cache.snapshot.find_module_path_and_base("libgone.so"), None);
         assert!(cache.snapshot.find_module_by_address(0x1800).is_none());
+    }
+
+    #[test]
+    fn executable_clusters_skip_distant_read_only_elf_mirrors() {
+        let maps = "\
+1000-2000 r--p 00000000 00:00 0 /tmp/libfoo.so
+3000-4000 r--p 00000000 00:00 0 /tmp/libbar.so
+100000000-100001000 r--p 00000000 00:00 0 /tmp/libfoo.so
+100001000-100002000 r-xp 00001000 00:00 0 /tmp/libfoo.so
+";
+
+        let clusters = collect_executable_module_clusters(&parse_module_map_entries(maps));
+
+        assert_eq!(
+            clusters,
+            vec![ModuleInfo {
+                name: "libfoo.so".to_string(),
+                base: 0x100000000,
+                size: 0x2000,
+                path: "/tmp/libfoo.so".to_string(),
+            }]
+        );
     }
 }

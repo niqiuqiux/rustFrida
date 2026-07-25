@@ -25,10 +25,17 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `console` | `object` | compatible |
 | `ptr` | `function` | compatible |
 | `NULL` | `object` | compatible |
+| `Int64` | `function` | compatible |
+| `UInt64` | `function` | compatible |
 | `Memory` | `object` | partial |
 | `File` | `function` | partial |
 | `Process` | `object` | partial |
 | `Module` | `object` | legacy |
+| `DebugSymbol` | `function` | compatible |
+| `Thread` | `object` | partial |
+| `Backtracer` | `object` | compatible |
+| `Instruction` | `function` | compatible |
+| `ApiResolver` | `function` | partial |
 | `Hook` | `object` | extension |
 | `Interceptor` | `object` | partial |
 | `Stalker` | `object` | partial |
@@ -51,7 +58,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | --- | --- | --- | --- |
 | Core runtime | partial | Goal 07 | `Frida`, `Script`, `send`, `recv`, `timers`, `Worker`, `hexdump` |
 | Native ABI | partial | Goal 04 | `NativeCallback`, `SystemFunction`, `variadic`, `struct-by-value`, `options` |
-| Diagnostics | missing | Goal 02 | `DebugSymbol`, `Thread`, `Backtracer`, `ApiResolver`, `Instruction.parse` |
+| Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `Module instances`, `ModuleMap`, `observers`, `runOnThread`, `exception handler` |
 | Memory | partial | Goal 06 | `patchCode`, `async scan`, `findPointers`, `MemoryAccessMonitor`, `alloc options` |
 | Stalker | partial | Goal 05 | `Arm64Writer`, `Arm64Relocator`, `drop statistics` |

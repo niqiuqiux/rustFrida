@@ -47,6 +47,11 @@ impl Symbol {
     pub fn line_number(&self) -> u32 {
         self.gum_debug_symbol_details.line_number
     }
+
+    /// Column number in `file_name`.
+    pub fn column(&self) -> u32 {
+        self.gum_debug_symbol_details.column
+    }
 }
 
 pub struct DebugSymbol {}
@@ -67,7 +72,7 @@ impl DebugSymbol {
     pub fn find_function<S: AsRef<str>>(name: S) -> Option<NativePointer> {
         match CString::new(name.as_ref()) {
             Ok(name) => {
-                let address = unsafe { gum_find_function(name.into_raw().cast()) };
+                let address = unsafe { gum_find_function(name.as_ptr().cast()) };
                 if address.is_null() {
                     None
                 } else {

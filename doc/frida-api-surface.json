@@ -33,13 +33,10 @@
         "area": "Diagnostics",
         "goal": "02",
         "missing": [
-          "DebugSymbol",
-          "Thread",
-          "Backtracer",
-          "ApiResolver",
-          "Instruction.parse"
+          "non-module ApiResolver types",
+          "Thread hardware breakpoints/watchpoints"
         ],
-        "status": "missing"
+        "status": "partial"
       },
       {
         "area": "Module and Process",
@@ -106,10 +103,17 @@
     "documentedGlobals": [
       "console",
       "ptr",
+      "Int64",
+      "UInt64",
       "Memory",
       "File",
       "Process",
       "Module",
+      "DebugSymbol",
+      "Thread",
+      "Backtracer",
+      "Instruction",
+      "ApiResolver",
       "Interceptor",
       "Stalker",
       "CModule",
@@ -140,6 +144,16 @@
         "type": "object"
       },
       {
+        "classification": "compatible",
+        "name": "Int64",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "UInt64",
+        "type": "function"
+      },
+      {
         "classification": "partial",
         "name": "Memory",
         "type": "object"
@@ -158,6 +172,31 @@
         "classification": "legacy",
         "name": "Module",
         "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "DebugSymbol",
+        "type": "function"
+      },
+      {
+        "classification": "partial",
+        "name": "Thread",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "Backtracer",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "Instruction",
+        "type": "function"
+      },
+      {
+        "classification": "partial",
+        "name": "ApiResolver",
+        "type": "function"
       },
       {
         "classification": "extension",
@@ -248,6 +287,14 @@
         "type": "function"
       },
       {
+        "path": "Int64.prototype.add",
+        "type": "function"
+      },
+      {
+        "path": "UInt64.prototype.toJSON",
+        "type": "function"
+      },
+      {
         "path": "Memory.alloc",
         "type": "function"
       },
@@ -317,6 +364,30 @@
       },
       {
         "path": "Module.enumerateSymbols",
+        "type": "function"
+      },
+      {
+        "path": "DebugSymbol.fromAddress",
+        "type": "function"
+      },
+      {
+        "path": "DebugSymbol.findFunctionsMatching",
+        "type": "function"
+      },
+      {
+        "path": "Thread.backtrace",
+        "type": "function"
+      },
+      {
+        "path": "Backtracer.ACCURATE",
+        "type": "number"
+      },
+      {
+        "path": "Instruction.parse",
+        "type": "function"
+      },
+      {
+        "path": "ApiResolver.prototype.enumerateMatches",
         "type": "function"
       },
       {

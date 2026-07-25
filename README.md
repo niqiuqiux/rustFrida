@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `ptr()`, `Memory`, `File`, `Process`, `Module`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 

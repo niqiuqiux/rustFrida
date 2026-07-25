@@ -42,6 +42,158 @@ struct RangeRecord {
     path: String,
 }
 
+fn wildcard_matches(pattern: &[u8], value: &[u8]) -> bool {
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star_index, mut star_value_index) = (None, 0);
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// Find functions in the current module snapshot without walking live ELF
+/// dynamic tables. File-backed parsing keeps stale Gum symbol caches from
+/// making module unload/reload lookups unsafe.
+pub fn find_loaded_function_addresses(pattern: &str, matching: bool) -> Vec<u64> {
+    let mut result = Vec::new();
+
+    for module in enumerate_executable_module_clusters_from_maps() {
+        let addresses = unsafe { elf_module_find_function_addresses(&module.path, module.base, pattern, matching) };
+        result.extend(addresses.into_iter().filter(|address| is_address_in_loaded_module(*address)));
+    }
+
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
+unsafe fn elf_module_find_function_addresses(
+    file_path: &str,
+    base_address: u64,
+    pattern: &str,
+    matching: bool,
+) -> Vec<u64> {
+    if !is_symbol_scan_candidate_path(file_path, base_address) || is_memfd_path(file_path) {
+        return Vec::new();
+    }
+
+    let data = match std::fs::read(normalized_module_path(file_path)) {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
+    };
+    if data.len() < std::mem::size_of::<Elf64Ehdr>() {
+        return Vec::new();
+    }
+    let ehdr = &*(data.as_ptr() as *const Elf64Ehdr);
+    if ehdr.e_ident[0..4] != *b"\x7fELF" || ehdr.e_ident[4] != 2 {
+        return Vec::new();
+    }
+    let Some((shdr_off, shdr_size, shnum)) = elf_section_headers_from_data(data.len(), ehdr) else {
+        return Vec::new();
+    };
+
+    let load_bias = elf_compute_load_bias(base_address);
+    let mut result = Vec::new();
+    for i in 0..shnum {
+        let Some(symtab) = elf_section_header_at(&data, shdr_off, shdr_size, i) else {
+            return Vec::new();
+        };
+        if symtab.sh_type != SHT_SYMTAB && symtab.sh_type != SHT_DYNSYM {
+            continue;
+        }
+        let Some(strtab) = elf_section_header_at(&data, shdr_off, shdr_size, symtab.sh_link as usize) else {
+            continue;
+        };
+        if strtab.sh_type != SHT_STRTAB {
+            continue;
+        }
+        let Some(symtab_off) = usize::try_from(symtab.sh_offset).ok() else {
+            continue;
+        };
+        let Some(strtab_off) = usize::try_from(strtab.sh_offset).ok() else {
+            continue;
+        };
+        let Some(strtab_size) = usize::try_from(strtab.sh_size).ok() else {
+            continue;
+        };
+        let Some(strtab_range) = checked_file_range(data.len(), strtab_off, strtab_size) else {
+            continue;
+        };
+        let sym_size = if symtab.sh_entsize > 0 {
+            symtab.sh_entsize as usize
+        } else {
+            std::mem::size_of::<Elf64Sym>()
+        };
+        if sym_size < std::mem::size_of::<Elf64Sym>() {
+            continue;
+        }
+        let Some(nsyms) = bounded_entry_count(symtab.sh_size, sym_size, MAX_FILE_SYMBOLS) else {
+            continue;
+        };
+        let Some(symtab_bytes) = nsyms.checked_mul(sym_size) else {
+            continue;
+        };
+        if checked_file_range(data.len(), symtab_off, symtab_bytes).is_none() {
+            continue;
+        }
+
+        for index in 0..nsyms {
+            let Some(sym_off) = index
+                .checked_mul(sym_size)
+                .and_then(|offset| symtab_off.checked_add(offset))
+            else {
+                break;
+            };
+            let sym = &*(data.as_ptr().add(sym_off) as *const Elf64Sym);
+            if sym.st_name == 0 || sym.st_shndx == SHN_UNDEF || sym.st_value == 0 || sym.st_type() != STT_FUNC {
+                continue;
+            }
+            let Some(name_off) = strtab_range.start.checked_add(sym.st_name as usize) else {
+                continue;
+            };
+            if name_off >= strtab_range.end {
+                continue;
+            }
+            let name = &data[name_off..strtab_range.end];
+            let name_len = name.iter().position(|byte| *byte == 0).unwrap_or(0);
+            if name_len == 0 {
+                continue;
+            }
+            let name = &name[..name_len];
+            let name_matches = if matching {
+                wildcard_matches(pattern.as_bytes(), name)
+            } else {
+                name == pattern.as_bytes()
+            };
+            if name_matches {
+                result.push(load_bias.wrapping_add(sym.st_value));
+            }
+        }
+    }
+
+    result
+}
+
 /// Enumerate every named symbol from the module's .symtab and .dynsym.
 /// Names are de-duplicated (.symtab wins when both sections list the same name).
 unsafe fn elf_module_enumerate_symbols(file_path: &str, base_address: u64) -> Vec<SymbolRecord> {

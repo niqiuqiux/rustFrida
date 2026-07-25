@@ -1,8 +1,8 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 和 Goal 01 已完成）
+> 状态：执行中（Goal 00、Goal 01 和 Goal 02 已完成）
 >
-> 更新日期：2026-07-24
+> 更新日期：2026-07-25
 >
 > 目标平台：Android ARM64
 >
@@ -215,6 +215,16 @@ cargo build --offline --release --target aarch64-linux-android
 - 现有最后一枚 probe + call/ret sink 回归继续通过。
 
 ### Goal 02：补齐诊断基础对象（P0）
+
+状态：**已完成（2026-07-25）**。
+
+落地证据：
+
+- QuickJS facade 已提供 `Int64`、`UInt64`、`DebugSymbol`、`Thread.backtrace()`、`Backtracer`、`Instruction.parse()` 和 `ApiResolver('module')`，并由固定 Gum/Capstone 后端实现诊断能力。
+- `DebugSymbol` 按名称查询会合并 Gum 当前映射结果与边界校验后的磁盘 ELF 结果；Android 16 上同路径的只读 ELF mirror 不会被误作 load bias，卸载重载后也不会返回 Gum 缓存中的旧地址。
+- `tests/device/run_goal02_diagnostics.py --device 3B65AU009YA00000` 在 PLC110 实机完成两轮回归；`%reload` 后测试 SO 从 `0x7b8f734620` 换址到 `0x7b0d51c620`，按名称查询返回新地址。
+- native hook 的 returnAddress 和 `Thread.backtrace()` 均输出 `librf_goal01_control.so!rf_goal01_call`；无符号地址、匿名可执行 JIT 映射和模块卸载后的地址查询均正常。
+- 两轮回归后最终 shutdown 正常，目标进程存活且没有新增 tombstone；兼容 surface、静态语法、rustfmt 和 diff 检查均通过。
 
 目标：优先覆盖最常见且低侵入的 Frida 脚本依赖。
 

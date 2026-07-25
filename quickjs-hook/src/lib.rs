@@ -39,6 +39,10 @@ pub use completion::complete_script;
 pub use context::JSContext;
 pub use jsapi::console::{set_console_callback, set_verbose};
 pub use jsapi::deferred_java_init;
+pub use jsapi::diagnostics::{
+    install_diagnostics_backend, ApiResolverMatch, DebugSymbolDetails, DiagnosticsBackend, DiagnosticsCpuContext,
+    InstructionDetails, InstructionMemoryOperand, InstructionOperand, InstructionOperandValue, InstructionShift,
+};
 pub use jsapi::hook_api::cleanup_hooks;
 pub use jsapi::hook_api::discard_native_hooks_in_range;
 #[cfg(feature = "qbdi")]
@@ -59,6 +63,7 @@ pub use jsapi::java::raw_clone_java_executor_hook_active;
 pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
+pub use jsapi::module::find_loaded_function_addresses;
 pub use jsapi::stalker::{
     clear_retired_stalker_callouts, dispatch_stalker_call_probe, dispatch_stalker_callout, dispatch_stalker_transform,
     install_stalker_backend, retire_stalker_callout, shutdown_stalker_backend, wait_for_stalker_call_probe_callbacks,

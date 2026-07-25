@@ -10,6 +10,7 @@ struct MapEntry {
     start: usize,
     end: usize,
     offset: usize,
+    readable: bool,
     name: String,
 }
 
@@ -99,6 +100,15 @@ pub(crate) fn resolve_symbol(addr: usize) -> ResolvedSymbol {
         Some(map.name.rsplit('/').next().unwrap_or(map.name.as_str()).to_string())
     };
 
+    let base_is_readable = maps.iter().any(|entry| entry.start == base && entry.readable);
+    if map.name.is_empty() || !base_is_readable {
+        return ResolvedSymbol {
+            module,
+            symbol: None,
+            offset: addr.saturating_sub(base),
+        };
+    }
+
     match unsafe { elf_find_nearest_symbol(base, addr) } {
         Some((symbol, offset)) => ResolvedSymbol {
             module,
@@ -186,6 +196,7 @@ fn parse_maps() -> Vec<MapEntry> {
             let start = usize::from_str_radix(range.next()?, 16).ok()?;
             let end = usize::from_str_radix(range.next()?, 16).ok()?;
             let offset = usize::from_str_radix(parts[2], 16).ok()?;
+            let readable = parts[1].as_bytes().first() == Some(&b'r');
             let name = if parts.len() > 5 {
                 parts[5..].join(" ")
             } else {
@@ -196,6 +207,7 @@ fn parse_maps() -> Vec<MapEntry> {
                 start,
                 end,
                 offset,
+                readable,
                 name,
             })
         })

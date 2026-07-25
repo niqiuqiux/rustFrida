@@ -25,6 +25,8 @@ mod trace;
 mod vma_name;
 
 #[cfg(feature = "frida-gum")]
+mod diagnostics;
+#[cfg(feature = "frida-gum")]
 mod memory_dump;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;

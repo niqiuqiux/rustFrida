@@ -1,10 +1,23 @@
 #include <dlfcn.h>
 #include <stdint.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define FIXTURE_PATH "/data/local/tmp/librf_goal01_unload.so"
 
 static void *fixture_handle;
+
+__attribute__((visibility("default"), noinline))
+void *rf_goal02_jit_alloc(void) {
+    void *result = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return result == MAP_FAILED ? NULL : result;
+}
+
+__attribute__((visibility("default"), noinline))
+int rf_goal02_jit_free(void *address) {
+    return address == NULL ? -1 : munmap(address, 4096);
+}
 
 __attribute__((visibility("default"), noinline))
 void rf_goal01_sleep_ms(unsigned int milliseconds) {
