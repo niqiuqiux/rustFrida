@@ -2,17 +2,6 @@
 // Module handle + symbol resolution
 // ============================================================================
 
-#[repr(C)]
-struct AndroidDlextinfo {
-    flags: u64,
-    reserved_addr: u64,
-    reserved_size: u64,
-    relro_fd: i32,
-    library_fd: i32,
-    library_fd_offset: u64,
-    library_namespace: u64,
-}
-
 /// Get a dlopen handle to libart.so via unrestricted linker API (Frida-style).
 unsafe fn get_libart_handle() -> *mut std::ffi::c_void {
     LIBART_HANDLE
@@ -499,37 +488,38 @@ pub(crate) unsafe fn memfd_dlopen_with_flags(name: &str, fd: i32, flags: i32) ->
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-    if let Some(api) = api {
-        if let Some(android_dlopen_ext) = api.android_dlopen_ext {
-            let extinfo = AndroidDlextinfo {
-                flags: 0x10,
-                reserved_addr: 0,
-                reserved_size: 0,
-                relro_fd: 0,
-                library_fd: fd,
-                library_fd_offset: 0,
-                library_namespace: 0,
-            };
-            crate::jsapi::console::output_message(&format!(
-                "[module] memfd_dlopen: name={} fd={} flags=0x{:x} caller={:?}",
-                name, fd, flags, api.trusted_caller
-            ));
-            let handle = android_dlopen_ext(
-                c_name.as_ptr() as *const i8,
-                flags,
-                &extinfo as *const _ as *const std::ffi::c_void,
-                api.trusted_caller,
-            );
-            crate::jsapi::console::output_message(&format!(
-                "[module] memfd_dlopen: android_dlopen_ext returned {:?}",
-                handle
-            ));
-            return handle;
-        }
+    #[cfg(target_os = "android")]
+    {
+        const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
+        let info = AndroidDlextinfo {
+            flags: ANDROID_DLEXT_USE_LIBRARY_FD,
+            reserved_addr: std::ptr::null_mut(),
+            reserved_size: 0,
+            relro_fd: -1,
+            library_fd: fd,
+            library_fd_offset: 0,
+            library_namespace: std::ptr::null_mut(),
+        };
+        crate::jsapi::console::output_message(&format!(
+            "[module] memfd_dlopen: name={} fd={} flags=0x{:x}",
+            name, fd, flags
+        ));
+        let handle = android_dlopen_ext(c_name.as_ptr(), flags, &info);
+        crate::jsapi::console::output_message(&format!(
+            "[module] memfd_dlopen: android_dlopen_ext returned {:?}",
+            handle
+        ));
+        return handle;
     }
 
-    std::ptr::null_mut()
+    #[cfg(not(target_os = "android"))]
+    {
+        let fd_path = match CString::new(format!("/proc/self/fd/{fd}")) {
+            Ok(value) => value,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        libc::dlopen(fd_path.as_ptr(), flags)
+    }
 }
 
 /// Resolve a symbol from libart.so by parsing ELF metadata.
@@ -706,4 +696,24 @@ fn find_module_base_for_path(path: &str) -> u64 {
         .find_map(|entry| (entry.path == Some(path)).then_some(entry.start))
         .unwrap_or(0);
     base
+}
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct AndroidDlextinfo {
+    flags: u64,
+    reserved_addr: *mut std::ffi::c_void,
+    reserved_size: usize,
+    relro_fd: i32,
+    library_fd: i32,
+    library_fd_offset: i64,
+    library_namespace: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn android_dlopen_ext(
+        filename: *const std::os::raw::c_char,
+        flags: i32,
+        info: *const AndroidDlextinfo,
+    ) -> *mut std::ffi::c_void;
 }

@@ -45,10 +45,8 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
         &[
             // dlopen/dlvsym (API 28+)
             "__dl___loader_dlopen",
-            "__dl___loader_android_dlopen_ext",
             "__dl___loader_dlvsym",
             // dlopen/dlvsym (API 26-27 fallback)
-            "__loader_android_dlopen_ext",
             "__dl__Z8__dlopenPKciPKv",
             "__dl__Z8__dlvsymPvPKcS1_PKv",
             // Linker internals (Frida's gum_store_linker_symbol_if_needed)
@@ -79,11 +77,6 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
         .get("__dl___loader_dlvsym")
         .or_else(|| symbols.get("__dl__Z8__dlvsymPvPKcS1_PKv"))
         .copied();
-    let android_dlopen_ext_addr = symbols
-        .get("__dl___loader_android_dlopen_ext")
-        .or_else(|| symbols.get("__loader_android_dlopen_ext"))
-        .copied();
-
     if dlopen_addr.is_none() || dlsym_addr.is_none() {
         output_message(&format!(
             "[linker api] dlopen/dlsym not found: dlopen={:?}, dlsym={:?}",
@@ -138,7 +131,6 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
 
     Some(UnrestrictedLinkerApi {
         dlopen: std::mem::transmute(dlopen_addr),
-        android_dlopen_ext: android_dlopen_ext_addr.map(|addr| std::mem::transmute(addr)),
         dlsym: std::mem::transmute(dlsym_addr),
         trusted_caller: trusted_caller as *const std::ffi::c_void,
         dl_mutex,

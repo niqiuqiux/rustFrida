@@ -147,15 +147,6 @@ const R_AARCH64_JUMP_SLOT: u32 = 1026;
 struct UnrestrictedLinkerApi {
     /// __dl___loader_dlopen(filename, flags, caller_addr) -> handle
     dlopen: unsafe extern "C" fn(*const i8, i32, *const std::ffi::c_void) -> *mut std::ffi::c_void,
-    /// __dl___loader_android_dlopen_ext(filename, flags, extinfo, caller_addr) -> handle
-    android_dlopen_ext: Option<
-        unsafe extern "C" fn(
-            *const i8,
-            i32,
-            *const std::ffi::c_void,
-            *const std::ffi::c_void,
-        ) -> *mut std::ffi::c_void,
-    >,
     /// __dl___loader_dlvsym(handle, symbol, version, caller_addr) -> addr
     dlsym: unsafe extern "C" fn(
         *mut std::ffi::c_void,

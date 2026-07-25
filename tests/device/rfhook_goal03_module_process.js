@@ -81,10 +81,12 @@ assertEqual("ModuleMap snapshot before update", map.find(fixtureAddress), null);
 map.update();
 assertEqual("ModuleMap after update", map.get(fixtureAddress).base, fixture.base);
 assertEqual("fixture close", controlClose(), 0);
+sleepMs(50);
+assertEqual("fixture mapping gone", Process.findRangeByAddress(fixtureAddress), null);
+assertEqual("fixture gone", Process.findModuleByAddress(fixtureAddress), null);
 assertEqual("fixture observer removed once", moduleEvents.filter(function (event) {
     return event.indexOf("remove:/data/local/tmp/librf_goal03_module.so:") === 0;
 }).length, 1);
-assertEqual("fixture gone", Process.findModuleByAddress(fixtureAddress), null);
 assertEqual("ModuleMap stale snapshot", map.get(fixtureAddress).base, fixture.base);
 map.update();
 assertEqual("ModuleMap refreshed removal", map.find(fixtureAddress), null);

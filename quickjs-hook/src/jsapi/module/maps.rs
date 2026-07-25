@@ -346,7 +346,7 @@ pub(crate) fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
 /// Prefer Gum's loader-aware registry, then add mappings absent from that
 /// registry (notably this agent after hide_soinfo and synthetic modules).
 fn enumerate_process_modules() -> Vec<ModuleInfo> {
-    let mut modules = module_backend()
+    let backend_modules = module_backend()
         .map(|backend| {
             (backend.enumerate_modules)()
                 .into_iter()
@@ -360,19 +360,32 @@ fn enumerate_process_modules() -> Vec<ModuleInfo> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    merge_backend_and_mapped_modules(backend_modules, enumerate_executable_module_clusters_from_maps())
+}
+
+fn merge_backend_and_mapped_modules(
+    backend_modules: Vec<ModuleInfo>,
+    mapped_modules: Vec<ModuleInfo>,
+) -> Vec<ModuleInfo> {
+    let mut modules = backend_modules
+        .into_iter()
+        .filter(|module| {
+            mapped_modules.iter().any(|mapped| {
+                normalized_module_path(&mapped.path) == normalized_module_path(&module.path)
+                    && mapped
+                        .base
+                        .checked_add(mapped.size)
+                        .is_some_and(|end| module.base >= mapped.base && module.base < end)
+            })
+        })
+        .collect::<Vec<_>>();
 
     let backend_paths = modules
         .iter()
         .map(|module| normalized_module_path(&module.path).to_string())
         .collect::<HashSet<_>>();
-    for module in enumerate_executable_module_clusters_from_maps() {
+    for module in mapped_modules {
         if backend_paths.contains(normalized_module_path(&module.path)) {
-            continue;
-        }
-        if modules
-            .iter()
-            .any(|existing| existing.base == module.base && existing.path == module.path)
-        {
             continue;
         }
         modules.push(module);
@@ -750,5 +763,38 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
                 path: "/tmp/libfoo.so".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn backend_entries_missing_from_maps_are_dropped() {
+        let backend = vec![ModuleInfo {
+            name: "libgone.so".to_string(),
+            version: Some("stale".to_string()),
+            base: 0x1000,
+            size: 0x2000,
+            path: "/tmp/libgone.so".to_string(),
+        }];
+
+        assert!(merge_backend_and_mapped_modules(backend, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn mapped_identity_replaces_stale_backend_identity_at_same_base() {
+        let backend = vec![ModuleInfo {
+            name: "libold.so".to_string(),
+            version: Some("stale".to_string()),
+            base: 0x1000,
+            size: 0x2000,
+            path: "/tmp/libold.so".to_string(),
+        }];
+        let mapped = vec![ModuleInfo {
+            name: "libnew.so".to_string(),
+            version: None,
+            base: 0x1000,
+            size: 0x3000,
+            path: "/tmp/libnew.so".to_string(),
+        }];
+
+        assert_eq!(merge_backend_and_mapped_modules(backend, mapped.clone()), mapped);
     }
 }

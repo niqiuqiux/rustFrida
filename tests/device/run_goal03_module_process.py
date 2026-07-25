@@ -133,7 +133,11 @@ def main():
 
         device_rustfrida = f"{DEVICE_ROOT}/rustfrida-goal03"
         device_script = f"{DEVICE_ROOT}/{SCRIPT.name}"
-        root_shell(f"mkdir -p {DEVICE_ROOT}/rf-goal03-a {DEVICE_ROOT}/rf-goal03-b")
+        root_shell(
+            f"rm -rf {DEVICE_ROOT}/rf-goal03-a {DEVICE_ROOT}/rf-goal03-b; "
+            f"mkdir -p {DEVICE_ROOT}/rf-goal03-a {DEVICE_ROOT}/rf-goal03-b; "
+            f"chmod 777 {DEVICE_ROOT}/rf-goal03-a {DEVICE_ROOT}/rf-goal03-b"
+        )
         for local, remote in (
             (control, f"{DEVICE_ROOT}/{control.name}"),
             (module, f"{DEVICE_ROOT}/{module.name}"),

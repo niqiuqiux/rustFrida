@@ -1,4 +1,5 @@
 const PROCESS_OBSERVER_QUEUE_CAPACITY: usize = 4096;
+const PROCESS_OBSERVER_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Clone)]
 enum QueuedProcessObserverEvent {
@@ -26,6 +27,8 @@ struct ProcessObserverState {
     module_observers: HashMap<u32, ModuleObserver>,
     thread_observers: HashMap<u32, ThreadObserver>,
     events: std::collections::VecDeque<QueuedProcessObserverEvent>,
+    reconciling: bool,
+    last_reconcile: Option<std::time::Instant>,
 }
 
 impl Default for ProcessObserverState {
@@ -37,6 +40,8 @@ impl Default for ProcessObserverState {
             module_observers: HashMap::new(),
             thread_observers: HashMap::new(),
             events: std::collections::VecDeque::new(),
+            reconciling: false,
+            last_reconcile: None,
         }
     }
 }
@@ -55,11 +60,17 @@ fn module_observer_key(details: &ModuleDetails) -> (String, u64) {
 }
 
 fn merge_module_snapshots(modules: Vec<ModuleDetails>) -> Vec<ModuleDetails> {
+    let current = current_module_details();
+    let current_identities = current
+        .iter()
+        .map(module_observer_key)
+        .collect::<HashSet<_>>();
     let mut by_identity = modules
         .into_iter()
+        .filter(|module| current_identities.contains(&module_observer_key(module)))
         .map(|module| (module_observer_key(&module), module))
         .collect::<HashMap<_, _>>();
-    for module in current_module_details() {
+    for module in current {
         by_identity.entry(module_observer_key(&module)).or_insert(module);
     }
     let mut modules = by_identity.into_values().collect::<Vec<_>>();
@@ -606,6 +617,110 @@ unsafe fn dispatch_thread_event(ctx: *mut ffi::JSContext, event: ThreadObserverE
     }
 }
 
+unsafe fn reconcile_process_observers(ctx: *mut ffi::JSContext) {
+    let (reconcile_modules, reconcile_threads) = {
+        let mut state = lock_process_observers();
+        if state.reconciling
+            || (state.module_observers.is_empty() && state.thread_observers.is_empty())
+            || state
+                .last_reconcile
+                .is_some_and(|last| last.elapsed() < PROCESS_OBSERVER_RECONCILE_INTERVAL)
+        {
+            return;
+        }
+        state.reconciling = true;
+        state.last_reconcile = Some(std::time::Instant::now());
+        (!state.module_observers.is_empty(), !state.thread_observers.is_empty())
+    };
+
+    let modules = reconcile_modules.then(current_module_details);
+    let threads = reconcile_threads.then(current_thread_details);
+    let mut events = Vec::new();
+    {
+        let mut state = lock_process_observers();
+        if let Some(modules) = modules {
+            let current = modules
+                .into_iter()
+                .map(|module| (module_observer_key(&module), module))
+                .collect::<HashMap<_, _>>();
+            let known = state
+                .module_observers
+                .values()
+                .flat_map(|observer| observer.known.iter())
+                .map(|(key, module)| (key.clone(), module.clone()))
+                .collect::<HashMap<_, _>>();
+
+            for (key, module) in &known {
+                if !current.contains_key(key) {
+                    events.push(QueuedProcessObserverEvent::Module(ModuleObserverEvent::Removed(
+                        module.clone(),
+                    )));
+                }
+            }
+            for (key, module) in current {
+                if state
+                    .module_observers
+                    .values()
+                    .any(|observer| !observer.known.contains_key(&key))
+                {
+                    events.push(QueuedProcessObserverEvent::Module(ModuleObserverEvent::Added(module)));
+                }
+            }
+        }
+
+        if let Some(threads) = threads {
+            let current = threads
+                .into_iter()
+                .map(|thread| (thread.id, thread))
+                .collect::<HashMap<_, _>>();
+            let known = state
+                .thread_observers
+                .values()
+                .flat_map(|observer| observer.known.iter())
+                .map(|(&id, thread)| (id, thread.clone()))
+                .collect::<HashMap<_, _>>();
+
+            for (&id, thread) in &known {
+                if !current.contains_key(&id) {
+                    events.push(QueuedProcessObserverEvent::Thread(ThreadObserverEvent::Removed(
+                        thread.clone(),
+                    )));
+                }
+            }
+            for (id, thread) in current {
+                if state
+                    .thread_observers
+                    .values()
+                    .any(|observer| !observer.known.contains_key(&id))
+                {
+                    events.push(QueuedProcessObserverEvent::Thread(ThreadObserverEvent::Added(thread)));
+                    continue;
+                }
+                if let Some(previous_name) = state
+                    .thread_observers
+                    .values()
+                    .filter_map(|observer| observer.known.get(&id))
+                    .find(|known| known.name != thread.name)
+                    .map(|known| known.name.clone())
+                {
+                    events.push(QueuedProcessObserverEvent::Thread(ThreadObserverEvent::Renamed {
+                        thread,
+                        previous_name,
+                    }));
+                }
+            }
+        }
+        state.reconciling = false;
+    }
+
+    for event in events {
+        match event {
+            QueuedProcessObserverEvent::Module(event) => dispatch_module_event(ctx, event),
+            QueuedProcessObserverEvent::Thread(event) => dispatch_thread_event(ctx, event),
+        }
+    }
+}
+
 pub(crate) unsafe fn drain_process_observer_events(ctx: *mut ffi::JSContext) {
     for _ in 0..PROCESS_OBSERVER_QUEUE_CAPACITY {
         let event = lock_process_observers().events.pop_front();
@@ -615,10 +730,20 @@ pub(crate) unsafe fn drain_process_observer_events(ctx: *mut ffi::JSContext) {
             None => break,
         }
     }
+    reconcile_process_observers(ctx);
 }
 
 pub(crate) fn process_observer_events_pending() -> bool {
-    !lock_process_observers().events.is_empty()
+    let state = lock_process_observers();
+    if !state.events.is_empty() {
+        return true;
+    }
+    if state.module_observers.is_empty() && state.thread_observers.is_empty() {
+        return false;
+    }
+    state
+        .last_reconcile
+        .map_or(true, |last| last.elapsed() >= PROCESS_OBSERVER_RECONCILE_INTERVAL)
 }
 
 pub fn cut_process_observers() -> Result<(), String> {
@@ -627,6 +752,8 @@ pub fn cut_process_observers() -> Result<(), String> {
         state.module_accepting = false;
         state.thread_accepting = false;
         state.events.clear();
+        state.reconciling = false;
+        state.last_reconcile = None;
         (!state.module_observers.is_empty(), !state.thread_observers.is_empty())
     };
     if let Some(backend) = process_observer_backend() {
@@ -646,6 +773,8 @@ pub unsafe fn free_process_observers(ctx: *mut ffi::JSContext) {
         state.module_accepting = false;
         state.thread_accepting = false;
         state.events.clear();
+        state.reconciling = false;
+        state.last_reconcile = None;
         (
             std::mem::take(&mut state.module_observers),
             std::mem::take(&mut state.thread_observers),
