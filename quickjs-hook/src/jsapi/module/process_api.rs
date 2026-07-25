@@ -67,13 +67,13 @@ fn process_current_thread_id() -> i64 {
 }
 
 fn process_find_module_by_name(name: &str) -> Option<ModuleInfo> {
-    enumerate_modules_from_maps()
+    enumerate_process_modules()
         .into_iter()
         .find(|m| matches_module_lookup_name(&m.path, name) || m.name == name)
 }
 
 fn process_main_module() -> Option<ModuleInfo> {
-    let modules = enumerate_modules_from_maps();
+    let modules = enumerate_process_modules();
     if modules.is_empty() {
         return None;
     }
@@ -326,7 +326,7 @@ unsafe extern "C" fn js_process_enumerate_modules(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let modules = enumerate_modules_from_maps();
+    let modules = enumerate_process_modules();
     let arr = ffi::JS_NewArray(ctx);
     for (i, module) in modules.iter().enumerate() {
         ffi::JS_SetPropertyUint32(ctx, arr, i as u32, module_info_to_js(ctx, module));
@@ -391,7 +391,7 @@ unsafe extern "C" fn js_process_find_module_by_address(
         Err(e) => return e,
     };
 
-    match find_module_by_address(addr) {
+    match find_process_module_by_address(addr) {
         Some(module) => module_info_to_js(ctx, &module),
         None => JSValue::null().raw(),
     }

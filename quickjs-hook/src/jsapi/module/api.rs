@@ -4,11 +4,64 @@
 
 use crate::jsapi::callback_util::extract_pointer_address;
 
+unsafe fn module_identity_from_js(
+    ctx: *mut ffi::JSContext,
+    value: JSValue,
+    operation: &str,
+) -> Result<ModuleIdentity, ffi::JSValue> {
+    if !value.is_object() {
+        return Err(ffi::JS_ThrowTypeError(
+            ctx,
+            b"module must be a Module instance\0".as_ptr() as *const _,
+        ));
+    }
+
+    let name_value = value.get_property(ctx, "name");
+    let path_value = value.get_property(ctx, "path");
+    let base_value = value.get_property(ctx, "base");
+    let size_value = value.get_property(ctx, "size");
+    let result = (|| {
+        let name = name_value.to_string(ctx).ok_or_else(|| {
+            ffi::JS_ThrowTypeError(ctx, b"module.name must be a string\0".as_ptr() as *const _)
+        })?;
+        let path = path_value.to_string(ctx).ok_or_else(|| {
+            ffi::JS_ThrowTypeError(ctx, b"module.path must be a string\0".as_ptr() as *const _)
+        })?;
+        let base = extract_pointer_address(ctx, base_value, operation)?;
+        let size = size_value.to_u64(ctx).ok_or_else(|| {
+            ffi::JS_ThrowTypeError(ctx, b"module.size must be a number\0".as_ptr() as *const _)
+        })?;
+        Ok(ModuleIdentity {
+            name,
+            path,
+            base,
+            size,
+        })
+    })();
+    name_value.free(ctx);
+    path_value.free(ctx);
+    base_value.free(ctx);
+    size_value.free(ctx);
+    result
+}
+
+fn module_identity_is_current(identity: &ModuleIdentity) -> bool {
+    find_process_module_by_address(identity.base).is_some_and(|module| {
+        module.base == identity.base
+            && normalized_module_path(&module.path) == normalized_module_path(&identity.path)
+    })
+}
+
 unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JSValue {
     let obj = ffi::JS_NewObject(ctx);
     let obj_val = JSValue(obj);
 
     let name_val = JSValue::string(ctx, &m.name);
+    let version_val = m
+        .version
+        .as_deref()
+        .map(|version| JSValue::string(ctx, version))
+        .unwrap_or_else(JSValue::null);
     let base_val = create_native_pointer(ctx, m.base);
     // Keep module fields JSON-serializable. `base` is a NativePointer with `toJSON()`,
     // and `size` must stay out of BigInt territory for JSON.stringify().
@@ -20,6 +73,7 @@ unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JS
     let path_val = JSValue::string(ctx, &m.path);
 
     obj_val.set_property(ctx, "name", name_val);
+    obj_val.set_property(ctx, "version", version_val);
     obj_val.set_property(ctx, "base", base_val);
     obj_val.set_property(ctx, "size", size_val);
     obj_val.set_property(ctx, "path", path_val);
@@ -134,7 +188,7 @@ unsafe extern "C" fn js_module_find_by_address(
         Err(e) => return e,
     };
 
-    match find_module_by_address(addr) {
+    match find_process_module_by_address(addr) {
         Some(module) => module_info_to_js(ctx, &module),
         None => JSValue::null().raw(),
     }
@@ -147,7 +201,7 @@ unsafe extern "C" fn js_module_enumerate(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let modules = enumerate_modules_from_maps();
+    let modules = enumerate_process_modules();
 
     let arr = ffi::JS_NewArray(ctx);
     for (i, m) in modules.iter().enumerate() {
@@ -234,6 +288,132 @@ unsafe fn range_record_to_js(
     obj_val.set_property(ctx, "file", file_val);
 
     obj
+}
+
+unsafe extern "C" fn js_module_ensure_initialized(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"module is required\0".as_ptr() as *const _);
+    }
+    let identity = match module_identity_from_js(ctx, JSValue(*argv), "Module.ensureInitialized") {
+        Ok(identity) => identity,
+        Err(error) => return error,
+    };
+    if !module_identity_is_current(&identity) {
+        return crate::jsapi::callback_util::throw_internal_error(ctx, "module is no longer loaded");
+    }
+    if let Some(backend) = module_backend() {
+        if let Err(error) = (backend.ensure_initialized)(&identity) {
+            return crate::jsapi::callback_util::throw_internal_error(ctx, error);
+        }
+    }
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_module_enumerate_sections_instance(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"module is required\0".as_ptr() as *const _);
+    }
+    let identity = match module_identity_from_js(ctx, JSValue(*argv), "Module.enumerateSections") {
+        Ok(identity) => identity,
+        Err(error) => return error,
+    };
+    if !module_identity_is_current(&identity) {
+        return crate::jsapi::callback_util::throw_internal_error(ctx, "module is no longer loaded");
+    }
+    let sections = module_backend()
+        .and_then(|backend| (backend.enumerate_sections)(&identity).ok())
+        .filter(|sections| !sections.is_empty())
+        .unwrap_or_else(|| elf_module_enumerate_sections(&identity.path, identity.base));
+    let result = ffi::JS_NewArray(ctx);
+    for (index, section) in sections.iter().enumerate() {
+        let item = ffi::JS_NewObject(ctx);
+        let item_value = JSValue(item);
+        item_value.set_property(ctx, "id", JSValue::string(ctx, &section.id));
+        item_value.set_property(ctx, "name", JSValue::string(ctx, &section.name));
+        item_value.set_property(ctx, "address", create_native_pointer(ctx, section.address));
+        item_value.set_property(ctx, "size", js_u64_value(ctx, section.size));
+        ffi::JS_SetPropertyUint32(ctx, result, index as u32, item);
+    }
+    result
+}
+
+unsafe extern "C" fn js_module_enumerate_dependencies_instance(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"module is required\0".as_ptr() as *const _);
+    }
+    let identity = match module_identity_from_js(ctx, JSValue(*argv), "Module.enumerateDependencies") {
+        Ok(identity) => identity,
+        Err(error) => return error,
+    };
+    if !module_identity_is_current(&identity) {
+        return crate::jsapi::callback_util::throw_internal_error(ctx, "module is no longer loaded");
+    }
+    let dependencies = module_backend()
+        .and_then(|backend| (backend.enumerate_dependencies)(&identity).ok())
+        .filter(|dependencies| !dependencies.is_empty())
+        .unwrap_or_else(|| elf_module_enumerate_dependencies(identity.base));
+    let result = ffi::JS_NewArray(ctx);
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let item = ffi::JS_NewObject(ctx);
+        let item_value = JSValue(item);
+        item_value.set_property(ctx, "name", JSValue::string(ctx, &dependency.name));
+        item_value.set_property(ctx, "type", JSValue::string(ctx, &dependency.kind));
+        ffi::JS_SetPropertyUint32(ctx, result, index as u32, item);
+    }
+    result
+}
+
+unsafe extern "C" fn js_module_find_symbol_instance(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(ctx, b"module and symbolName are required\0".as_ptr() as *const _);
+    }
+    let identity = match module_identity_from_js(ctx, JSValue(*argv), "Module.findSymbolByName") {
+        Ok(identity) => identity,
+        Err(error) => return error,
+    };
+    let symbol = match require_string_arg(ctx, JSValue(*argv.add(1)), "symbolName") {
+        Ok(symbol) => symbol,
+        Err(error) => return error,
+    };
+    if !module_identity_is_current(&identity) {
+        return JSValue::null().raw();
+    }
+
+    let exact = elf_module_find_symbols(&identity.path, identity.base, &[&symbol])
+        .get(&symbol)
+        .copied();
+    let backend = module_backend()
+        .and_then(|backend| (backend.find_symbol_by_name)(&identity, &symbol).ok())
+        .flatten();
+    let address = exact.or(backend).filter(|address| {
+        identity
+            .base
+            .checked_add(identity.size)
+            .is_some_and(|end| *address >= identity.base && *address < end)
+    });
+    address
+        .map(|address| create_native_pointer(ctx, address).raw())
+        .unwrap_or_else(|| JSValue::null().raw())
 }
 
 /// Module.enumerateExports(moduleName) → Array of {type, name, address}
@@ -469,7 +649,7 @@ unsafe extern "C" fn js_module_load(
 
     // 从 /proc/self/maps 找刚加载的模块。tagged=true 时优先返回 memfd 映射，
     // 避免原始 so 已加载时误返回同路径的旧模块。
-    let modules = enumerate_modules_from_maps();
+    let modules = enumerate_process_modules();
     if let Some(name) = memfd_name.as_deref() {
         for m in &modules {
             if m.path.contains(name) || m.name.contains(name) {
@@ -492,6 +672,7 @@ unsafe extern "C" fn js_module_load(
     let obj = ffi::JS_NewObject(ctx);
     let obj_val = JSValue(obj);
     obj_val.set_property(ctx, "name", JSValue::string(ctx, &basename));
+    obj_val.set_property(ctx, "version", JSValue::null());
     obj_val.set_property(ctx, "path", JSValue::string(ctx, &path));
     obj_val.set_property(ctx, "base", create_native_pointer(ctx, handle as u64));
     obj_val.set_property(ctx, "size", JSValue(ffi::qjs_new_int64(ctx, 0)));
@@ -569,6 +750,28 @@ pub fn register_module_api(ctx: &JSContext) {
             js_module_load,
             1,
         );
+        add_cfunction_to_object(ctx_ptr, module_obj, "__ensureInitialized", js_module_ensure_initialized, 1);
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "__enumerateSections",
+            js_module_enumerate_sections_instance,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "__enumerateDependencies",
+            js_module_enumerate_dependencies_instance,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "__findSymbolByName",
+            js_module_find_symbol_instance,
+            2,
+        );
 
         global.set_property(ctx.as_ptr(), "Module", JSValue(module_obj));
     }
@@ -576,4 +779,9 @@ pub fn register_module_api(ctx: &JSContext) {
     global.free(ctx.as_ptr());
 
     register_process_api(ctx);
+
+    match ctx.eval(include_str!("module_boot.js"), "<module_boot>") {
+        Ok(value) => value.free(ctx.as_ptr()),
+        Err(error) => output_message(&format!("[module] bootstrap failed: {error}")),
+    }
 }

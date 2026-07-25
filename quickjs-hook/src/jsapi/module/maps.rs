@@ -51,6 +51,7 @@ pub(crate) fn find_module_base(module_name: &str) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleInfo {
     pub name: String,
+    pub version: Option<String>,
     pub base: u64,
     pub size: u64,
     pub path: String,
@@ -61,6 +62,7 @@ impl ModuleInfo {
         let name = module_basename(&path).to_string();
         Self {
             name,
+            version: None,
             base,
             size: end - base,
             path,
@@ -341,6 +343,54 @@ pub(crate) fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
     refresh_module_snapshot_cache().modules
 }
 
+/// Prefer Gum's loader-aware registry, then add mappings absent from that
+/// registry (notably this agent after hide_soinfo and synthetic modules).
+fn enumerate_process_modules() -> Vec<ModuleInfo> {
+    let mut modules = module_backend()
+        .map(|backend| {
+            (backend.enumerate_modules)()
+                .into_iter()
+                .map(|module| ModuleInfo {
+                    name: module.name,
+                    version: module.version,
+                    base: module.base,
+                    size: module.size,
+                    path: module.path,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let backend_paths = modules
+        .iter()
+        .map(|module| normalized_module_path(&module.path).to_string())
+        .collect::<HashSet<_>>();
+    for module in enumerate_executable_module_clusters_from_maps() {
+        if backend_paths.contains(normalized_module_path(&module.path)) {
+            continue;
+        }
+        if modules
+            .iter()
+            .any(|existing| existing.base == module.base && existing.path == module.path)
+        {
+            continue;
+        }
+        modules.push(module);
+    }
+
+    modules.sort_by_key(|module| module.base);
+    modules
+}
+
+fn find_process_module_by_address(addr: u64) -> Option<ModuleInfo> {
+    enumerate_process_modules().into_iter().find(|module| {
+        module
+            .base
+            .checked_add(module.size)
+            .is_some_and(|end| addr >= module.base && addr < end)
+    })
+}
+
 #[cfg(test)]
 fn find_module_by_address_in_entries(
     entries: impl IntoIterator<Item = ModuleMapEntry>,
@@ -612,6 +662,7 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
             module,
             ModuleInfo {
                 name: "libfoo.so".to_string(),
+                version: None,
                 base: 0x1000,
                 size: 0xa000,
                 path: "/tmp/libfoo.so".to_string(),
@@ -633,6 +684,7 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
             modules,
             vec![ModuleInfo {
                 name: "libfoo.so".to_string(),
+                version: None,
                 base: 0x1000,
                 size: 0x1800,
                 path: "/tmp/libfoo.so".to_string(),
@@ -673,6 +725,7 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
             clusters,
             vec![ModuleInfo {
                 name: "libfoo.so".to_string(),
+                version: None,
                 base: 0x100000000,
                 size: 0x2000,
                 path: "/tmp/libfoo.so".to_string(),

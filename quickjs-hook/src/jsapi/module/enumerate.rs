@@ -42,6 +42,174 @@ struct RangeRecord {
     path: String,
 }
 
+fn elf_module_enumerate_sections(file_path: &str, base_address: u64) -> Vec<ModuleSectionDetails> {
+    let data = match std::fs::read(normalized_module_path(file_path)) {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
+    };
+    if data.len() < std::mem::size_of::<Elf64Ehdr>() {
+        return Vec::new();
+    }
+
+    unsafe {
+        let ehdr = &*(data.as_ptr() as *const Elf64Ehdr);
+        if ehdr.e_ident[0..4] != *b"\x7fELF" || ehdr.e_ident[4] != 2 {
+            return Vec::new();
+        }
+        let Some((shdr_off, shdr_size, shnum)) = elf_section_headers_from_data(data.len(), ehdr) else {
+            return Vec::new();
+        };
+        let Some(strings) = elf_section_header_at(&data, shdr_off, shdr_size, ehdr._e_shstrndx as usize) else {
+            return Vec::new();
+        };
+        let Some(strings_off) = usize::try_from(strings.sh_offset).ok() else {
+            return Vec::new();
+        };
+        let Some(strings_size) = usize::try_from(strings.sh_size).ok() else {
+            return Vec::new();
+        };
+        let Some(strings_range) = checked_file_range(data.len(), strings_off, strings_size) else {
+            return Vec::new();
+        };
+
+        let load_bias = elf_compute_load_bias(base_address);
+        let mut sections = Vec::with_capacity(shnum);
+        for index in 0..shnum {
+            let Some(section) = elf_section_header_at(&data, shdr_off, shdr_size, index) else {
+                break;
+            };
+            let name = section_name_from_data(&data, &strings_range, section.sh_name).unwrap_or_default();
+            let id = if name.is_empty() {
+                index.to_string()
+            } else if name.starts_with('.') {
+                format!("{index}{name}")
+            } else {
+                format!("{index}.{name}")
+            };
+            let address = if section._sh_flags & SHF_ALLOC != 0 {
+                load_bias.wrapping_add(section._sh_addr)
+            } else {
+                section._sh_addr
+            };
+            sections.push(ModuleSectionDetails {
+                id,
+                name,
+                address,
+                size: section.sh_size,
+            });
+        }
+        sections
+    }
+}
+
+fn section_name_from_data(data: &[u8], strings: &std::ops::Range<usize>, offset: u32) -> Option<String> {
+    let start = strings.start.checked_add(offset as usize)?;
+    if start >= strings.end {
+        return None;
+    }
+    let bytes = &data[start..strings.end];
+    let len = bytes.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&bytes[..len]).ok().map(str::to_string)
+}
+
+unsafe fn elf_module_enumerate_dependencies(base_address: u64) -> Vec<ModuleDependencyDetails> {
+    const MAX_DYNAMIC_ENTRIES: usize = 4096;
+    if !is_addr_accessible(base_address, std::mem::size_of::<Elf64Ehdr>()) {
+        return Vec::new();
+    }
+    let ehdr = &*(base_address as *const Elf64Ehdr);
+    if ehdr.e_ident[0..4] != *b"\x7fELF" || ehdr.e_ident[4] != 2 {
+        return Vec::new();
+    }
+
+    let load_bias = elf_compute_load_bias(base_address);
+    let phnum = ehdr.e_phnum as usize;
+    let phentsize = ehdr.e_phentsize as usize;
+    if phnum == 0 || phnum > MAX_ELF_PHDRS || phentsize < std::mem::size_of::<Elf64Phdr>() {
+        return Vec::new();
+    }
+    let Some(phdr_base) = base_address.checked_add(ehdr.e_phoff) else {
+        return Vec::new();
+    };
+    let Some(phdr_bytes) = phnum.checked_mul(phentsize) else {
+        return Vec::new();
+    };
+    if !is_addr_accessible(phdr_base, phdr_bytes) {
+        return Vec::new();
+    }
+
+    let mut dynamic_address = 0u64;
+    let mut dynamic_size = 0usize;
+    for index in 0..phnum {
+        let Some(address) = checked_indexed_addr(phdr_base, index, phentsize) else {
+            return Vec::new();
+        };
+        let phdr = &*(address as *const Elf64Phdr);
+        if phdr.p_type == PT_DYNAMIC {
+            let Some(size) = usize::try_from(phdr._p_memsz).ok() else {
+                return Vec::new();
+            };
+            dynamic_address = load_bias.wrapping_add(phdr.p_vaddr);
+            dynamic_size = size;
+            break;
+        }
+    }
+    if dynamic_address == 0 || dynamic_size < std::mem::size_of::<Elf64Dyn>() {
+        return Vec::new();
+    }
+    let count = (dynamic_size / std::mem::size_of::<Elf64Dyn>()).min(MAX_DYNAMIC_ENTRIES);
+    let Some(dynamic_bytes) = count.checked_mul(std::mem::size_of::<Elf64Dyn>()) else {
+        return Vec::new();
+    };
+    if !is_addr_accessible(dynamic_address, dynamic_bytes) {
+        return Vec::new();
+    }
+
+    let entries = std::slice::from_raw_parts(dynamic_address as *const Elf64Dyn, count);
+    let mut string_table = 0u64;
+    let mut string_table_size = 0usize;
+    let mut needed = Vec::new();
+    for entry in entries {
+        match entry.d_tag {
+            DT_NULL => break,
+            DT_NEEDED => needed.push(entry.d_val as usize),
+            DT_STRTAB => string_table = dynamic_ptr(load_bias, entry.d_val),
+            DT_STRSZ => string_table_size = entry.d_val as usize,
+            _ => {}
+        }
+    }
+    if string_table == 0
+        || string_table_size == 0
+        || string_table_size > MAX_MEMORY_STRTAB_BYTES
+        || !is_addr_accessible(string_table, string_table_size)
+    {
+        return Vec::new();
+    }
+
+    let strings = std::slice::from_raw_parts(string_table as *const u8, string_table_size);
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for offset in needed {
+        if offset >= strings.len() {
+            continue;
+        }
+        let bytes = &strings[offset..];
+        let Some(len) = bytes.iter().position(|byte| *byte == 0) else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(&bytes[..len]) else {
+            continue;
+        };
+        if !name.is_empty() && seen.insert(name.to_string()) {
+            result.push(ModuleDependencyDetails {
+                name: name.to_string(),
+                kind: "regular".to_string(),
+            });
+        }
+    }
+    result
+}
+
 fn wildcard_matches(pattern: &[u8], value: &[u8]) -> bool {
     let (mut pattern_index, mut value_index) = (0, 0);
     let (mut star_index, mut star_value_index) = (None, 0);

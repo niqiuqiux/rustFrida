@@ -28,6 +28,8 @@ mod vma_name;
 mod diagnostics;
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
+#[cfg(feature = "frida-gum")]
+mod module_backend;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
 #[cfg(feature = "frida-gum")]

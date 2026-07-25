@@ -108,8 +108,10 @@ const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 const SHT_RELA: u32 = 4;
 const SHT_DYNSYM: u32 = 11;
+const SHF_ALLOC: u64 = 1 << 1;
 
 const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
 const DT_HASH: i64 = 4;
 const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;

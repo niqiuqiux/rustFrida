@@ -252,6 +252,8 @@ pub fn init() -> Result<(), String> {
     crate::stalker::install_quickjs_backend()?;
     #[cfg(feature = "frida-gum")]
     crate::diagnostics::install_quickjs_backend();
+    #[cfg(feature = "frida-gum")]
+    crate::module_backend::install_quickjs_backend();
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());

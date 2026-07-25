@@ -121,6 +121,26 @@ impl Module {
         }
     }
 
+    #[cfg(feature = "std")]
+    /// Get the version of this module, when provided by the platform.
+    pub fn version(&self) -> Option<String> {
+        unsafe {
+            let version = gum_sys::gum_module_get_version(self.inner);
+            if version.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(version).to_string_lossy().to_string())
+            }
+        }
+    }
+
+    /// Ensure that the module's initializers have run.
+    pub fn ensure_initialized(&self) {
+        unsafe {
+            gum_sys::gum_module_ensure_initialized(self.inner);
+        }
+    }
+
     /// Get the range of this module
     pub fn range(&self) -> MemoryRange {
         MemoryRange::from_raw(unsafe { gum_sys::gum_module_get_range(self.inner) })

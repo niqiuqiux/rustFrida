@@ -64,6 +64,9 @@ pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use jsapi::module::find_loaded_function_addresses;
+pub use jsapi::module::{
+    install_module_backend, ModuleBackend, ModuleDependencyDetails, ModuleDetails, ModuleIdentity, ModuleSectionDetails,
+};
 pub use jsapi::stalker::{
     clear_retired_stalker_callouts, dispatch_stalker_call_probe, dispatch_stalker_callout, dispatch_stalker_transform,
     install_stalker_backend, retire_stalker_callout, shutdown_stalker_backend, wait_for_stalker_call_probe_callbacks,

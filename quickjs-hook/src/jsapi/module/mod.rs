@@ -15,6 +15,7 @@ use crate::value::JSValue;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 
+include!("backend.rs");
 include!("types.rs");
 include!("maps.rs");
 include!("elf.rs");
