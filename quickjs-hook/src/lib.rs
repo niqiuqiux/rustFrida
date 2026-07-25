@@ -111,6 +111,42 @@ pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
 /// Best-effort owner tracking for the thread currently executing inside the global JS engine.
 /// Used by hook callbacks to distinguish same-thread reentrancy from ordinary contention.
 pub(crate) static JS_ENGINE_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
+pub(crate) static COOPERATIVE_JS_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
+pub(crate) static COOPERATIVE_JS_GATE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static COOPERATIVE_JS_CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct CooperativeJsCallbackGuard {
+    previous_owner: u64,
+}
+
+impl CooperativeJsCallbackGuard {
+    pub(crate) fn begin() -> Self {
+        let owner = JS_ENGINE_OWNER_THREAD.load(Ordering::Acquire);
+        let previous_owner = COOPERATIVE_JS_OWNER_THREAD.swap(owner, Ordering::AcqRel);
+        Self { previous_owner }
+    }
+}
+
+impl Drop for CooperativeJsCallbackGuard {
+    fn drop(&mut self) {
+        COOPERATIVE_JS_OWNER_THREAD.store(self.previous_owner, Ordering::Release);
+        let inside_callback = COOPERATIVE_JS_CALLBACK_DEPTH.with(|depth| depth.get() != 0);
+        if !inside_callback {
+            drop(COOPERATIVE_JS_GATE.lock().unwrap_or_else(|error| error.into_inner()));
+        }
+    }
+}
+
+pub(crate) fn enter_cooperative_js_callback() {
+    COOPERATIVE_JS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+}
+
+pub(crate) fn leave_cooperative_js_callback() {
+    COOPERATIVE_JS_CALLBACK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+}
 
 static RAW_CLONE_JS_THREAD_0: AtomicU64 = AtomicU64::new(0);
 static RAW_CLONE_JS_THREAD_1: AtomicU64 = AtomicU64::new(0);

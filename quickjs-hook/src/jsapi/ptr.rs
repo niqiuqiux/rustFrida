@@ -79,6 +79,10 @@ fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
     class_id
 }
 
+pub(crate) unsafe fn native_pointer_prototype(ctx: *mut ffi::JSContext) -> ffi::JSValue {
+    ffi::JS_GetClassProto(ctx, get_or_init_class_id(ctx))
+}
+
 fn create_native_pointer_with_owner(
     ctx: *mut ffi::JSContext,
     addr: u64,
@@ -129,7 +133,10 @@ fn clone_native_pointer_parts(_ctx: *mut ffi::JSContext, val: JSValue) -> Option
 
 /// Get address from NativePointer object
 pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
-    clone_native_pointer_parts(_ctx, val).map(|(addr, _)| addr)
+    clone_native_pointer_parts(_ctx, val)
+        .map(|(addr, _)| addr)
+        .or_else(|| crate::jsapi::hook_api::native_callback_address(val.raw()))
+        .or_else(|| unsafe { crate::jsapi::hook_api::native_function_address(_ctx, val.raw()) })
 }
 
 fn format_native_pointer(addr: u64) -> String {
@@ -657,6 +664,16 @@ pub fn register_ptr(ctx: &JSContext) {
         crate::jsapi::memory::register_ptr_methods(ctx_ptr, proto);
 
         // Set as class prototype
+        let ctor = ffi::JS_NewCFunction2(
+            ctx_ptr,
+            Some(js_ptr),
+            b"NativePointer\0".as_ptr() as *const _,
+            1,
+            ffi::JSCFunctionEnum_JS_CFUNC_constructor_or_func,
+            0,
+        );
+        ffi::JS_SetConstructor(ctx_ptr, ctor, proto);
+        global.set_property(ctx_ptr, "NativePointer", JSValue(ctor));
         ffi::JS_SetClassProto(ctx_ptr, class_id, proto);
 
         global.set_property(ctx_ptr, "NULL", create_native_pointer(ctx_ptr, 0));

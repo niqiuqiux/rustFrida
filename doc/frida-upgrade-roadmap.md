@@ -1,8 +1,8 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00、Goal 01 和 Goal 02 已完成）
+> 状态：执行中（Goal 00 至 Goal 04 已完成）
 >
-> 更新日期：2026-07-25
+> 更新日期：2026-07-26
 >
 > 目标平台：Android ARM64
 >
@@ -67,10 +67,10 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 | 领域 | 当前 rustFrida | 最新 GumJS | 状态 | 优先级 |
 | --- | --- | --- | --- | --- |
-| 核心运行时 | QuickJS、`console`、HTTP `rpc.exports` | `Frida`、`Script`、`send/recv`、timer、`gc`、`Worker`、`hexdump` | 部分 | P1/P2 |
+| 核心运行时 | QuickJS、`console`、`gc`、HTTP `rpc.exports` | `Frida`、`Script`、`send/recv`、timer、`gc`、`Worker`、`hexdump` | 部分 | P1/P2 |
 | 数值与指针 | `ptr`、`NULL`、NativePointer 大部分运算和读写 | 另有 `Int64`、`UInt64`、pointer sign/blend、`ArrayBuffer.wrap/unwrap` | 部分 | P1 |
-| Native 调用 | ARM64 `NativeFunction`，标量/指针/浮点和栈参数 | 另有 ABI/options、struct、variadic、`SystemFunction` | 部分 | P1 |
-| Native callback | CModule 函数指针可用于高频 callback | 通用 `NativeCallback` | 缺失 | P0/P1 |
+| Native 调用 | ARM64 `NativeFunction`、`SystemFunction`，支持 ABI/options、variadic、嵌套 struct | 同名 API | 已有 | P1 |
+| Native callback | 通用 `NativeCallback`；CModule 函数指针继续用于高频 callback | 通用 `NativeCallback` | 已有/扩展 | P0/P1 |
 | Memory | 同步读写、分配、protect、copy/dup、scanSync、queryProtection、stealth patch | 另有 alloc options、patchCode、异步 scan、findPointers、MemoryAccessMonitor | 部分 | P1 |
 | Module | 实例 API、ModuleMap、sections/dependencies/ensureInitialized/findSymbol；保留旧式静态入口 | 最新实例 API；旧式静态入口已由上游移除 | 已有/扩展 | P1 |
 | Process | 基本属性、模块/范围/线程枚举和目录查询、module/thread observer | 另有 findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
@@ -88,7 +88,8 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 - NativePointer 的基础算术、比较、格式化和常用内存读写。
 - Memory 的同步访问、UTF-8/UTF-16、保护查询、同步 pattern scan。
-- ARM64 NativeFunction 的常见标量调用。
+- ARM64 NativeFunction/SystemFunction 的标量、variadic、嵌套 struct、options 与 system error 语义。
+- NativeCallback 的跨线程 JS 调度、重入、errno、GC ownership 和 reload retirement。
 - Module 实例/ModuleMap、全局导出查询以及 module/thread observer 生命周期。
 - Int64/UInt64、DebugSymbol、Thread.backtrace、Backtracer、Instruction 和 module ApiResolver。
 - Interceptor 双阶段回调、CModule native callback 和自研 stealth 模式。
@@ -97,10 +98,9 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
-1. 缺少 `NativeCallback`，导致大量标准 `Interceptor.replace()`、C API callback 和 Stalker callback 脚本必须改写成 CModule。
-2. Stalker transform 只能遍历、keep、callout 和 chaining return，不能调用 ARM64 writer 发射或替换指令。
-3. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
-4. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
+1. Stalker transform 只能遍历、keep、callout 和 chaining return，不能调用 ARM64 writer 发射或替换指令。
+2. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
+3. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
 
 ## 5. 架构与稳定性风险
 
@@ -271,6 +271,17 @@ cargo build --offline --release --target aarch64-linux-android
 - memfd、隐藏 soinfo、同名模块的行为有设备测试。
 
 ### Goal 04：通用 NativeCallback 与完整调用 ABI（P0/P1）
+
+状态：**已完成（2026-07-26）**。
+
+落地证据：
+
+- 默认 agent 构建启用 Frida FFI closure；`NativeFunction`、`SystemFunction` 和 `NativeCallback` 均保持最新版 NativePointer 子类形状，支持 `call/apply` receiver override、`default/sysv` ABI 与 scheduling/exceptions/traps options。
+- NativeFunction/SystemFunction 支持标量、浮点、栈溢出、C variadic 默认提升、小型及嵌套大型 struct-by-value；SystemFunction 返回 `{value, errno}`，`exceptions: "steal"` 将 native fault 转为结构化 JavaScript 异常。
+- NativeCallback 支持标量及嵌套 struct 参数/返回值、任意 native 线程同步进入 JS、callback 内重入 NativeFunction、`this.errno`/`returnAddress`，并可直接用于 `Interceptor.replace()` 与 Stalker 原生 callback 位置。
+- callback root 由 native 注册点持有；reload/shutdown 按切断入口、等待 in-flight、释放 JS 引用的顺序清理。由于无法证明外部 native 代码已丢弃旧函数指针，可执行 closure 退休到进程结束；旧指针稳定返回零，不再访问已销毁的 QuickJS runtime。
+- `tests/device/run_goal04_native_abi.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成两轮 `%reload` 和最终 shutdown，覆盖 GPR/FPR、栈参数、pthread callback、errno、variadic、struct、options/fault、重入、Interceptor replace/revert、native/Stalker 持有 callback 后的显式 GC，以及 reload 后旧 callback retirement；目标进程存活且没有新增 tombstone。
+- 无 FFI 的标量 fallback 编译、agent/rustfrida release 构建、兼容 surface、JavaScript/Python 语法和 rustfmt 检查均纳入回归。
 
 目标：让标准 Frida native callback 脚本不再依赖 CModule 改写。
 

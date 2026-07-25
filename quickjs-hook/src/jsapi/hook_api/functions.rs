@@ -10,6 +10,7 @@ use crate::jsapi::callback_util::{
 use crate::jsapi::ptr::create_native_pointer;
 use crate::jsapi::stalker::with_stalker_native_call;
 use crate::jsapi::util::is_addr_accessible;
+use crate::runtime::SuspendedRuntime;
 use crate::value::JSValue;
 
 use super::callback::{
@@ -196,6 +197,85 @@ unsafe fn install_hook(
     });
 
     JSValue::bool(true).raw()
+}
+
+unsafe fn install_native_replacement(
+    ctx: *mut ffi::JSContext,
+    target: u64,
+    replacement: u64,
+    mode: StealthMode,
+) -> Result<u64, ffi::JSValue> {
+    init_registry();
+
+    if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&target)).flatten() {
+        super::remove_single_hook(target, &old_data);
+        if old_data.kind == HookKind::Interceptor
+            || super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20))
+        {
+            super::free_hook_callback(target, &old_data);
+        }
+    }
+
+    let (hook_addr, recomp_addr) = match mode {
+        StealthMode::Recomp => {
+            if let Err(error) = crate::recomp::ensure_and_translate(target as usize) {
+                return Err(throw_internal_error(
+                    ctx,
+                    &format!("Interceptor.replace(recomp): {error}"),
+                ));
+            }
+            match crate::recomp::alloc_trampoline_slot(target as usize) {
+                Ok(slot) => (slot as u64, slot as u64),
+                Err(error) => {
+                    return Err(throw_internal_error(
+                        ctx,
+                        &format!("Interceptor.replace(recomp slot): {error}"),
+                    ))
+                }
+            }
+        }
+        _ => (target, 0),
+    };
+    let stealth = i32::from(mode == StealthMode::WxShadow);
+    let trampoline = hook_ffi::hook_install(
+        hook_addr as *mut std::ffi::c_void,
+        replacement as *mut std::ffi::c_void,
+        stealth,
+    );
+    if trampoline.is_null() {
+        return Err(throw_internal_error(
+            ctx,
+            "Interceptor.replace: native replacement installation failed",
+        ));
+    }
+    if mode == StealthMode::Recomp {
+        if let Err(error) = finalize_recomp_hook_slot(hook_addr, target, trampoline) {
+            hook_ffi::hook_remove(hook_addr as *mut std::ffi::c_void);
+            return Err(throw_internal_error(
+                ctx,
+                &format!("Interceptor.replace(recomp): {error}"),
+            ));
+        }
+    }
+
+    with_registry_mut(&HOOK_REGISTRY, |registry| {
+        registry.insert(
+            target,
+            HookData {
+                ctx: ctx as usize,
+                callback_bytes: [0; 16],
+                on_leave_bytes: [0; 16],
+                has_on_enter: false,
+                has_on_leave: false,
+                trampoline: trampoline as u64,
+                kind: HookKind::Replace,
+                mode,
+                recomp_addr,
+                native_attach_data: 0,
+            },
+        );
+    });
+    Ok(trampoline as u64)
 }
 
 /// unhook(ptr) - Remove a hook at the given address
@@ -650,6 +730,29 @@ enum NativeCallResult {
     Float32(f32),
 }
 
+#[cfg(target_os = "android")]
+extern "C" {
+    #[link_name = "__errno"]
+    fn native_call_errno_location() -> *mut i32;
+}
+
+#[cfg(all(not(target_os = "android"), target_os = "linux"))]
+extern "C" {
+    #[link_name = "__errno_location"]
+    fn native_call_errno_location() -> *mut i32;
+}
+
+unsafe fn native_call_system_error() -> i32 {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        *native_call_errno_location()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        0
+    }
+}
+
 impl NativeRetKind {
     fn from_i32(v: i32) -> Option<Self> {
         match v {
@@ -699,7 +802,7 @@ extern "C" {
     ) -> f32;
 }
 
-/// __nativeCall(addr, retKind, gpr[], fpr[], fprFloatMask, stk[])
+/// __nativeCall(addr, retKind, gpr[], fpr[], fprFloatMask, stk[], captureSystemError?, activateTraps?)
 ///
 /// - addr: NativePointer / number
 /// - retKind: 0=void, 1=int, 2=double, 3=float32
@@ -821,29 +924,43 @@ pub(crate) unsafe extern "C" fn js_native_call(
     let fn_ptr = addr as *const std::ffi::c_void;
     let stk_ptr = stk.as_ptr();
 
-    let result = match with_stalker_native_call(ctx, addr, || match kind {
-        NativeRetKind::Void => {
-            native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            NativeCallResult::Void
-        }
-        NativeRetKind::Int => {
-            NativeCallResult::Int(native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len))
-        }
-        NativeRetKind::Double => NativeCallResult::Double(native_call_shim_f64(
-            fn_ptr,
-            gpr.as_ptr(),
-            fpr.as_ptr(),
-            stk_ptr,
-            stk_len,
-        )),
-        NativeRetKind::Float32 => NativeCallResult::Float32(native_call_shim_f32(
-            fn_ptr,
-            gpr.as_ptr(),
-            fpr.as_ptr(),
-            stk_ptr,
-            stk_len,
-        )),
-    }) {
+    let capture_system_error = argc >= 7 && JSValue(*argv.add(6)).to_bool() == Some(true);
+    let activate_traps = argc < 8 || JSValue(*argv.add(7)).to_bool() != Some(false);
+    let operation = || {
+        let result = match kind {
+            NativeRetKind::Void => {
+                native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+                NativeCallResult::Void
+            }
+            NativeRetKind::Int => {
+                NativeCallResult::Int(native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len))
+            }
+            NativeRetKind::Double => NativeCallResult::Double(native_call_shim_f64(
+                fn_ptr,
+                gpr.as_ptr(),
+                fpr.as_ptr(),
+                stk_ptr,
+                stk_len,
+            )),
+            NativeRetKind::Float32 => NativeCallResult::Float32(native_call_shim_f32(
+                fn_ptr,
+                gpr.as_ptr(),
+                fpr.as_ptr(),
+                stk_ptr,
+                stk_len,
+            )),
+        };
+        (result, native_call_system_error())
+    };
+    let call_result = if activate_traps {
+        with_stalker_native_call(ctx, addr, operation)
+    } else {
+        let mut suspended = SuspendedRuntime::suspend_cooperatively(ctx);
+        let result = operation();
+        suspended.resume();
+        Ok(result)
+    };
+    let (result, system_error) = match call_result {
         Ok(result) => result,
         Err(error) => return throw_internal_error(ctx, &format!("NativeFunction: {error}")),
     };
@@ -855,7 +972,14 @@ pub(crate) unsafe extern "C" fn js_native_call(
         NativeCallResult::Float32(value) => ffi::qjs_new_float64(ctx, value as f64),
     };
     crate::jsapi::module::drain_process_observer_events(ctx);
-    result
+    if capture_system_error {
+        let wrapper = ffi::JS_NewObject(ctx);
+        JSValue(wrapper).set_property(ctx, "value", JSValue(result));
+        JSValue(wrapper).set_property(ctx, "errno", JSValue(ffi::qjs_new_int64(ctx, system_error as i64)));
+        wrapper
+    } else {
+        result
+    }
 }
 
 /// diagAllocNear(addr) - 诊断 hook_alloc_near 对指定地址的有效性
@@ -1137,6 +1261,22 @@ pub(crate) unsafe extern "C" fn js_interceptor_replace(
     } else {
         StealthMode::Normal
     };
+    let target = match extract_pointer_address(ctx, ptr_arg, "Interceptor.replace") {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    if !is_executable_hook_target(target) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.replace: target address is not executable\0".as_ptr() as *const _,
+        );
+    }
+    if let Some(replacement) = super::native_callback_address(replacement_arg.raw()) {
+        return match install_native_replacement(ctx, target, replacement, mode) {
+            Ok(_) => JSValue::undefined().raw(),
+            Err(error) => error,
+        };
+    }
     let result = install_hook(ctx, ptr_arg, replacement_arg, mode);
     if ffi::qjs_is_exception(result) != 0 {
         return result;

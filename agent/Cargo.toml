@@ -6,7 +6,7 @@ description = "Frida agent for ARM64 Android"
 
 [features]
 default = ["quickjs", "frida-gum"]
-frida-gum = ["dep:frida-gum", "dep:frida-gum-sys", "quickjs"]
+frida-gum = ["dep:frida-gum", "dep:frida-gum-sys", "quickjs", "quickjs-hook/frida-ffi"]
 qbdi = ["quickjs-hook?/qbdi"]
 quickjs = ["dep:quickjs-hook"]
 

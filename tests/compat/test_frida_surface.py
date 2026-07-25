@@ -103,6 +103,27 @@ Object.defineProperties(globalThis, {
             ["runOnThread", "exception handler"],
         )
 
+    def test_goal04_native_abi_surface_is_pinned(self):
+        spec = frida_surface.load_json(frida_surface.SPEC_PATH)
+        globals_by_name = {entry["name"]: entry for entry in spec["globals"]}
+        probes_by_path = {entry["path"]: entry for entry in spec["probes"]}
+        areas_by_name = {entry["area"]: entry for entry in spec["compatibilityAreas"]}
+
+        for name in {"gc", "NativeFunction", "NativeCallback", "SystemFunction"}:
+            self.assertEqual(globals_by_name[name]["type"], "function")
+            self.assertEqual(globals_by_name[name]["classification"], "compatible")
+
+        for path in {
+            "gc",
+            "NativeFunction.prototype.call",
+            "NativeCallback.prototype.isNull",
+            "SystemFunction.prototype.apply",
+        }:
+            self.assertEqual(probes_by_path[path]["type"], "function")
+
+        self.assertEqual(areas_by_name["Native ABI"]["status"], "compatible")
+        self.assertEqual(areas_by_name["Native ABI"]["missing"], [])
+
     @unittest.skipUnless(FRIDA_SOURCE.exists(), "local Frida source checkout is unavailable")
     def test_extracts_arm64_generated_writer_surface(self):
         baseline = frida_surface.build_baseline(FRIDA_SOURCE)

@@ -206,12 +206,21 @@ pub(crate) enum JsEngineCallbackGuard {
         _guard: MutexGuard<'static, Option<JSEngine>>,
     },
     Reentrant,
+    Cooperative {
+        _guard: MutexGuard<'static, ()>,
+        previous_owner: u64,
+    },
 }
 
 impl Drop for JsEngineCallbackGuard {
     fn drop(&mut self) {
-        if matches!(self, JsEngineCallbackGuard::Locked { .. }) {
-            crate::clear_js_engine_owner_current_thread();
+        match self {
+            JsEngineCallbackGuard::Locked { .. } => crate::clear_js_engine_owner_current_thread(),
+            JsEngineCallbackGuard::Cooperative { previous_owner, .. } => {
+                crate::leave_cooperative_js_callback();
+                crate::JS_ENGINE_OWNER_THREAD.store(*previous_owner, Ordering::Release);
+            }
+            JsEngineCallbackGuard::Reentrant => {}
         }
     }
 }
@@ -232,6 +241,22 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == current_thread {
         ffi::qjs_update_stack_top(ctx);
         return Some(JsEngineCallbackGuard::Reentrant);
+    }
+
+    if crate::COOPERATIVE_JS_OWNER_THREAD.load(Ordering::Acquire) != 0 {
+        let guard = crate::COOPERATIVE_JS_GATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if crate::COOPERATIVE_JS_OWNER_THREAD.load(Ordering::Acquire) != 0 {
+            let previous_owner = crate::JS_ENGINE_OWNER_THREAD.swap(current_thread, Ordering::AcqRel);
+            crate::enter_cooperative_js_callback();
+            ffi::qjs_update_stack_top(ctx);
+            return Some(JsEngineCallbackGuard::Cooperative {
+                _guard: guard,
+                previous_owner,
+            });
+        }
+        drop(guard);
     }
 
     let g = match crate::JS_ENGINE.lock() {

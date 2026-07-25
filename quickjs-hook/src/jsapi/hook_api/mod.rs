@@ -3,6 +3,9 @@
 mod callback;
 mod cmodule;
 mod functions;
+mod native_callback;
+#[cfg(feature = "frida-ffi")]
+mod native_ffi;
 #[cfg(feature = "qbdi")]
 mod qbdi;
 mod registry;
@@ -48,7 +51,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), g, "recompHook", js_recomp_hook, 2);
         add_cfunction_to_object(ctx.as_ptr(), g, "diagAllocNear", js_diag_alloc_near, 1);
         // __nativeCall: 底层 shim，由 JS 侧的 NativeFunction wrapper 调用
-        add_cfunction_to_object(ctx.as_ptr(), g, "__nativeCall", js_native_call, 6);
+        add_cfunction_to_object(ctx.as_ptr(), g, "__nativeCall", js_native_call, 8);
 
         // Hook.NORMAL = 0, Hook.WXSHADOW = 1, Hook.RECOMP = 2
         let hook_obj = ffi::JS_NewObject(ctx.as_ptr());
@@ -67,6 +70,9 @@ pub fn register_hook_api(ctx: &JSContext) {
         global.set_property(ctx.as_ptr(), "Interceptor", crate::value::JSValue(interceptor));
 
         cmodule::register_cmodule_api(ctx.as_ptr(), g);
+        native_callback::register_native_callback_api(ctx.as_ptr(), g);
+        #[cfg(feature = "frida-ffi")]
+        native_ffi::register_native_ffi_api(ctx.as_ptr(), g);
     }
 
     #[cfg(feature = "qbdi")]
@@ -226,6 +232,7 @@ pub(crate) unsafe fn free_hook_callback(addr: u64, data: &registry::HookData) {
 /// Phase 1 - 切断 native hook 入口 (hook() JS API 装的所有 hook，不释放 callback)。
 /// 注册表条目不 take，保留到 `free_native_hooks` 再批量释放 JS callback。
 pub fn cut_native_hooks() {
+    native_callback::cut_native_callbacks();
     let hooks = {
         let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         guard
@@ -256,6 +263,23 @@ pub fn free_native_hooks() {
         free_interceptor_listeners(&orphaned_listeners);
     }
     free_retired_native_hooks();
+    native_callback::free_native_callbacks();
+}
+
+pub(crate) use native_callback::native_callback_address;
+pub(crate) use native_callback::wait_for_in_flight_native_callbacks;
+
+pub(crate) unsafe fn native_function_address(ctx: *mut ffi::JSContext, value: ffi::JSValue) -> Option<u64> {
+    if ffi::JS_IsFunction(ctx, value) == 0 {
+        return None;
+    }
+    let address = ffi::JS_GetPropertyStr(ctx, value, c"__rfNativeFunctionAddress".as_ptr());
+    if ffi::qjs_is_exception(address) != 0 {
+        return None;
+    }
+    let result = crate::value::JSValue(address).to_u64(ctx);
+    ffi::qjs_free_value(ctx, address);
+    result
 }
 
 /// 兼容旧调用: 依次 cut → 本地 200ms 小 drain → free。
@@ -267,6 +291,9 @@ pub fn cleanup_hooks() {
             "[hook cleanup] waiting for in-flight callbacks timed out, remaining={}",
             in_flight_native_hook_callbacks()
         ));
+    }
+    if !wait_for_in_flight_native_callbacks(std::time::Duration::from_millis(200)) {
+        crate::jsapi::console::output_message("[hook cleanup] waiting for in-flight NativeCallback calls timed out");
     }
     free_native_hooks();
 }

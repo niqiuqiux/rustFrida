@@ -106,8 +106,9 @@ fn main() {
     }
 
     // Compile hook_engine.c, arm64_writer.c, arm64_relocator.c,
-    // 以及 native_call.S (AAPCS64 变参调用 shim)
-    cc::Build::new()
+    // 以及 NativeFunction / NativeCallback 的 AAPCS64 shim
+    let mut hook_engine = cc::Build::new();
+    hook_engine
         .file(src_path.join("hook_engine.c"))
         .file(src_path.join("hook_engine_mem.c"))
         .file(src_path.join("hook_engine_inline.c"))
@@ -118,13 +119,17 @@ fn main() {
         .file(src_path.join("arm64_relocator.c"))
         .file(src_path.join("recomp/recomp_page.c"))
         .file(src_path.join("native_call.S"))
+        .file(src_path.join("native_callback.S"))
         .include(&src_path)
         .include(src_path.join("recomp"))
         .opt_level(2)
         .flag("-fPIC")
         .flag("-fno-exceptions")
-        .warnings(false)
-        .compile("hook_engine");
+        .warnings(false);
+    if env::var_os("CARGO_FEATURE_FRIDA_FFI").is_some() {
+        hook_engine.file(src_path.join("native_ffi.c"));
+    }
+    hook_engine.compile("hook_engine");
 
     // Compile QuickJS sources
     let quickjs_src = PathBuf::from(&manifest_dir).join("quickjs-src");
@@ -267,6 +272,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/recomp/recomp_page.c");
     println!("cargo:rerun-if-changed=src/recomp/recomp_page.h");
     println!("cargo:rerun-if-changed=src/native_call.S");
+    println!("cargo:rerun-if-changed=src/native_callback.S");
+    println!("cargo:rerun-if-changed=src/native_ffi.c");
     println!("cargo:rerun-if-changed=quickjs-src/VERSION");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.c");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.h");

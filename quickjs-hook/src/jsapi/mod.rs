@@ -30,9 +30,27 @@ pub use rpc::register_rpc;
 pub use stalker::register_stalker_api;
 
 use crate::context::JSContext;
+use crate::ffi;
+use crate::jsapi::util::add_cfunction_to_object;
+use crate::value::JSValue;
+
+unsafe extern "C" fn js_gc(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    ffi::JS_RunGC(ffi::JS_GetRuntime(ctx));
+    JSValue::undefined().raw()
+}
 
 /// Register all JavaScript APIs
 pub fn register_all_apis(ctx: &JSContext) {
+    let global = ctx.global_object();
+    unsafe {
+        add_cfunction_to_object(ctx.as_ptr(), global.raw(), "gc", js_gc, 0);
+    }
+    global.free(ctx.as_ptr());
     register_console(ctx);
     register_file_api(ctx);
     register_ptr(ctx);

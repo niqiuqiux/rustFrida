@@ -3,6 +3,7 @@
   "baselineRevision": "c7daef081b7965ce7e578e16b134a21a168d7646",
   "documentedGlobals": [
     "console",
+    "gc",
     "ptr",
     "Int64",
     "UInt64",
@@ -19,6 +20,8 @@
     "Stalker",
     "CModule",
     "NativeFunction",
+    "NativeCallback",
+    "SystemFunction",
     "hook",
     "hookNative",
     "attachNative",
@@ -30,6 +33,7 @@
   ],
   "globals": [
     { "name": "console", "type": "object", "classification": "compatible" },
+    { "name": "gc", "type": "function", "classification": "compatible" },
     { "name": "ptr", "type": "function", "classification": "compatible" },
     { "name": "NULL", "type": "object", "classification": "compatible" },
     { "name": "Int64", "type": "function", "classification": "compatible" },
@@ -47,7 +51,9 @@
     { "name": "Interceptor", "type": "object", "classification": "partial" },
     { "name": "Stalker", "type": "object", "classification": "partial" },
     { "name": "CModule", "type": "function", "classification": "partial" },
-    { "name": "NativeFunction", "type": "function", "classification": "partial" },
+    { "name": "NativeFunction", "type": "function", "classification": "compatible" },
+    { "name": "NativeCallback", "type": "function", "classification": "compatible" },
+    { "name": "SystemFunction", "type": "function", "classification": "compatible" },
     { "name": "hook", "type": "function", "classification": "extension" },
     { "name": "hookNative", "type": "function", "classification": "extension" },
     { "name": "attachNative", "type": "function", "classification": "extension" },
@@ -63,6 +69,7 @@
   ],
   "probes": [
     { "path": "console.log", "type": "function" },
+    { "path": "gc", "type": "function" },
     { "path": "NULL.isNull", "type": "function" },
     { "path": "Int64.prototype.add", "type": "function" },
     { "path": "UInt64.prototype.toJSON", "type": "function" },
@@ -104,6 +111,9 @@
     { "path": "Interceptor.replace", "type": "function" },
     { "path": "Interceptor.revert", "type": "function" },
     { "path": "Interceptor.flush", "type": "function" },
+    { "path": "NativeFunction.prototype.call", "type": "function" },
+    { "path": "NativeCallback.prototype.isNull", "type": "function" },
+    { "path": "SystemFunction.prototype.apply", "type": "function" },
     { "path": "Stalker.supported", "type": "boolean" },
     { "path": "Stalker.follow", "type": "function" },
     { "path": "Stalker.addCallProbe", "type": "function" },
@@ -126,9 +136,9 @@
     },
     {
       "area": "Native ABI",
-      "status": "partial",
+      "status": "compatible",
       "goal": "04",
-      "missing": ["NativeCallback", "SystemFunction", "variadic", "struct-by-value", "options"]
+      "missing": []
     },
     {
       "area": "Diagnostics",

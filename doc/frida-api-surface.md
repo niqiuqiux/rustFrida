@@ -23,6 +23,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Name | Expected type | Classification |
 | --- | --- | --- |
 | `console` | `object` | compatible |
+| `gc` | `function` | compatible |
 | `ptr` | `function` | compatible |
 | `NULL` | `object` | compatible |
 | `Int64` | `function` | compatible |
@@ -40,7 +41,9 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `Interceptor` | `object` | partial |
 | `Stalker` | `object` | partial |
 | `CModule` | `function` | partial |
-| `NativeFunction` | `function` | partial |
+| `NativeFunction` | `function` | compatible |
+| `NativeCallback` | `function` | compatible |
+| `SystemFunction` | `function` | compatible |
 | `hook` | `function` | extension |
 | `hookNative` | `function` | extension |
 | `attachNative` | `function` | extension |
@@ -57,7 +60,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Area | Status | Roadmap goal | Missing upstream surface |
 | --- | --- | --- | --- |
 | Core runtime | partial | Goal 07 | `Frida`, `Script`, `send`, `recv`, `timers`, `Worker`, `hexdump` |
-| Native ABI | partial | Goal 04 | `NativeCallback`, `SystemFunction`, `variadic`, `struct-by-value`, `options` |
+| Native ABI | compatible | Goal 04 |  |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
 | Memory | partial | Goal 06 | `patchCode`, `async scan`, `findPointers`, `MemoryAccessMonitor`, `alloc options` |

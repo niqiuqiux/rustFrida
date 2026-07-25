@@ -620,13 +620,17 @@ pub(crate) fn process_pending_stalker() -> Result<(), String> {
 }
 
 struct NativeCallStalkerScope {
-    runtime: SuspendedRuntime,
+    runtime: Option<SuspendedRuntime>,
     activated: bool,
 }
 
 impl NativeCallStalkerScope {
-    unsafe fn enter(ctx: *mut ffi::JSContext, target: u64) -> Result<Self, String> {
-        let runtime = SuspendedRuntime::suspend(ctx);
+    unsafe fn enter(ctx: *mut ffi::JSContext, target: u64, cooperative: bool) -> Result<Self, String> {
+        let runtime = if cooperative {
+            Some(SuspendedRuntime::suspend_cooperatively(ctx))
+        } else {
+            None
+        };
         process_pending_stalker()?;
         let activated = match backend() {
             Some(backend) => (backend.activate_current)(target)?,
@@ -645,7 +649,9 @@ impl NativeCallStalkerScope {
             Ok(())
         };
         self.activated = false;
-        self.runtime.resume();
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.resume();
+        }
         result
     }
 }
@@ -666,10 +672,33 @@ pub(crate) unsafe fn with_stalker_native_call<R>(
     target: u64,
     operation: impl FnOnce() -> R,
 ) -> Result<R, String> {
-    let scope = NativeCallStalkerScope::enter(ctx, target)?;
+    let scope = NativeCallStalkerScope::enter(ctx, target, true)?;
     let result = operation();
     scope.finish()?;
     Ok(result)
+}
+
+pub(crate) unsafe fn with_native_call_context<R>(
+    ctx: *mut ffi::JSContext,
+    target: u64,
+    cooperative: bool,
+    activate_stalker: bool,
+    operation: impl FnOnce() -> R,
+) -> Result<R, String> {
+    if activate_stalker {
+        let scope = NativeCallStalkerScope::enter(ctx, target, cooperative)?;
+        let result = operation();
+        scope.finish()?;
+        return Ok(result);
+    }
+    if cooperative {
+        let mut runtime = SuspendedRuntime::suspend_cooperatively(ctx);
+        let result = operation();
+        runtime.resume();
+        Ok(result)
+    } else {
+        Ok(operation())
+    }
 }
 
 unsafe fn backend_or_throw(ctx: *mut ffi::JSContext) -> Result<StalkerBackend, ffi::JSValue> {

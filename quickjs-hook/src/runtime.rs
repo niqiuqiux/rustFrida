@@ -88,6 +88,7 @@ pub(crate) struct SuspendedRuntime {
     runtime: *mut ffi::JSRuntime,
     state: AlignedThreadState,
     suspended: bool,
+    cooperative: Option<crate::CooperativeJsCallbackGuard>,
 }
 
 impl SuspendedRuntime {
@@ -100,11 +101,19 @@ impl SuspendedRuntime {
             runtime,
             state,
             suspended: true,
+            cooperative: None,
         }
+    }
+
+    pub(crate) unsafe fn suspend_cooperatively(ctx: *mut ffi::JSContext) -> Self {
+        let mut runtime = Self::suspend(ctx);
+        runtime.cooperative = Some(crate::CooperativeJsCallbackGuard::begin());
+        runtime
     }
 
     pub(crate) unsafe fn resume(&mut self) {
         if self.suspended {
+            self.cooperative.take();
             ffi::JS_Resume(self.runtime, self.state.0.as_ptr());
             self.suspended = false;
         }

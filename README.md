@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -634,9 +634,9 @@ unhook(Module.findExportByName("libc.so", "open"));
 var pid = callNative(Module.findExportByName("libc.so", "getpid"));
 ```
 
-### NativeFunction（任意签名调用）
+### NativeFunction / SystemFunction / NativeCallback
 
-Frida 兼容 API，任意参数数量（寄存器用完自动栈溢出，上限 256 个栈参数）。
+默认 agent 构建启用 Frida FFI，提供 Frida 兼容的 `NativeFunction`、`SystemFunction` 和 `NativeCallback`。三者都是 `NativePointer` 子类；`NativeFunction`/`SystemFunction` 还是可调用对象，并支持 `call()` / `apply()` 通过 receiver 临时覆盖调用地址。
 
 ```js
 var open = new NativeFunction(
@@ -652,11 +652,43 @@ var atan2 = new NativeFunction(
     ["double", "double"]
 );
 atan2(1.0, 2.0);
+
+var openWithErrno = new SystemFunction(
+    Module.findExportByName("libc.so", "open"),
+    "int",
+    ["pointer", "int"]
+);
+var result = openWithErrno(Memory.allocUtf8String("/missing"), 0);
+console.log(result.value, result.errno);
 ```
 
 **支持的类型**：`void`, `bool`, `char`/`uchar`, `int8`/`uint8`, `short`/`ushort`, `int16`/`uint16`, `int`/`uint`, `int32`/`uint32`, `long`/`ulong` (64-bit), `int64`/`uint64`, `size_t`/`ssize_t`, `pointer`, `float`, `double`。
 
-AAPCS64 调用约定：整数/指针先填 x0-x7，浮点先填 d0-d7（两队列独立），超出部分自动压栈。不支持 struct-by-value。
+结构体按 Frida 的嵌套数组类型描述，例如 `["int32", "int32"]`；参数和返回值均支持 struct-by-value。变参签名使用 `"..."` 分隔固定参数和变参类型，小整数与 `float` 会按 C 默认规则提升：
+
+```js
+var Pair = ["int32", "int32"];
+var transformPair = new NativeFunction(address, Pair, [Pair, "int32"]);
+var pair = transformPair([10, 20], 3);
+
+var sum = new NativeFunction(sumAddress, "double", ["int", "...", "float"]);
+sum(2, 1.25, 2.5);
+```
+
+第四个参数接受 ABI 字符串或 options：Android ARM64 支持 `abi: "default" | "sysv"`、`scheduling: "cooperative" | "exclusive"`、`exceptions: "steal" | "propagate"` 和 `traps: "default" | "none" | "all"`。`SystemFunction` 使用同样的签名和 options，但返回 `{ value, errno }`；`exceptions: "steal"` 会把 native fault 转成带 `type/address/memory` 的 JavaScript 异常。
+
+`NativeCallback` 将 JavaScript 函数变成可传给 C API、`Interceptor.replace()` 或 Stalker 原生 callback 位置的函数指针：
+
+```js
+var compare = new NativeCallback(function(left, right) {
+    console.log(this.returnAddress, this.errno);
+    return left - right;
+}, "int", ["int", "int"], "sysv");
+```
+
+callback 可从任意 native 线程同步进入 JS，并允许在 callback 内重入 `NativeFunction`。`this.errno` 可读写当前线程的 system error，`this.returnAddress` 是调用方地址。native 注册点会持有 callback root，因此 JavaScript GC 不会提前释放 thunk；reload/shutdown 会先切断入口并等待 in-flight 调用，再释放 JS 引用。为避免 native 端保存旧函数指针后发生 UAF，可执行 closure 会退休到进程结束，退休后的旧指针只返回零且不会再次进入 JS。`gc()` 可显式触发当前 QuickJS runtime 的垃圾回收。
+
+仅直接构建未启用 `frida-ffi` feature 的 `quickjs-hook` 时，使用 ARM64 标量 fallback：整数/指针填 x0-x7、浮点填 d0-d7，溢出参数走栈；该 fallback 不支持 struct、variadic 和高级 options。
 
 
 ### CModule 和 native C callback
@@ -866,7 +898,10 @@ cd /home/qiu/Android/kernel_hook/wxshadow
 | `attachNative(target, callbackPtr, data?, stealth?)` | `AddressLike, NativePointer, AddressLike?, number?` | `boolean` |
 | `attachNative(target, {onEnter?, onLeave?, data?, mode?})` | `AddressLike, Object` | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, ...AddressLike` (最多6个) | `number \| bigint` |
-| `new NativeFunction(addr, retType, argTypes)` | `AddressLike, string, string[]` | `Function` (可调用，任意签名) |
+| `new NativeFunction(addr, retType, argTypes, options?)` | `AddressLike, NativeType, NativeType[], object?` | `NativePointer & Function` |
+| `new SystemFunction(addr, retType, argTypes, options?)` | `AddressLike, NativeType, NativeType[], object?` | 返回 `{value, errno}` 的可调用指针 |
+| `new NativeCallback(fn, retType, argTypes, abi?)` | `Function, NativeType, NativeType[], string?` | `NativePointer` callback thunk |
+| `gc()` | — | `undefined` |
 | `diagAllocNear(addr)` | `AddressLike` | `undefined` |
 
 ---
@@ -1816,7 +1851,7 @@ JavaScript callout 在被跟踪线程同步执行，接收实时可读写的 ARM
 
 `%reload` 会先停止 Stalker 并注销当前脚本的模块观察器，但保留进程级 Gum/GLib runtime；新脚本初始化时重新注册观察器。只有 agent 最终退出时才释放 Gum，避免同一进程内重复初始化 Frida 的 startup callbacks。
 
-与 Frida 17.15.5 的当前主要差异：transform 尚未暴露 ARM64 writer 方法，项目也尚未提供通用 `NativeCallback` 构造器。`putCallout()`、`onEvent/data` 与 `addCallProbe()` 已支持 JavaScript 或 CModule/原生指针回调；JavaScript callout 可同步读写完整 ARM64 `CpuContext`，调用探针也可同步读取和修改参数。`queueDrainInterval` 已按每次 `follow()` 时的配置周期派发 `onReceive/onCallSummary`，设为 `0` 可禁用自动派发；`unfollow()`、`flush()` 和 `garbageCollect()` 仍会同步排空队列。
+与 Frida 17.15.5 的当前主要差异是 transform 尚未暴露 ARM64 writer 方法。`putCallout()`、`onEvent/data` 与 `addCallProbe()` 已支持 JavaScript、`NativeCallback` 或 CModule/原生指针回调；JavaScript callout 可同步读写完整 ARM64 `CpuContext`，调用探针也可同步读取和修改参数。`queueDrainInterval` 已按每次 `follow()` 时的配置周期派发 `onReceive/onCallSummary`，设为 `0` 可禁用自动派发；`unfollow()`、`flush()` 和 `garbageCollect()` 仍会同步排空队列。
 
 ## QBDI Trace
 

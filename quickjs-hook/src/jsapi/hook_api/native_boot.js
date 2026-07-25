@@ -35,11 +35,12 @@
 //     a=x0, c=x1, b=d0
 //   - Return: int/pointer in x0, float/double in d0
 //
-// Limits:
+// Scalar fallback limits (builds without the `frida-ffi` feature):
 //   - Integer/pointer args: x0-x7, overflow spills to stack
 //   - Float/double args:   d0-d7, overflow spills to stack
 //   - Max 256 stack-spilled args (2KB stack region)
-//   - Struct-by-value not supported
+// Agent builds enable `frida-ffi`, which additionally supports variadic calls
+// and nested struct-by-value arguments and return values.
 
 // hook(addr, fn, stealth?) — Frida 风格回调包装
 //   fn(arg0, arg1, ..., arg7) { this.x0, this.$orig(), ... }
@@ -242,14 +243,121 @@
         return _f64Bits[0];
     }
 
-    // NativeFunction 构造器 — 返回一个可调用函数，内部缓存 addr/retType/argTypes
-    // 预计算：FPR 哪些槽是 float32（bit mask），避免每次调用重算
-    globalThis.NativeFunction = function NativeFunction(addr, retType, argTypes) {
+    function _parseNativeOptions(apiName, value) {
+        var options = {
+            abi: 'default',
+            scheduling: 'cooperative',
+            exceptions: 'steal',
+            traps: 'default'
+        };
+        if (value === undefined || value === null) return options;
+        if (typeof value === 'string') {
+            options.abi = value;
+        } else if (typeof value === 'object') {
+            if (value.abi !== undefined) options.abi = value.abi;
+            if (value.scheduling !== undefined) options.scheduling = value.scheduling;
+            if (value.exceptions !== undefined) options.exceptions = value.exceptions;
+            if (value.traps !== undefined) options.traps = value.traps;
+        } else {
+            throw new TypeError(apiName + ': expected ABI string or options object');
+        }
+        if (options.abi !== 'default' && options.abi !== 'sysv') {
+            throw new TypeError(apiName + ': unsupported ABI on ARM64 Android');
+        }
+        if (options.scheduling !== 'cooperative' && options.scheduling !== 'exclusive') {
+            throw new TypeError(apiName + ': scheduling must be cooperative or exclusive');
+        }
+        if (options.exceptions !== 'steal' && options.exceptions !== 'propagate') {
+            throw new TypeError(apiName + ': exceptions must be steal or propagate');
+        }
+        if (options.traps !== 'default' && options.traps !== 'none' && options.traps !== 'all') {
+            throw new TypeError(apiName + ': traps must be default, none, or all');
+        }
+        return options;
+    }
+
+    function _validateReceiver(apiName, receiver) {
+        if (receiver === null || receiver === undefined) return null;
+        if (typeof receiver !== 'object' && typeof receiver !== 'function') {
+            throw new TypeError(apiName + ': invalid receiver');
+        }
+        return receiver;
+    }
+
+    function _toArgumentArray(apiName, values) {
+        if (values === null || values === undefined) return [];
+        if (typeof values !== 'object' && typeof values !== 'function') {
+            throw new TypeError(apiName + '.apply: expected an array-like value');
+        }
+        var length = Number(values.length);
+        if (!Number.isSafeInteger(length) || length < 0) {
+            throw new TypeError(apiName + '.apply: invalid array-like length');
+        }
+        var result = new Array(length);
+        for (var i = 0; i < length; i++) result[i] = values[i];
+        return result;
+    }
+
+    function _installNativeFunctionPrototype(constructor, parentPrototype, apiName) {
+        var prototype = Object.create(parentPrototype);
+        Object.defineProperties(prototype, {
+            constructor: { value: constructor, writable: true, configurable: true },
+            call: {
+                value: function(receiver) {
+                    var args = new Array(Math.max(arguments.length - 1, 0));
+                    for (var i = 1; i < arguments.length; i++) args[i - 1] = arguments[i];
+                    return this.__rfNativeFunctionInvoke(_validateReceiver(apiName, receiver), args);
+                },
+                writable: true,
+                configurable: true
+            },
+            apply: {
+                value: function(receiver, args) {
+                    return this.__rfNativeFunctionInvoke(
+                        _validateReceiver(apiName, receiver),
+                        _toArgumentArray(apiName, args)
+                    );
+                },
+                writable: true,
+                configurable: true
+            }
+        });
+        constructor.prototype = prototype;
+    }
+
+    // NativeFunction/SystemFunction 构造器 — 返回可调用的 NativePointer 子类实例。
+    function _makeNativeFunction(apiName, addr, retType, argTypes, optionValue, captureSystemError, prototype) {
         if (addr === null || addr === undefined) {
-            throw new TypeError("NativeFunction: addr must not be null");
+            throw new TypeError(apiName + ": addr must not be null");
         }
         if (!Array.isArray(argTypes)) {
-            throw new TypeError("NativeFunction: argTypes must be an array");
+            throw new TypeError(apiName + ": argTypes must be an array");
+        }
+        var options = _parseNativeOptions(apiName, optionValue);
+        var useFfi = typeof __nativeFfiPrepare === 'function' && typeof __nativeFfiCall === 'function';
+        var ffiSignature = useFfi ? __nativeFfiPrepare(retType, argTypes) : null;
+
+        if (!useFfi && (options.scheduling !== 'cooperative'
+                || options.exceptions !== 'steal' || options.traps === 'all')) {
+            throw new TypeError(apiName + ': requested options require Frida FFI support');
+        }
+
+        if (useFfi) {
+            function invokeFfi(implementation, values) {
+                var trapMode = options.traps === 'none' ? 1 : (options.traps === 'all' ? 2 : 0);
+                return __nativeFfiCall(
+                    ffiSignature,
+                    implementation === null ? addr : implementation,
+                    values,
+                    captureSystemError,
+                    options.scheduling === 'cooperative',
+                    options.exceptions === 'steal',
+                    trapMode
+                );
+            }
+            return _createNativeFunctionObject(
+                apiName, addr, retType, argTypes, options, prototype, invokeFfi
+            );
         }
 
         var retInfo = _resolveType(retType);
@@ -265,7 +373,7 @@
         for (var i = 0; i < argInfos.length; i++) {
             var info = argInfos[i];
             if (info.kind === 0) {
-                throw new TypeError("NativeFunction: 'void' can only be the return type");
+                throw new TypeError(apiName + ": 'void' can only be the return type");
             }
             if (info.kind === 1) {
                 // 整数：先填 x0-x7，满了就溢出到栈
@@ -291,7 +399,7 @@
             }
         }
         if (stackArgCount > 256) {
-            throw new RangeError("NativeFunction: too many args (" + argInfos.length + " total, " + stackArgCount + " stack overflow > 256)");
+            throw new RangeError(apiName + ": too many args (" + argInfos.length + " total, " + stackArgCount + " stack overflow > 256)");
         }
 
         // retKind: 0=void, 1=int, 2=double(f64), 3=float32
@@ -301,16 +409,16 @@
         else if (retInfo.kind === 2 && retInfo.size === 4) retKind = 3;
         else retKind = 2;
 
-        var fn = function() {
-            if (arguments.length !== argInfos.length) {
-                throw new TypeError("NativeFunction: expected " + argInfos.length + " args, got " + arguments.length);
+        function invoke(implementation, values) {
+            if (values.length !== argInfos.length) {
+                throw new TypeError(apiName + ": expected " + argInfos.length + " args, got " + values.length);
             }
             var gpr = [0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n];
             var fpr = [0, 0, 0, 0, 0, 0, 0, 0];
             var stk = [];  // 栈溢出参数，u64 bit 图（BigInt）按声明顺序
             for (var i = 0; i < argInfos.length; i++) {
                 var plan = argPlan[i];
-                var val = arguments[i];
+                var val = values[i];
                 var info = plan.info;
                 if (plan.slot !== -1) {
                     // 寄存器参数
@@ -330,20 +438,64 @@
                     }
                 }
             }
-            var raw = __nativeCall(addr, retKind, gpr, fpr, precomputedFloat32Mask, stk);
-            if (retKind === 0) return undefined;
-            if (retKind === 2 || retKind === 3) return raw;
-            return _coerceReturnInt(raw, retInfo);
+            var result = __nativeCall(
+                implementation === null ? addr : implementation,
+                retKind,
+                gpr,
+                fpr,
+                precomputedFloat32Mask,
+                stk,
+                captureSystemError,
+                options.traps !== 'none'
+            );
+            var raw = captureSystemError ? result.value : result;
+            var value;
+            if (retKind === 0) value = undefined;
+            else if (retKind === 2 || retKind === 3) value = raw;
+            else value = _coerceReturnInt(raw, retInfo);
+            if (captureSystemError) return { value: value, errno: result.errno };
+            return value;
+        }
+
+        return _createNativeFunctionObject(
+            apiName, addr, retType, argTypes, options, prototype, invoke
+        );
+    }
+
+    function _createNativeFunctionObject(apiName, addr, retType, argTypes, options, prototype, invoke) {
+        var fn = function() {
+            var values = new Array(arguments.length);
+            for (var i = 0; i < arguments.length; i++) values[i] = arguments[i];
+            return invoke(null, values);
         };
+        Object.setPrototypeOf(fn, prototype);
 
         // 暴露元信息方便调试
-        fn.address = addr;
-        fn.returnType = retType;
-        fn.argumentTypes = argTypes;
-        fn.toString = function() {
-            return 'NativeFunction(' + String(addr) + ', ' + retType
-                 + ', [' + argTypes.join(', ') + '])';
-        };
+        Object.defineProperties(fn, {
+            __rfNativeFunctionAddress: { value: _coerceArgInt(addr, TYPE_INFO.pointer) },
+            __rfNativeFunctionInvoke: { value: invoke },
+            address: { value: addr, enumerable: true },
+            returnType: { value: retType, enumerable: true },
+            argumentTypes: { value: argTypes.slice(), enumerable: true },
+            abi: { value: options.abi, enumerable: true }
+        });
         return fn;
-    };
+    }
+
+    function NativeFunction(addr, retType, argTypes, options) {
+        return _makeNativeFunction(
+            'NativeFunction', addr, retType, argTypes, options, false, NativeFunction.prototype
+        );
+    }
+
+    function SystemFunction(addr, retType, argTypes, options) {
+        return _makeNativeFunction(
+            'SystemFunction', addr, retType, argTypes, options, true, SystemFunction.prototype
+        );
+    }
+
+    _installNativeFunctionPrototype(NativeFunction, NativePointer.prototype, 'NativeFunction');
+    _installNativeFunctionPrototype(SystemFunction, NativePointer.prototype, 'SystemFunction');
+    globalThis.NativeFunction = NativeFunction;
+    globalThis.SystemFunction = SystemFunction;
 })();

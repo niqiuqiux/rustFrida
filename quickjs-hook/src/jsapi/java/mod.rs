@@ -1727,8 +1727,10 @@ pub fn drain_thunk_in_flight() -> bool {
     let mut rounds = 0u32;
     loop {
         let callbacks_done = wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(100));
+        let native_callbacks_done =
+            crate::jsapi::hook_api::wait_for_in_flight_native_callbacks(std::time::Duration::from_millis(100));
         let exec_remaining = unsafe { hook_ffi::hook_thunk_in_flight_count() };
-        if callbacks_done && exec_remaining == 0 {
+        if callbacks_done && native_callbacks_done && exec_remaining == 0 {
             output_message(&format!(
                 "[drain] done, callback_in_flight=0, exec_in_flight=0 after {}ms ({} rounds)",
                 start.elapsed().as_millis(),

@@ -10,6 +10,7 @@ license = "Apache-2.0"
 default = []
 std = []
 qbdi = []
+frida-ffi = []
 
 [dependencies]
 libc = "0.2"
