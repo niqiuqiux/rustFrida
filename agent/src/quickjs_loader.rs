@@ -12,10 +12,10 @@ use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 use quickjs_hook::shutdown_qbdi_helper;
 use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
-    cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
-    drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
-    set_qbdi_helper_blob, set_qbdi_output_dir,
+    cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, cut_process_observers,
+    detach_current_jni_thread, drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks,
+    get_or_init_engine, init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused,
+    set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 use std::collections::VecDeque;
 use std::ptr;
@@ -575,6 +575,11 @@ pub fn cleanup() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    if let Err(error) = cut_process_observers() {
+        log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
+        return false;
+    }
+    stage("phase1 cut_process_observers", &mut t);
     #[cfg(feature = "frida-gum")]
     {
         if let Err(error) = crate::stalker::shutdown_module_observer() {
@@ -783,6 +788,11 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    if let Err(error) = cut_process_observers() {
+        log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
+        return false;
+    }
+    stage("phase1 cut_process_observers", &mut t);
     #[cfg(feature = "frida-gum")]
     {
         if let Err(error) = crate::stalker::shutdown_module_observer() {
@@ -915,6 +925,8 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    cut_process_observers()?;
+    stage("phase1 cut_process_observers", &mut t);
     #[cfg(feature = "frida-gum")]
     {
         crate::stalker::pause_module_unload_observer_for_reload()?;

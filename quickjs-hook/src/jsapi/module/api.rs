@@ -307,9 +307,7 @@ unsafe extern "C" fn js_module_ensure_initialized(
         return crate::jsapi::callback_util::throw_internal_error(ctx, "module is no longer loaded");
     }
     if let Some(backend) = module_backend() {
-        if let Err(error) = (backend.ensure_initialized)(&identity) {
-            return crate::jsapi::callback_util::throw_internal_error(ctx, error);
-        }
+        let _ = (backend.ensure_initialized)(&identity);
     }
     JSValue::undefined().raw()
 }

@@ -23,4 +23,5 @@ include!("enumerate.rs");
 include!("linker.rs");
 include!("resolve.rs");
 include!("process_api.rs");
+include!("observer.rs");
 include!("api.rs");

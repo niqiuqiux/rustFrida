@@ -65,7 +65,10 @@ pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use jsapi::module::find_loaded_function_addresses;
 pub use jsapi::module::{
-    install_module_backend, ModuleBackend, ModuleDependencyDetails, ModuleDetails, ModuleIdentity, ModuleSectionDetails,
+    cut_process_observers, free_process_observers, install_module_backend, install_process_observer_backend,
+    queue_module_observer_event, queue_thread_observer_event, ModuleBackend, ModuleDependencyDetails, ModuleDetails,
+    ModuleIdentity, ModuleObserverEvent, ModuleSectionDetails, ProcessObserverBackend, ProcessThreadDetails,
+    ThreadObserverEvent,
 };
 pub use jsapi::stalker::{
     clear_retired_stalker_callouts, dispatch_stalker_call_probe, dispatch_stalker_callout, dispatch_stalker_transform,
@@ -375,6 +378,8 @@ impl Drop for JSEngine {
         // Drop 顺序（字段声明顺序）：先 context（这里访问仍有效）→ 再 runtime。
         // 在 context drop 前释放热路径 atom，让 JS_FreeAtom 有合法上下文。
         unsafe {
+            let _ = jsapi::module::cut_process_observers();
+            jsapi::module::free_process_observers(self.context.as_ptr());
             jsapi::callback_util::free_hot_atoms(self.context.as_ptr());
         }
     }
@@ -416,6 +421,9 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
         let _owner_guard = JsEngineOwnerGuard::acquire();
         let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
         let value = engine.eval_file(script, filename)?;
+        unsafe {
+            jsapi::module::drain_process_observer_events(engine.context().as_ptr());
+        }
         engine.flush_java_ready_callbacks()?;
         engine.run_pending_jobs();
         let result = if value.is_undefined() {
@@ -493,6 +501,9 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
         );
 
         let value = engine.eval(&script)?;
+        unsafe {
+            jsapi::module::drain_process_observer_events(engine.context().as_ptr());
+        }
         engine.run_pending_jobs();
         let result = value
             .to_string(engine.context().as_ptr())
@@ -522,6 +533,7 @@ pub fn try_dispatch_due_stalker_events() -> Result<bool, String> {
         let ctx = engine.context();
         unsafe {
             ffi::qjs_update_stack_top(ctx.as_ptr());
+            jsapi::module::drain_process_observer_events(ctx.as_ptr());
         }
 
         let global = ctx.global_object();
@@ -542,6 +554,29 @@ pub fn try_dispatch_due_stalker_events() -> Result<bool, String> {
     })();
 
     combine_js_and_pending_result(result, jsapi::stalker::process_pending_stalker())
+}
+
+pub fn try_dispatch_process_observer_events() -> Result<bool, String> {
+    if !jsapi::module::process_observer_events_pending() {
+        return Ok(false);
+    }
+    let engine = match JS_ENGINE.try_lock() {
+        Ok(engine) => engine,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    let Some(engine) = engine.as_ref() else {
+        return Ok(false);
+    };
+    let _owner_guard = JsEngineOwnerGuard::acquire();
+    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
+    unsafe {
+        ffi::qjs_update_stack_top(engine.context().as_ptr());
+        jsapi::module::drain_process_observer_events(engine.context().as_ptr());
+    }
+    engine.run_pending_jobs();
+    jsapi::stalker::process_pending_stalker()?;
+    Ok(true)
 }
 
 /// Cleanup the global JS engine

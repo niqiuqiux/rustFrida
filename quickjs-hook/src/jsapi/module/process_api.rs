@@ -677,6 +677,41 @@ pub fn register_process_api(ctx: &JSContext) {
             js_process_enumerate_threads,
             0,
         );
+        add_cfunction_to_object(
+            ctx_ptr,
+            process_obj,
+            "__attachModuleObserver",
+            js_process_attach_module_observer,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            process_obj,
+            "__detachModuleObserver",
+            js_process_detach_module_observer,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            process_obj,
+            "__attachThreadObserver",
+            js_process_attach_thread_observer,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            process_obj,
+            "__detachThreadObserver",
+            js_process_detach_thread_observer,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            process_obj,
+            "__dispatchObserverEvents",
+            js_process_dispatch_observer_events,
+            0,
+        );
 
         global.set_property(ctx_ptr, "Process", process_val);
     }

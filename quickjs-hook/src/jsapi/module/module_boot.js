@@ -106,7 +106,11 @@
     Object.defineProperties(Module, {
         load: {
             enumerable: true,
-            value() { return wrapModule(rawModule.load.apply(rawModule, arguments)); }
+            value() {
+                const module = rawModule.load.apply(rawModule, arguments);
+                rawProcess.__dispatchObserverEvents();
+                return wrapModule(module);
+            }
         },
         findGlobalExportByName: {
             enumerable: true,
@@ -140,6 +144,30 @@
         return module;
     };
     rawProcess.mainModule = wrapModule(rawProcess.mainModule);
+
+    function makeObserver(attach, detach, callbacks) {
+        const id = attach(callbacks);
+        let attached = true;
+        return {
+            detach() {
+                if (!attached)
+                    return;
+                attached = false;
+                detach(id);
+            }
+        };
+    }
+
+    const rawAttachModuleObserver = rawProcess.__attachModuleObserver.bind(rawProcess);
+    const rawDetachModuleObserver = rawProcess.__detachModuleObserver.bind(rawProcess);
+    const rawAttachThreadObserver = rawProcess.__attachThreadObserver.bind(rawProcess);
+    const rawDetachThreadObserver = rawProcess.__detachThreadObserver.bind(rawProcess);
+    rawProcess.attachModuleObserver = function (callbacks) {
+        return makeObserver(rawAttachModuleObserver, rawDetachModuleObserver, callbacks);
+    };
+    rawProcess.attachThreadObserver = function (callbacks) {
+        return makeObserver(rawAttachThreadObserver, rawDetachThreadObserver, callbacks);
+    };
 
     function ModuleMap(filter) {
         if (!(this instanceof ModuleMap))

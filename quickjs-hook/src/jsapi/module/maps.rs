@@ -628,7 +628,12 @@ fn is_system_libart_path(path: &str) -> bool {
 }
 
 fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {
-    if !path.contains(module_name) {
+    let path = normalized_module_path(path);
+    let module_name = normalized_module_path(module_name);
+    if path == module_name {
+        return true;
+    }
+    if module_name.contains('/') || !path.contains(module_name) {
         return false;
     }
 
@@ -708,6 +713,20 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
         assert_eq!(cache.snapshot.find_module_base("libgone.so"), None);
         assert_eq!(cache.snapshot.find_module_path_and_base("libgone.so"), None);
         assert!(cache.snapshot.find_module_by_address(0x1800).is_none());
+    }
+
+    #[test]
+    fn full_path_lookup_distinguishes_same_named_modules() {
+        let maps = "\
+1000-2000 r-xp 00000000 00:00 0 /tmp/a/libsame.so
+3000-4000 r-xp 00000000 00:00 0 /tmp/b/libsame.so
+";
+        let snapshot = ModuleSnapshot::from_entries(parse_module_map_entries(maps));
+
+        assert_eq!(snapshot.find_module_base("/tmp/a/libsame.so"), Some(0x1000));
+        assert_eq!(snapshot.find_module_base("/tmp/b/libsame.so"), Some(0x3000));
+        assert_eq!(snapshot.find_module_base("libsame.so"), Some(0x1000));
+        assert_eq!(snapshot.find_module_base("/tmp/c/libsame.so"), None);
     }
 
     #[test]

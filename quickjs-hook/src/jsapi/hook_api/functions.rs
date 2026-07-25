@@ -848,12 +848,14 @@ pub(crate) unsafe extern "C" fn js_native_call(
         Err(error) => return throw_internal_error(ctx, &format!("NativeFunction: {error}")),
     };
 
-    match result {
+    let result = match result {
         NativeCallResult::Void => JSValue::undefined().raw(),
         NativeCallResult::Int(value) => js_i64_to_js_number_or_bigint(ctx, value as i64),
         NativeCallResult::Double(value) => ffi::qjs_new_float64(ctx, value),
         NativeCallResult::Float32(value) => ffi::qjs_new_float64(ctx, value as f64),
-    }
+    };
+    crate::jsapi::module::drain_process_observer_events(ctx);
+    result
 }
 
 /// diagAllocNear(addr) - 诊断 hook_alloc_near 对指定地址的有效性
