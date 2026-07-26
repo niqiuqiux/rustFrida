@@ -14,8 +14,6 @@ mod vma_name;
 #[cfg(feature = "frida-gum")]
 mod diagnostics;
 #[cfg(feature = "frida-gum")]
-mod memory_dump;
-#[cfg(feature = "frida-gum")]
 mod memory_monitor;
 #[cfg(feature = "frida-gum")]
 mod module_backend;
@@ -119,8 +117,6 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     install_panic_hook();
     SHOULD_EXIT.store(false, Ordering::Relaxed);
     SHOULD_DETACH.store(false, Ordering::Relaxed);
-    // Keep native crash handlers disabled for this target.
-    // install_crash_handlers();
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table) = unsafe {
@@ -472,9 +468,6 @@ fn cleanup_agent_runtime_for_unload(fast_unload_ok: bool) -> bool {
             log_msg_sync(format!("Gum 模块观察器清理失败，拒绝卸载 agent: {error}\n"));
             safe_to_return = false;
         }
-    }
-    if safe_to_return {
-        crash_handler::uninstall_crash_handlers();
     }
     safe_to_return
 }

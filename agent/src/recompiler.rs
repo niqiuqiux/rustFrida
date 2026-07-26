@@ -56,7 +56,6 @@ extern "C" {
     fn hook_flush_cache(start: *mut libc::c_void, size: usize);
     fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
     fn hook_mmap_near_range(target: *mut libc::c_void, alloc_size: usize, max_range: i64) -> *mut libc::c_void;
-    fn hook_register_pool(base: *mut libc::c_void, size: usize) -> i32;
     fn arm64_install_user_patch(
         user_bytes: *const u8,
         user_len: usize,
@@ -131,8 +130,6 @@ struct SlotInfo {
     slot_addr: usize,
     /// 被覆盖前的原始 4 字节指令
     orig_insn: [u8; 4],
-    /// slot 字节数；决定能否放进固定 32B free list
-    slot_size: usize,
     /// true = 32B 可复用 hook slot；false = writest 变长 slot，不进 free list
     reusable: bool,
 }
@@ -982,7 +979,6 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
             recomp_addr: recomp_code_addr,
             slot_addr,
             orig_insn,
-            slot_size,
             reusable: true,
         },
     );
@@ -1099,7 +1095,6 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
             recomp_addr: recomp_code_addr,
             slot_addr,
             orig_insn,
-            slot_size,
             reusable: false, // writest 变长 slot，不进 free list
         },
     );
@@ -1365,7 +1360,6 @@ fn try_compile_temp(orig_base: usize, orig_code: &[u8], tramp_pages: usize) -> R
                 total_size,
                 recomp_base,
                 tramp_used,
-                tramp_capacity: tramp_cap,
                 stats,
             });
         }
@@ -1431,7 +1425,6 @@ struct TempRecomp {
     total_size: usize,
     recomp_base: u64,
     tramp_used: usize,
-    tramp_capacity: usize,
     stats: RecompileStatsC,
 }
 

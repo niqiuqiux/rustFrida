@@ -4,7 +4,6 @@
 //! goes straight to the sys API and owns the range array and the monitor for as
 //! long as it is installed.
 
-use crate::communication::log_msg;
 use frida_gum_sys as gum_sys;
 use quickjs_hook::{dispatch_memory_access, MemoryAccessInfo, MemoryMonitorBackend};
 use std::ffi::c_void;
@@ -132,11 +131,4 @@ fn enable(ranges: &[(u64, u64)], _context: usize) -> Result<(), String> {
 
 pub fn install_quickjs_backend() {
     quickjs_hook::install_memory_monitor_backend(MemoryMonitorBackend { enable, disable });
-}
-
-/// Drop the monitor without touching the JavaScript side, for agent teardown.
-pub fn shutdown() {
-    if let Err(error) = disable() {
-        log_msg(format!("[memory-monitor] shutdown failed: {error}\n"));
-    }
 }

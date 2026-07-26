@@ -2,8 +2,7 @@
 //! dynamic tables. This module intentionally avoids libc/linker APIs such as
 //! `dladdr`, `dlopen`, `dlsym`, `dlclose`, and `dl_iterate_phdr`.
 
-use libc::{c_char, c_void};
-use std::ffi::CStr;
+use libc::c_void;
 
 #[derive(Clone, Debug)]
 struct MapEntry {
@@ -18,7 +17,6 @@ struct MapEntry {
 pub(crate) struct ResolvedSymbol {
     pub(crate) module: Option<String>,
     pub(crate) symbol: Option<String>,
-    pub(crate) offset: usize,
 }
 
 #[repr(C)]
@@ -67,11 +65,6 @@ struct Elf64Sym {
     st_size: u64,
 }
 
-#[repr(C)]
-struct AbortMsg {
-    size: usize,
-}
-
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -89,7 +82,6 @@ pub(crate) fn resolve_symbol(addr: usize) -> ResolvedSymbol {
         return ResolvedSymbol {
             module: None,
             symbol: None,
-            offset: 0,
         };
     };
 
@@ -102,82 +94,18 @@ pub(crate) fn resolve_symbol(addr: usize) -> ResolvedSymbol {
 
     let base_is_readable = maps.iter().any(|entry| entry.start == base && entry.readable);
     if map.name.is_empty() || !base_is_readable {
-        return ResolvedSymbol {
-            module,
-            symbol: None,
-            offset: addr.saturating_sub(base),
-        };
+        return ResolvedSymbol { module, symbol: None };
     }
 
-    match unsafe { elf_find_nearest_symbol(base, addr) } {
-        Some((symbol, offset)) => ResolvedSymbol {
-            module,
-            symbol: Some(symbol),
-            offset,
-        },
-        None => ResolvedSymbol {
-            module,
-            symbol: None,
-            offset: addr.saturating_sub(base),
-        },
-    }
-}
-
-pub(crate) fn resolve_loaded_symbol(module_name: &str, symbol: &str) -> Option<usize> {
-    let maps = parse_maps();
-    let module = maps
-        .iter()
-        .find(|m| m.offset == 0 && (m.name.ends_with(module_name) || m.name.rsplit('/').next() == Some(module_name)))?;
-
-    unsafe { elf_find_symbol_exact(module.start, symbol) }
-}
-
-pub(crate) fn is_addr_in_memfd(addr: usize) -> bool {
-    let maps = parse_maps();
-    match find_map_for_addr(addr, &maps) {
-        Some(map) => is_memfd(&map.name),
-        None => false,
+    ResolvedSymbol {
+        module,
+        symbol: unsafe { elf_find_nearest_symbol(base, addr) },
     }
 }
 
 pub(crate) fn is_address_mapped(addr: usize) -> bool {
     let maps = parse_maps();
     find_map_for_addr(addr, &maps).is_some()
-}
-
-pub(crate) fn memfd_ranges(limit: usize) -> Vec<(usize, usize)> {
-    parse_maps()
-        .into_iter()
-        .filter(|m| is_memfd(&m.name))
-        .take(limit)
-        .map(|m| (m.start, m.end))
-        .collect()
-}
-
-pub(crate) fn is_module_memfd(module: &str) -> bool {
-    is_memfd(module)
-}
-
-pub(crate) fn get_abort_message() -> Option<String> {
-    unsafe {
-        if let Some(api_addr) = resolve_loaded_symbol("libc.so", "android_get_abort_message") {
-            let get_abort_msg: extern "C" fn() -> *const c_char = std::mem::transmute(api_addr);
-            let msg_ptr = get_abort_msg();
-            if !msg_ptr.is_null() {
-                return CStr::from_ptr(msg_ptr).to_str().ok().map(|s| s.to_string());
-            }
-        }
-
-        let ptr = resolve_loaded_symbol("libc.so", "__abort_message")?;
-        let msg_ptr_ptr = ptr as *const *const AbortMsg;
-        let msg_ptr = *msg_ptr_ptr;
-        if msg_ptr.is_null() || (*msg_ptr).size == 0 {
-            return None;
-        }
-
-        let msg_data = (msg_ptr as *const u8).add(std::mem::size_of::<usize>()) as *const c_char;
-        CStr::from_ptr(msg_data).to_str().ok().map(|s| s.to_string())
-    }
 }
 
 fn parse_maps() -> Vec<MapEntry> {
@@ -223,10 +151,6 @@ fn module_base_for_map(map: &MapEntry, maps: &[MapEntry]) -> usize {
         .find(|m| m.offset == 0 && !m.name.is_empty() && m.name == map.name)
         .map(|m| m.start)
         .unwrap_or(map.start.saturating_sub(map.offset))
-}
-
-fn is_memfd(name: &str) -> bool {
-    name.contains("memfd:")
 }
 
 unsafe fn valid_elf(base: usize) -> bool {
@@ -365,21 +289,7 @@ unsafe fn symbol_name(strtab: *const u8, strsz: usize, name_off: u32) -> Option<
     std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).ok()
 }
 
-unsafe fn elf_find_symbol_exact(base: usize, wanted: &str) -> Option<usize> {
-    let (symtab, strtab, strsz, nsyms) = elf_dynamic_info(base)?;
-    for i in 0..nsyms {
-        let sym = &*symtab.add(i);
-        if sym.st_name == 0 || sym.st_shndx == SHN_UNDEF || sym.st_value == 0 {
-            continue;
-        }
-        if symbol_name(strtab, strsz, sym.st_name).is_some_and(|name| name == wanted) {
-            return Some(base + sym.st_value as usize);
-        }
-    }
-    None
-}
-
-unsafe fn elf_find_nearest_symbol(base: usize, addr: usize) -> Option<(String, usize)> {
+unsafe fn elf_find_nearest_symbol(base: usize, addr: usize) -> Option<String> {
     let (symtab, strtab, strsz, nsyms) = elf_dynamic_info(base)?;
     let mut best_name = None;
     let mut best_addr = 0usize;
@@ -399,7 +309,7 @@ unsafe fn elf_find_nearest_symbol(base: usize, addr: usize) -> Option<(String, u
         }
     }
 
-    best_name.map(|name| (name, addr.saturating_sub(best_addr)))
+    best_name
 }
 
 #[allow(dead_code)]

@@ -1411,10 +1411,6 @@ pub extern "C" fn replacecb(arg1: usize) -> usize {
     original_fn(arg1)
 }
 
-pub extern "C" fn replacecc() {
-    let _ = shutdown_hfollow();
-}
-
 fn shutdown_hfollow() -> bool {
     let state = HFOLLOW_RUNTIME.get_or_init(|| Mutex::new(None));
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());

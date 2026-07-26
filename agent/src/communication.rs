@@ -4,7 +4,7 @@
 //! 避免为日志保留后台线程影响自定义 linker 卸载。
 //! 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 仍走同步路径（低频且需要保序）。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
@@ -36,17 +36,6 @@ fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Re
     stream.write_all(payload)
 }
 
-pub(crate) fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
-    let mut kind = [0u8; 1];
-    stream.read_exact(&mut kind)?;
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok((kind[0], payload))
-}
-
 /// 保留调用点但不创建后台线程；agent 卸载前不能留下仍在执行 agent 代码的线程。
 pub(crate) fn start_log_writer() {}
 
@@ -69,25 +58,6 @@ pub(crate) fn write_stream_sync(data: &[u8]) {
 }
 
 pub(crate) fn shutdown_log_writer() {}
-
-/// 直接通过原始 fd 写 socket，供崩溃处理等场景使用。
-pub(crate) fn write_stream_raw(data: &[u8]) {
-    if let Some(fd) = GLOBAL_STREAM_FD.get() {
-        let mut header = [0u8; 5];
-        header[0] = FRAME_KIND_LOG;
-        header[1..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let _ = unsafe { libc::write(*fd, header.as_ptr() as *const libc::c_void, header.len()) };
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let wrote =
-                unsafe { libc::write(*fd, data[offset..].as_ptr() as *const libc::c_void, data.len() - offset) };
-            if wrote <= 0 {
-                break;
-            }
-            offset += wrote as usize;
-        }
-    }
-}
 
 pub(crate) fn send_hello() {
     if let Some(m) = GLOBAL_STREAM.get() {

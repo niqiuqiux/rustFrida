@@ -44,7 +44,6 @@ static JAVA_WORKER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_EVAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
-static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
 
@@ -180,10 +179,6 @@ impl ExecMemory {
             ptr: ptr as *mut u8,
             size: alloc_size,
         })
-    }
-
-    fn new(size: usize) -> Option<Self> {
-        Self::new_near(size, 0)
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -737,34 +732,8 @@ pub fn cleanup() -> bool {
 }
 
 // 注：full cleanup 在 callback/exec 两套计数都归零后同步 munmap hook pool/recomp 页。
-
-fn munmap_initial_exec_mem_for_unload() {
-    if EXEC_MEM_UNMAPPED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let Some(exec_mem) = EXEC_MEM.get() else {
-        return;
-    };
-    unsafe {
-        let ret = munmap(exec_mem.ptr as *mut _, exec_mem.size);
-        if ret == 0 {
-            log_msg(format!("[quickjs] munmap initial hook exec: bytes={}\n", exec_mem.size));
-        } else {
-            log_msg(format!(
-                "[quickjs] munmap initial hook exec failed: {}\n",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-}
-
-pub fn cleanup_for_unload() {
-    if cleanup() {
-        munmap_initial_exec_mem_for_unload();
-    } else {
-        log_msg("[quickjs] unload cleanup retained initial executable memory after timeout\n".to_string());
-    }
-}
+// 初始 hook 执行页故意不 munmap：卸载路径走 cleanup_for_unload_leak_safe()，宁可漏一页
+// 也不能让还在跑 agent 代码的线程踩空（见 doc/frida-upgrade-roadmap.md §5.7）。
 
 pub fn prepare_unload_fast() -> bool {
     if !hook_runtime_initialized() {
