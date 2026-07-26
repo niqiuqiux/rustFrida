@@ -1,20 +1,8 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-/// 生成 UnsafeCell 包装结构体，自动实现 Send + Sync。
-/// 用于将非 Send/Sync 类型安全地存入 OnceLock 全局变量。
-#[cfg(any(feature = "frida-gum", feature = "qbdi"))]
-macro_rules! define_sync_cell {
-    ($name:ident, $inner:ty) => {
-        struct $name(std::cell::UnsafeCell<$inner>);
-        unsafe impl Sync for $name {}
-        unsafe impl Send for $name {}
-    };
-}
-
 mod arm64_relocator;
 mod communication;
 mod crash_handler;
-mod exec_mem;
 mod gumlibc;
 mod linker;
 mod pthread_shim;
@@ -56,9 +44,6 @@ use std::sync::OnceLock;
 pub extern "C" fn rust_get_hide_result() -> *const c_void {
     null_mut()
 }
-
-// 定义我们自己的Result类型，错误统一为String
-type Result<T> = std::result::Result<T, String>;
 
 // StringTable 结构定义（需要和 main.rs 中的定义完全一致）
 #[repr(C)]
@@ -175,7 +160,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     raw_thread::sleep_ms(100);
     flush_cached_logs();
 
-    let mut reader = sock;
+    let reader = sock;
     let reader_fd_for_raw = reader.as_raw_fd();
     loop {
         let mut header = [0u8; 5];
@@ -777,7 +762,7 @@ fn process_cmd(command: &str) {
             let addr_str = command.split_whitespace().nth(1).unwrap_or("");
             let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
             match usize::from_str_radix(addr_str, 16) {
-                Ok(addr) => match recompiler::release(addr, 0) {
+                Ok(addr) => match recompiler::release(addr) {
                     Ok(_) => send_eval_ok("released"),
                     Err(e) => send_eval_err(&e),
                 },

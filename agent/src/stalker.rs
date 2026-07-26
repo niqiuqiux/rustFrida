@@ -4,7 +4,6 @@
 
 use crate::communication::{log_msg, write_stream};
 use crate::stalker_writer;
-use frida_gum::instruction_writer::InstructionWriter;
 use frida_gum::interceptor::Interceptor;
 use frida_gum::stalker::{
     Event, EventMask, EventSink, NativeCallProbeCallback, NativeEventSinkCallback, Stalker, StalkerIterator,

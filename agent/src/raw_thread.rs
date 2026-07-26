@@ -185,9 +185,7 @@ pub(crate) fn sleep_ms(ms: i64) {
         tv_sec: ms / 1000,
         tv_nsec: (ms % 1000) * 1_000_000,
     };
-    unsafe {
-        gum_libc_syscall_4(SYS_nanosleep as c_long, &req as *const timespec as usize, 0, 0, 0);
-    }
+    gum_libc_syscall_4(SYS_nanosleep as c_long, &req as *const timespec as usize, 0, 0, 0);
 }
 
 unsafe fn raw_clone(
@@ -402,15 +400,13 @@ unsafe fn find_elf_symbol(data: &[u8], base: usize, wanted: &str) -> Option<usiz
 
 extern "C" fn raw_thread_entry(arg: usize) -> c_int {
     let start = unsafe { &mut *(arg as *mut RawThreadStart) };
-    unsafe {
-        gum_libc_syscall_4(
-            libc::SYS_prctl as c_long,
-            PR_SET_NAME as usize,
-            start.name.as_ptr() as usize,
-            0,
-            0,
-        );
-    }
+    gum_libc_syscall_4(
+        libc::SYS_prctl as c_long,
+        PR_SET_NAME as usize,
+        start.name.as_ptr() as usize,
+        0,
+        0,
+    );
 
     if let Some(func) = start.func.take() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(func));

@@ -1568,7 +1568,7 @@ pub(crate) unsafe extern "C" fn js_java_jit_info(
     obj
 }
 
-pub(crate) unsafe fn compile_art_method_to_quick(
+pub(in crate::jsapi::java) unsafe fn compile_art_method_to_quick(
     env: JniEnv,
     art_method: u64,
     entry_point_offset: usize,

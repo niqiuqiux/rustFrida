@@ -462,8 +462,12 @@ pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
 
 // ─── 内部实现 ────────────────────────────────────────────────────────────────
 
-/// 解析 property_info 二进制 trie，查找属性名对应的 context (area file name)。
-/// property_info 格式: header(32B) + ... + contexts_table + trie_nodes
+/// 查找属性名对应的 context (area file name)。
+///
+/// context 映射本身来自 selinux 的 `*_property_contexts` 文本文件，而不是
+/// profile 里的 `property_info` 二进制 trie——后者只用来确认这个目录确实是一份
+/// 属性快照。快照里没有 `property_info`（或长度不足一个 header）时直接放弃，
+/// 让调用方回落到前缀启发式。
 fn lookup_property_context(profile_dir: &str, key: &str) -> Option<String> {
     let pi_path = format!("{}/property_info", profile_dir);
     let data = std::fs::read(&pi_path).ok()?;
@@ -471,26 +475,7 @@ fn lookup_property_context(profile_dir: &str, key: &str) -> Option<String> {
         return None;
     }
 
-    let contexts_off = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-    let root_off = u32::from_le_bytes(data[28..32].try_into().ok()?) as usize;
-
-    // 读取 contexts 字符串表（null-separated list）
-    let contexts_data = &data[contexts_off..];
-
-    // 遍历 property_info trie 查找最佳匹配的 context
-    // property_info_area_node 布局:
-    //   uint32_t name_offset     +0  (相对于 context_area 起始)
-    //   uint32_t name_length     +4
-    //   uint32_t context_index   +8
-    //   uint32_t type_index      +12
-    //   uint32_t left            +16
-    //   uint32_t right           +20
-    //   uint32_t children        +24
-    //   uint32_t name_length_2   +28 (? 有些版本不同)
-    // 但实际格式可能更简单。用 prefix match 方式遍历。
-
-    // 简单方案: 从 /dev/__properties__/ 上的 property_contexts 或 plat_property_contexts 读取
-    // 这些是文本文件，格式: prefix context_name
+    // 文本文件格式: prefix context_name [exact]
     let ctx_files = [
         "/system/etc/selinux/plat_property_contexts",
         "/vendor/etc/selinux/vendor_property_contexts",

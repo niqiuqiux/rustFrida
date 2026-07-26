@@ -5,6 +5,8 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 #![allow(clippy::all)]
+// bindgen 为位域访问器生成的 transmute，本文件全是机器生成的代码，无从修改。
+#![allow(unnecessary_transmutes)]
 
 // Include the generated QuickJS bindings
 include!(concat!(env!("OUT_DIR"), "/quickjs_bindings.rs"));

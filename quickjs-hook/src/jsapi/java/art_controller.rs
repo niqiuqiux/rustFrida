@@ -1752,7 +1752,7 @@ static WALKSTACK_GUARD_USING_SIGCHAIN: AtomicBool = AtomicBool::new(false);
 /// Chaining to ourselves would recurse until the stack ran out, and two threads
 /// refreshing at once can each read back the handler the other just installed.
 fn publish_prev_sigsegv_action(action: libc::sigaction) {
-    if action.sa_sigaction == walkstack_sigsegv_handler as usize {
+    if action.sa_sigaction == walkstack_sigsegv_handler as *const () as usize {
         return;
     }
     PREV_SIGSEGV_ACTION.store(Box::into_raw(Box::new(action)), Ordering::Release);
@@ -2195,7 +2195,7 @@ unsafe fn install_walkstack_sigsegv_guard() {
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 
@@ -2267,12 +2267,12 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
     if bionic_sigaction(libc::SIGSEGV, std::ptr::null(), &mut current) != 0 {
         return;
     }
-    if current.sa_sigaction == walkstack_sigsegv_handler as usize {
+    if current.sa_sigaction == walkstack_sigsegv_handler as *const () as usize {
         return;
     }
 
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_sigaction = walkstack_sigsegv_handler as *const () as usize;
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 

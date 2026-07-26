@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::proc_mem::ProcMem;
 use crate::process::{attach_to_process, call_target_function};
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
-use crate::{log_error, log_info, log_success, log_verbose, log_warn};
+use crate::{log_info, log_success, log_verbose, log_warn};
 
 pub(crate) const BOOTSTRAPPER: &[u8] = include_bytes!("../../loader/build/bootstrapper.bin");
 pub(crate) const FRIDA_LOADER: &[u8] = include_bytes!("../../loader/build/rustfrida-loader.bin");

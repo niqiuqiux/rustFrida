@@ -2619,7 +2619,7 @@ extern "C" fn signal_cleanup_handler(_sig: libc::c_int) {
 /// 注册 SIGINT/SIGTERM 信号处理函数
 pub(crate) fn register_cleanup_handler() {
     unsafe {
-        libc::signal(libc::SIGINT, signal_cleanup_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_cleanup_handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, signal_cleanup_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_cleanup_handler as *const () as libc::sighandler_t);
     }
 }

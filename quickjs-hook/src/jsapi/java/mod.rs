@@ -50,7 +50,6 @@ pub(crate) mod reflect;
 
 mod safe_mem;
 
-pub(crate) use art_class::run_pending_checkpoints as run_pending_art_checkpoints;
 pub use java_hook_api::managed_native_counter_value;
 pub(crate) use jni_core::ensure_jni_initialized;
 pub(crate) use reflect::get_class_name_unchecked;
@@ -1549,7 +1548,7 @@ pub fn register_java_api(ctx: &JSContext) {
 /// 目标 app/framework ArtMethod 的 entry_point_/data_ 不写外部地址，也不在
 /// cleanup 时用旧快照覆盖 ART 自己后续做出的更新。路由切断通过 code hook /
 /// ART shared entry hook 完成。
-pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn restore_art_method_fields(data: &JavaHookData) {
     if !data.hook_type.original_flags_mutated() && !data.hook_type.original_entry_mutated() {
         return;
     }
@@ -1578,7 +1577,7 @@ pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
 }
 
 /// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
-pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     if data.quick_trampoline == 0 {
         // No inline per-method hook was installed. Shared/early-entry methods are
         // routed through ART trampolines only; restore_art_method_fields() only
@@ -1606,7 +1605,7 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
 }
 
 /// 移除 registered native fnPtr inline hook。
-pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
     if data.native_entry_hook_target != 0 {
         crate::recomp::try_revert_slot_patch_by_slot(data.native_entry_hook_target as usize);
         hook_ffi::hook_remove(data.native_entry_hook_target as *mut std::ffi::c_void);
@@ -1614,7 +1613,7 @@ pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
 }
 
 /// 移除 native trampoline (hook_remove_redirect)。
-pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
+pub(in crate::jsapi::java) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     if matches!(data.hook_type, callback::HookType::NativeEntry) {
         return;
     }
@@ -1628,7 +1627,7 @@ pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
 /// ArtMethod；Android 16 的 ProfileSaver 会在稍后读取 declaring_class_ 并崩溃。
 /// 这些小块分配因此保留到进程退出，安装失败且尚未发布给 ART 的分配仍由
 /// JavaHookInstallGuard 正常释放。
-pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
+pub(in crate::jsapi::java) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
     let replacement_addr = match &data.hook_type {
         callback::HookType::NativeEntry => 0,
         callback::HookType::Replaced { replacement_addr, .. } | callback::HookType::Quick { replacement_addr, .. } => {
@@ -1789,9 +1788,7 @@ pub fn free_java_hooks() {
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_ref() {
             for (_art_method, data) in registry.iter() {
-                unsafe {
-                    callback::delete_replacement_method(data.art_method);
-                }
+                callback::delete_replacement_method(data.art_method);
             }
         }
     }

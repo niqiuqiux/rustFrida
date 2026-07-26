@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// 用于探测的 RT 信号。Bionic SIGRTMIN=32，+7=39，ART/pthread 未占用
 fn probe_signal() -> c_int {
-    unsafe { libc::SIGRTMIN() + 7 }
+    libc::SIGRTMIN() + 7
 }
 
 static PROBE_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -123,7 +123,7 @@ fn install_probe_handler() {
     }
     unsafe {
         let mut sa: sigaction = zeroed();
-        sa.sa_sigaction = probe_handler as usize;
+        sa.sa_sigaction = probe_handler as *const () as usize;
         sa.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&mut sa.sa_mask);
         if sigaction(probe_signal(), &sa, std::ptr::null_mut()) != 0 {

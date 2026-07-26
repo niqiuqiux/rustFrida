@@ -765,6 +765,9 @@ impl NativeRetKind {
     }
 }
 
+// 三个签名故意指向同一个 asm symbol，只有返回类型不同——这正是让编译器从对的
+// 物理寄存器取返回值的手段，因此关掉 clashing_extern_declarations。
+#[allow(clashing_extern_declarations)]
 extern "C" {
     /// ARM64 AAPCS64 shim：
     ///   - gpr[0..8] 载入 x0-x7

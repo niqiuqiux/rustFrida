@@ -46,7 +46,6 @@ unsafe fn raw_clone_string_arg(
     ctx: *mut ffi::JSContext,
     argc: i32,
     argv: *mut ffi::JSValue,
-    func_name: &str,
     argc_with_explicit_env: i32,
     type_error: &'static [u8],
 ) -> Result<String, ffi::JSValue> {
@@ -418,14 +417,7 @@ unsafe extern "C" fn js_jni_find_class(
     }
 
     if crate::is_raw_clone_js_thread() {
-        let name = match raw_clone_string_arg(
-            ctx,
-            argc,
-            argv,
-            "Jni._findClass",
-            2,
-            b"Jni._findClass: name must be a string\0",
-        ) {
+        let name = match raw_clone_string_arg(ctx, argc, argv, 2, b"Jni._findClass: name must be a string\0") {
             Ok(v) => v,
             Err(err) => return err,
         };
@@ -479,14 +471,7 @@ unsafe extern "C" fn js_jni_new_string_utf(
     }
 
     if crate::is_raw_clone_js_thread() {
-        let value = match raw_clone_string_arg(
-            ctx,
-            argc,
-            argv,
-            "Jni._newStringUtf",
-            2,
-            b"Jni._newStringUtf: str must be a string\0",
-        ) {
+        let value = match raw_clone_string_arg(ctx, argc, argv, 2, b"Jni._newStringUtf: str must be a string\0") {
             Ok(v) => v,
             Err(err) => return err,
         };
