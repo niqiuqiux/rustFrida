@@ -588,7 +588,7 @@ pub fn cleanup() -> bool {
     // Background scans re-enter this runtime, so stop them before anything
     // starts tearing the context down.
     cut_memory_scans();
-    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+    if !wait_for_memory_scan_callbacks(MEMORY_SCAN_STOP_TIMEOUT) {
         log_msg("[quickjs] memory scan callbacks did not stop; keeping agent resident\n".to_string());
         return false;
     }
@@ -596,7 +596,10 @@ pub fn cleanup() -> bool {
     stage("phase1 cut_memory_scans", &mut t);
     clear_message_sink();
     cut_timers();
-    if !wait_for_timers(TIMER_STOP_TIMEOUT) {
+    // Only wait for the callbacks here. Joining would deadlock: this thread
+    // holds the engine the pump is waiting for. The join happens once the
+    // engine is gone, below.
+    if !wait_for_timer_callbacks(TIMER_STOP_TIMEOUT) {
         log_msg("[quickjs] timer callbacks did not stop; keeping agent resident\n".to_string());
         return false;
     }
@@ -702,6 +705,17 @@ pub fn cleanup() -> bool {
     stage("phase4 detach_jni_thread", &mut t);
     cleanup_engine();
     stage("phase4 cleanup_engine", &mut t);
+    // The engine is gone, so the pump can no longer be blocked on it: joining is
+    // safe now, and required before the agent's code is unmapped.
+    if !wait_for_timers(TIMER_STOP_TIMEOUT) {
+        log_msg("[quickjs] timer thread did not exit; keeping agent resident\n".to_string());
+        return false;
+    }
+    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+        log_msg("[quickjs] scan callbacks did not stop; keeping agent resident\n".to_string());
+        return false;
+    }
+    stage("phase4 join_background_threads", &mut t);
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
     let (recomp_ok, recomp_fail, recomp_bytes) = unsafe { crate::recompiler::munmap_retained_ranges() };
@@ -817,7 +831,7 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     // Background scans re-enter this runtime, so stop them before anything
     // starts tearing the context down.
     cut_memory_scans();
-    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+    if !wait_for_memory_scan_callbacks(MEMORY_SCAN_STOP_TIMEOUT) {
         log_msg("[quickjs] memory scan callbacks did not stop; keeping agent resident\n".to_string());
         return false;
     }
@@ -825,7 +839,10 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     stage("phase1 cut_memory_scans", &mut t);
     clear_message_sink();
     cut_timers();
-    if !wait_for_timers(TIMER_STOP_TIMEOUT) {
+    // Only wait for the callbacks here. Joining would deadlock: this thread
+    // holds the engine the pump is waiting for. The join happens once the
+    // engine is gone, below.
+    if !wait_for_timer_callbacks(TIMER_STOP_TIMEOUT) {
         log_msg("[quickjs] timer callbacks did not stop; keeping agent resident\n".to_string());
         return false;
     }

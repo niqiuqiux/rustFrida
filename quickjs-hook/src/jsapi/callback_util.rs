@@ -95,6 +95,15 @@ pub(crate) struct HotAtomsCell(UnsafeCell<HotAtoms>);
 // hot path 读取也必然在 JS_ENGINE 锁下。
 unsafe impl Sync for HotAtomsCell {}
 
+/// Serializes the agent's own background threads before they reach for the
+/// JavaScript engine.
+///
+/// Hook, Stalker and Java callbacks run on threads the target already owns, and
+/// the engine lock alone is enough for them. Two agent-created threads racing
+/// for it — the timer pump and an async scan — is a different case and has
+/// proven unsafe in practice, so they queue here first.
+pub(crate) static BACKGROUND_JS_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) static HOT_ATOMS: HotAtomsCell = HotAtomsCell(UnsafeCell::new(HotAtoms::zeros()));
 pub(crate) static HOT_ATOMS_READY: AtomicBool = AtomicBool::new(false);
 

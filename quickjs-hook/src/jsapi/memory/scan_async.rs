@@ -1,17 +1,20 @@
 //! `Memory.scan(address, size, pattern, callbacks)` — background pattern scan.
 //!
-//! The scan runs on its own thread and re-enters JavaScript for each callback
-//! through the same engine guard the other native callbacks use, so it obeys
-//! the runtime's owner rules instead of opening a second uncontrolled entry.
+//! The scan runs on the shared pump thread rather than one of its own. The
+//! agent's pthread shim clones threads without CLONE_SETTLS, so every thread it
+//! creates shares one TLS block and only one may run at a time; two agent-owned
+//! background threads crash the target. Queueing the work keeps callbacks
+//! entering JavaScript through the same guard as before, from one thread.
 //!
-//! Upstream wraps this in a Promise from `runtime/core.js`. That wrapper needs a
-//! job queue to settle, which arrives with the message loop in Goal 07, so the
-//! callback form is the one exposed here.
+//! A long scan therefore delays timers. That is the cost of the single thread,
+//! and the scan yields between chunks so cancellation still takes effect
+//! promptly.
 
 use super::scan::{parse_pattern_argument, scan_range_chunked, MatchPattern};
 use crate::ffi;
 use crate::jsapi::callback_util::{
     acquire_js_engine_for_callback, extract_pointer_address, handle_js_exception, throw_internal_error,
+    BACKGROUND_JS_GATE,
 };
 use crate::jsapi::ptr::create_native_pointer;
 use crate::value::JSValue;
@@ -30,12 +33,6 @@ static SCAN_JOBS: Mutex<Vec<std::sync::Arc<ScanJob>>> = Mutex::new(Vec::new());
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static IN_FLIGHT_SCANS: Mutex<usize> = Mutex::new(0);
 static IN_FLIGHT_SCANS_CV: Condvar = Condvar::new();
-/// Handles of scan threads, so teardown can join them.
-///
-/// The in-flight count drops before the thread has finished running its own
-/// code, and the agent is unmapped right after teardown returns — joining is
-/// what makes that safe.
-static SCAN_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 struct InFlightScanGuard;
 
@@ -63,6 +60,9 @@ impl Drop for InFlightScanGuard {
 /// scan threads observe the flag between chunks, so a long scan cannot outlive
 /// the context it would call back into.
 pub fn cut_memory_scans() {
+    // Work that has not started yet can simply be dropped; anything running
+    // observes the flag between chunks.
+    crate::jsapi::timers::clear_background_tasks();
     let jobs = SCAN_JOBS.lock().unwrap_or_else(|error| error.into_inner());
     for job in jobs.iter() {
         job.cancelled.store(true, Ordering::SeqCst);
@@ -112,10 +112,6 @@ pub fn wait_for_memory_scans(timeout: std::time::Duration) -> bool {
         }
     }
 
-    let handles = std::mem::take(&mut *SCAN_HANDLES.lock().unwrap_or_else(|error| error.into_inner()));
-    for handle in handles {
-        let _ = handle.join();
-    }
     true
 }
 
@@ -176,6 +172,7 @@ fn run_scan(job: std::sync::Arc<ScanJob>, address: u64, size: usize, pattern: Ma
             return true;
         };
         unsafe {
+            let _background = BACKGROUND_JS_GATE.lock().unwrap_or_else(|error| error.into_inner());
             let Some(_guard) = acquire_js_engine_for_callback(ctx, "Memory.scan onMatch", job.id) else {
                 cancelled = true;
                 return false;
@@ -200,6 +197,7 @@ fn run_scan(job: std::sync::Arc<ScanJob>, address: u64, size: usize, pattern: Ma
 
     if !cancelled && !job.cancelled.load(Ordering::SeqCst) {
         unsafe {
+            let _background = BACKGROUND_JS_GATE.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(_guard) = acquire_js_engine_for_callback(ctx, "Memory.scan completion", job.id) {
                 if !job.cancelled.load(Ordering::SeqCst) {
                     if let (Some(reason), Some(on_error)) = (error.as_ref(), callbacks.on_error) {
@@ -220,6 +218,7 @@ fn run_scan(job: std::sync::Arc<ScanJob>, address: u64, size: usize, pattern: Ma
 
     // Release the callbacks under the guard so the GC sees a consistent state.
     unsafe {
+        let _background = BACKGROUND_JS_GATE.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(_guard) = acquire_js_engine_for_callback(ctx, "Memory.scan teardown", job.id) {
             for callback in [callbacks.on_match, callbacks.on_error, callbacks.on_complete]
                 .into_iter()
@@ -274,21 +273,11 @@ pub(super) unsafe extern "C" fn memory_scan(
         .unwrap_or_else(|error| error.into_inner())
         .push(std::sync::Arc::clone(&job));
 
-    let spawned = std::thread::Builder::new()
-        .name("rf-memory-scan".to_string())
-        .spawn(move || run_scan(job, address, size, pattern, callbacks));
-    match spawned {
-        Ok(handle) => {
-            let mut handles = SCAN_HANDLES.lock().unwrap_or_else(|error| error.into_inner());
-            // Reap threads that already finished so a long session does not
-            // accumulate handles.
-            handles.retain(|handle| !handle.is_finished());
-            handles.push(handle);
-        }
-        Err(error) => {
-            unregister_job(job_id);
-            return throw_internal_error(ctx, format!("Memory.scan() could not start scan thread: {error}"));
-        }
+    if let Err(error) =
+        crate::jsapi::timers::submit_background_task(move || run_scan(job, address, size, pattern, callbacks))
+    {
+        unregister_job(job_id);
+        return throw_internal_error(ctx, format!("Memory.scan(): {error}"));
     }
     JSValue::undefined().raw()
 }

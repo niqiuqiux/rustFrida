@@ -10,7 +10,9 @@
 //! thread-free teardown behaviour.
 
 use crate::ffi;
-use crate::jsapi::callback_util::{acquire_js_engine_for_callback, handle_js_exception, throw_internal_error};
+use crate::jsapi::callback_util::{
+    acquire_js_engine_for_callback, handle_js_exception, throw_internal_error, BACKGROUND_JS_GATE,
+};
 use crate::value::JSValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -68,6 +70,14 @@ static PUMP_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None
 /// so these must be released — just not while the pump might still be using
 /// the engine.
 static RETIRED_TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
+/// Work handed to the pump by other subsystems.
+///
+/// The agent's pthread shim clones threads without CLONE_SETTLS, so every
+/// thread it creates shares one TLS block and only one of them can safely run.
+/// Rather than each feature spawning its own, they queue their work here and
+/// the single pump thread runs it.
+type BackgroundTask = Box<dyn FnOnce() + Send>;
+static BACKGROUND_TASKS: Mutex<Vec<BackgroundTask>> = Mutex::new(Vec::new());
 
 fn lock_timers() -> std::sync::MutexGuard<'static, TimerState> {
     TIMERS.lock().unwrap_or_else(|error| error.into_inner())
@@ -104,6 +114,7 @@ fn release_retired_timers() {
     for timer in retired {
         let ctx = timer.context as *mut ffi::JSContext;
         unsafe {
+            let _background = BACKGROUND_JS_GATE.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(_guard) = acquire_js_engine_for_callback(ctx, "timer teardown", timer.id) {
                 ffi::qjs_free_value(ctx, timer.callback);
             }
@@ -155,6 +166,37 @@ pub fn scheduled_timer_count() -> usize {
     lock_timers().timers.len()
 }
 
+/// Run `task` on the pump thread.
+///
+/// Long tasks delay timers, which is the price of having exactly one thread;
+/// see [`BACKGROUND_TASKS`] for why there is only one.
+pub fn submit_background_task(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    ensure_pump()?;
+    BACKGROUND_TASKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(Box::new(task));
+    TIMERS_CV.notify_all();
+    Ok(())
+}
+
+fn take_background_task() -> Option<BackgroundTask> {
+    let mut tasks = BACKGROUND_TASKS.lock().unwrap_or_else(|error| error.into_inner());
+    if tasks.is_empty() {
+        None
+    } else {
+        Some(tasks.remove(0))
+    }
+}
+
+/// Drop queued work that has not started yet, for teardown.
+pub fn clear_background_tasks() {
+    BACKGROUND_TASKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
 fn next_due(state: &TimerState) -> Option<Instant> {
     state
         .timers
@@ -196,6 +238,7 @@ fn take_due_timer(state: &mut TimerState, now: Instant) -> Option<Timer> {
 /// callback has been released.
 unsafe fn run_and_retire(timer: Timer) -> Option<Timer> {
     let ctx = timer.context as *mut ffi::JSContext;
+    let _background = BACKGROUND_JS_GATE.lock().unwrap_or_else(|error| error.into_inner());
     let Some(_guard) = acquire_js_engine_for_callback(ctx, "timer", timer.id) else {
         // Without the engine the callback cannot be released safely either;
         // hand the timer back so the next round retries.
@@ -243,6 +286,15 @@ unsafe fn drain_jobs(ctx: *mut ffi::JSContext) {
 
 fn pump_loop() {
     while !PUMP_STOP.load(Ordering::SeqCst) {
+        // Queued work first: a caller waiting on a scan should not sit behind
+        // an idle poll.
+        if let Some(task) = take_background_task() {
+            PUMP_IN_CALLBACK.store(true, Ordering::SeqCst);
+            task();
+            PUMP_IN_CALLBACK.store(false, Ordering::SeqCst);
+            continue;
+        }
+
         let due = {
             let state = lock_timers();
             if state.timers.is_empty() {
