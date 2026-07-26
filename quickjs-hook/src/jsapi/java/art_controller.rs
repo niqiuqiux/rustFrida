@@ -19,7 +19,7 @@
 
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_verbose;
-use crate::jsapi::module::{libart_dlsym, libart_find_symbol_contains, module_dlsym};
+use crate::jsapi::module::{libart_dlsym, module_dlsym};
 use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -66,27 +66,11 @@ unsafe extern "C" fn recomp_reverse_translate_for_c(recomp_addr: usize) -> usize
 }
 
 const MAX_SIGNAL_RECOMP_RANGES: usize = 128;
-const ART_FAULT_MANAGER_GENERATED_RANGES_OFFSET: usize = 0x28;
 static SIGNAL_RECOMP_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SIGNAL_RECOMP_ORIG_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
     [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
 static SIGNAL_RECOMP_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
     [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
-
-#[repr(C)]
-struct ArtGeneratedCodeRangeNode {
-    next: AtomicUsize,
-    start: AtomicUsize,
-    size: AtomicUsize,
-}
-
-static ART_RECOMP_RANGE_NODES: [ArtGeneratedCodeRangeNode; MAX_SIGNAL_RECOMP_RANGES] = [const {
-    ArtGeneratedCodeRangeNode {
-        next: AtomicUsize::new(0),
-        start: AtomicUsize::new(0),
-        size: AtomicUsize::new(0),
-    }
-}; MAX_SIGNAL_RECOMP_RANGES];
 
 fn register_recomp_signal_range(orig_addr: usize, recomp_addr: usize) {
     const PAGE_SIZE: usize = 0x1000;
@@ -111,31 +95,6 @@ fn register_recomp_signal_range(orig_addr: usize, recomp_addr: usize) {
     // ReferenceMapVisitor. Keep the range only in our signal-safe side table so
     // the front SIGSEGV guard can translate LR to the original OAT PC.
     SIGNAL_RECOMP_RANGE_COUNT.store(count + 1, Ordering::Release);
-}
-
-unsafe fn register_recomp_art_fault_range(index: usize, recomp_base: usize, size: usize) {
-    let fault_manager = libart_dlsym("_ZN3art13fault_managerE");
-    if fault_manager.is_null() {
-        return;
-    }
-
-    let node = &ART_RECOMP_RANGE_NODES[index];
-    node.start.store(recomp_base, Ordering::Release);
-    node.size.store(size, Ordering::Release);
-
-    let head_addr = (fault_manager as usize + ART_FAULT_MANAGER_GENERATED_RANGES_OFFSET) as *const AtomicUsize;
-    let head = &*head_addr;
-    let node_ptr = node as *const ArtGeneratedCodeRangeNode as usize;
-    loop {
-        let old_head = head.load(Ordering::Acquire);
-        node.next.store(old_head, Ordering::Relaxed);
-        if head
-            .compare_exchange(old_head, node_ptr, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            break;
-        }
-    }
 }
 
 fn translate_recomp_to_orig_signal_safe(addr: usize) -> Option<usize> {
@@ -422,6 +381,11 @@ static FORCED_INTERPRET_SAVED: AtomicU8 = AtomicU8::new(0);
 /// 通过 InstrumentationSpec 获取偏移，从 JavaVM → Runtime → Instrumentation → field。
 /// 指针模式: Runtime[offset] 是 Instrumentation*，需先解引用
 /// 嵌入模式: Runtime + offset 就是 Instrumentation 结构体的起始地址
+///
+/// 目前没有调用方：hook 安装走的是 per-method 重编译，不需要全局关掉 JIT。保留是因为
+/// 它和下面 restore_forced_interpret_only() 是一对，那个是活的（只是永远走 saved==0
+/// 的早退分支）；删掉 setter 会留下一个永远不做事的 restorer。
+#[allow(dead_code)]
 unsafe fn set_forced_interpret_only() {
     let spec = match get_instrumentation_spec() {
         Some(s) => s,
@@ -1099,6 +1063,9 @@ static HOT_METHOD_SAMPLER_EVERY_N: [std::sync::atomic::AtomicU32; HOT_METHOD_SAM
 static HOT_METHOD_SAMPLER_COUNTERS: [std::sync::atomic::AtomicU64; HOT_METHOD_SAMPLER_SLOTS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; HOT_METHOD_SAMPLER_SLOTS];
 
+/// 采样表的读取端 should_sample_original_method() 是活的，只是还没有 JS 侧入口来往表里
+/// 登记方法，所以这个写入端暂时没有调用方。表为空时读取端一律返回 true，行为等同于不采样。
+#[allow(dead_code)]
 pub(crate) fn register_hot_method_sampler(original: u64, every_n: u32) {
     if original == 0 || every_n <= 1 {
         return;
@@ -1402,14 +1369,6 @@ pub(crate) fn clear_call_original_bypass() {
     BYPASS_DEPTHS[slot].store(next, Ordering::Release);
     if next == 0 {
         BYPASS_THREAD_IDS[slot].store(0, Ordering::Release);
-    }
-}
-
-pub(crate) fn get_interpreter_bridge() -> u64 {
-    use super::art_method::ART_BRIDGE_FUNCTIONS;
-    match ART_BRIDGE_FUNCTIONS.get() {
-        Some(b) => b.quick_to_interpreter_bridge,
-        None => 0,
     }
 }
 
@@ -1850,6 +1809,9 @@ fn resolve_recomp_suspend_poll_entrypoint() -> Option<usize> {
     Some(entry)
 }
 
+/// 没有调用方：目前的隐式 suspend check 处理走 Thread::tlsPtr_.suspend_trigger 地址比对，
+/// 不需要先解码指令。保留这份译码器是因为它记着 ART 生成码的指令形状。
+#[allow(dead_code)]
 fn arm64_self_ldr_reg(inst: u32) -> Option<usize> {
     // LDR Xt, [Xn, #0]. ART normally uses `ldr x21, [x21]` for implicit
     // suspend checks, but some generated helper code has shown up outside
@@ -2076,18 +2038,6 @@ unsafe extern "C" fn on_decode_gc_masks_only_enter(ctx: *mut hook_ffi::HookConte
     if !ctx.is_null() && (*ctx).x[0] == 0 {
         (*ctx).x[0] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
     }
-}
-
-unsafe fn find_decode_gc_masks_only_entry() -> u64 {
-    if let Some((name, addr)) = libart_find_symbol_contains("DecodeGcMasksOnly") {
-        output_verbose(&format!(
-            "[artController] DecodeGcMasksOnly symbol wildcard hit: {} @ {:#x}",
-            name, addr
-        ));
-        return addr;
-    }
-
-    0
 }
 
 unsafe fn find_decode_gc_masks_only_header_load() -> u64 {

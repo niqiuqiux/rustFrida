@@ -2,98 +2,6 @@
 // Module handle + symbol resolution
 // ============================================================================
 
-/// Get a dlopen handle to libart.so via unrestricted linker API (Frida-style).
-unsafe fn get_libart_handle() -> *mut std::ffi::c_void {
-    LIBART_HANDLE
-        .get_or_init(|| {
-            let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-            if let Some(api) = api {
-                let &(libart_base, _) = LIBART_RANGE.get_or_init(probe_libart_range);
-                if libart_base == 0 {
-                    output_message("[linker api] libart.so base not found in /proc/self/maps");
-                    return SyncPtr(std::ptr::null_mut());
-                }
-
-                let caller_addr = libart_base as *const std::ffi::c_void;
-
-                let paths_to_try: Vec<String> = {
-                    let mut paths = Vec::new();
-                    if let Some(Some(path)) = LIBART_PATH.get() {
-                        paths.push(path.clone());
-                    }
-                    paths.push("libart.so".to_string());
-                    paths
-                };
-
-                for path in &paths_to_try {
-                    let c_path = CString::new(path.as_str()).unwrap();
-                    let handle = (api.dlopen)(
-                        c_path.as_ptr() as *const i8,
-                        libc::RTLD_NOW | libc::RTLD_NOLOAD,
-                        caller_addr,
-                    );
-                    if !handle.is_null() {
-                        output_message(&format!(
-                            "[linker api] dlopen({}, NOLOAD, caller={:#x}) = {:?}",
-                            path, libart_base, handle
-                        ));
-                        return SyncPtr(handle);
-                    }
-
-                    let err = libc::dlerror();
-                    if !err.is_null() {
-                        let err_msg = std::ffi::CStr::from_ptr(err).to_string_lossy();
-                        output_message(&format!(
-                            "[linker api] dlopen({}, NOLOAD) failed: {}",
-                            path, err_msg
-                        ));
-                    }
-                }
-
-                output_message("[linker api] all dlopen attempts failed");
-            }
-            SyncPtr(std::ptr::null_mut())
-        })
-        .0
-}
-
-/// Get a dlopen handle to an arbitrary module via unrestricted linker API.
-///
-/// This is kept only for APIs that still need to load a new shared object
-/// (Module.load/QBDI/JVMTI). Symbol lookup paths below intentionally avoid it.
-unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
-    let c_name = CString::new(module_name).unwrap();
-
-    // 直接走 unrestricted path（跳过 standard dlopen fast path）
-    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-    if let Some(api) = api {
-        let base = find_module_base(module_name);
-        if base != 0 {
-            let caller_addr = base as *const std::ffi::c_void;
-            let handle = (api.dlopen)(
-                c_name.as_ptr() as *const i8,
-                libc::RTLD_NOW | libc::RTLD_NOLOAD,
-                caller_addr,
-            );
-            if !handle.is_null() {
-                return handle;
-            }
-        }
-
-        // Try with trusted_caller as fallback
-        let handle = (api.dlopen)(
-            c_name.as_ptr() as *const i8,
-            libc::RTLD_NOW | libc::RTLD_NOLOAD,
-            api.trusted_caller,
-        );
-        if !handle.is_null() {
-            return handle;
-        }
-    }
-
-    std::ptr::null_mut()
-}
-
 /// Resolve a symbol from an arbitrary loaded module by parsing ELF metadata.
 /// This bypasses the system linker entirely: no dlopen, dlsym, dladdr, or
 /// __loader_* entrypoints are called on the lookup path.
@@ -476,11 +384,6 @@ pub(crate) unsafe fn module_dlopen_load_from_libart_namespace(
     std::ptr::null_mut()
 }
 
-/// Load a shared object from an existing memfd using the linker's trusted-caller API.
-pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void {
-    memfd_dlopen_with_flags(name, fd, libc::RTLD_NOW)
-}
-
 /// Load a shared object from an existing memfd using caller-provided dlopen flags.
 pub(crate) unsafe fn memfd_dlopen_with_flags(name: &str, fd: i32, flags: i32) -> *mut std::ffi::c_void {
     let c_name = match CString::new(name) {
@@ -543,43 +446,6 @@ pub(crate) unsafe fn libart_dlsym(name: &str) -> *mut std::ffi::c_void {
     }
 
     std::ptr::null_mut()
-}
-
-/// Resolve a libart symbol by name substring from .symtab/.dynsym.
-///
-/// This is used for ART internals whose mangled signatures drift across Android
-/// releases while the stable semantic name remains present.
-pub(crate) unsafe fn libart_find_symbol_contains(needle: &str) -> Option<(String, u64)> {
-    let &(libart_base, _) = LIBART_RANGE.get_or_init(probe_libart_range);
-    if libart_base == 0 || needle.is_empty() {
-        return None;
-    }
-
-    let path = match LIBART_PATH.get() {
-        Some(Some(path)) => path.clone(),
-        _ => match find_module_path_and_base("libart.so") {
-            Some((path, _)) => path,
-            None => return None,
-        },
-    };
-
-    let symbols = elf_module_enumerate_symbols(&path, libart_base);
-    let mut fallback: Option<(String, u64)> = None;
-    for symbol in symbols {
-        if symbol.address == 0 || !symbol.is_defined || symbol.kind != "function" {
-            continue;
-        }
-        if !symbol.name.contains(needle) {
-            continue;
-        }
-        if symbol.name.contains("CodeInfo") {
-            return Some((symbol.name, symbol.address));
-        }
-        if fallback.is_none() {
-            fallback = Some((symbol.name, symbol.address));
-        }
-    }
-    fallback
 }
 
 /// 在多个候选符号中查找第一个可用的（通过 libart_dlsym）

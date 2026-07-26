@@ -73,6 +73,8 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
         .get("__dl___loader_dlopen")
         .or_else(|| symbols.get("__dl__Z8__dlopenPKciPKv"))
         .copied();
+    // dlvsym 已经没有调用方——符号查找一律走 ELF 解析，不碰 __loader_* 入口。
+    // 但它在不在，依然是判断这条 unrestricted 路径能不能用的依据，所以照旧要求它在场。
     let dlsym_addr = symbols
         .get("__dl___loader_dlvsym")
         .or_else(|| symbols.get("__dl__Z8__dlvsymPvPKcS1_PKv"))
@@ -100,15 +102,13 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
     ));
 
     // Extract optional linker internals
-    let dl_mutex = symbols
-        .get("__dl_g_dl_mutex")
-        .or_else(|| symbols.get("__dl__ZL10g_dl_mutex"))
-        .or_else(|| symbols.get("__dl__ZL8gDlMutex"))
-        .map(|&addr| addr as *mut std::ffi::c_void)
-        .unwrap_or_else(|| {
-            output_message("[linker api] dl_mutex not found");
-            std::ptr::null_mut()
-        });
+    // dl_mutex 只报缺失，不留地址：我们从不调用 pthread mutex API 去动它。
+    if symbols.get("__dl_g_dl_mutex").is_none()
+        && symbols.get("__dl__ZL10g_dl_mutex").is_none()
+        && symbols.get("__dl__ZL8gDlMutex").is_none()
+    {
+        output_message("[linker api] dl_mutex not found");
+    }
 
     let solist_get_head: Option<unsafe extern "C" fn() -> *mut std::ffi::c_void> = symbols
         .get("__dl__Z15solist_get_headv")
@@ -131,9 +131,7 @@ unsafe fn init_unrestricted_linker_api() -> Option<UnrestrictedLinkerApi> {
 
     Some(UnrestrictedLinkerApi {
         dlopen: std::mem::transmute(dlopen_addr),
-        dlsym: std::mem::transmute(dlsym_addr),
         trusted_caller: trusted_caller as *const std::ffi::c_void,
-        dl_mutex,
         solist_get_head,
         solist,
         soinfo_get_path,

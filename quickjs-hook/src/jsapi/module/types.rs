@@ -147,17 +147,8 @@ const R_AARCH64_JUMP_SLOT: u32 = 1026;
 struct UnrestrictedLinkerApi {
     /// __dl___loader_dlopen(filename, flags, caller_addr) -> handle
     dlopen: unsafe extern "C" fn(*const i8, i32, *const std::ffi::c_void) -> *mut std::ffi::c_void,
-    /// __dl___loader_dlvsym(handle, symbol, version, caller_addr) -> addr
-    dlsym: unsafe extern "C" fn(
-        *mut std::ffi::c_void,
-        *const i8,
-        *const i8,
-        *const std::ffi::c_void,
-    ) -> *mut std::ffi::c_void,
     /// Trusted caller address (linker64 内部地址，dlopen_addr)
     trusted_caller: *const std::ffi::c_void,
-    /// dl_mutex address, kept only for diagnostics. We never call pthread mutex APIs.
-    dl_mutex: *mut std::ffi::c_void,
     /// solist_get_head() — __dl__Z15solist_get_headv
     solist_get_head: Option<unsafe extern "C" fn() -> *mut std::ffi::c_void>,
     /// solist global variable (fallback) — __dl__ZL6solist
@@ -172,13 +163,6 @@ unsafe impl Sync for UnrestrictedLinkerApi {}
 
 static UNRESTRICTED_LINKER_API: std::sync::OnceLock<Option<UnrestrictedLinkerApi>> =
     std::sync::OnceLock::new();
-
-/// Newtype wrapper for *mut c_void to implement Send+Sync
-pub(crate) struct SyncPtr(pub(crate) *mut std::ffi::c_void);
-unsafe impl Send for SyncPtr {}
-unsafe impl Sync for SyncPtr {}
-
-static LIBART_HANDLE: std::sync::OnceLock<SyncPtr> = std::sync::OnceLock::new();
 
 /// Cached libart.so address range (start, end).
 pub(crate) static LIBART_RANGE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
