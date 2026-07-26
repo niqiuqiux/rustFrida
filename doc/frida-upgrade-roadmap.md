@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 08 已完成首批范围；八项设备回归首次全部通过）
+> 状态：执行中（Goal 00 至 Goal 08b 已完成；八项设备回归全部通过）
 >
 > 更新日期：2026-07-26
 >
@@ -81,7 +81,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | File | 同步 File 构造、读写、seek、静态 read/write helpers | GumJS File 行为及异步 I/O 生态 | 部分 | P2 |
 | Stream/Socket | 无 | IOStream、InputStream、OutputStream、Socket | 缺失 | P2 |
 | 工具模块 | 无 | Checksum、SQLite、Cloak、Sampler、Profiler、Kernel | 缺失 | P2/P3 |
-| Java | `use`、`perform/performNow`、`available`、`androidVersion`、`cast/retain/array`、`synchronized`、`ACC_*`、overload、choose、class loader、loaded class、deopt、字段、DSL/fast hook | 官方 bridge 另有 ClassFactory、registerClass、main-thread 调度 | 部分/扩展 | P1 |
+| Java | `use`、`perform/performNow`、`available`、`androidVersion`、`cast/retain/array`、`synchronized`、`ACC_*`、`vm`、`scheduleOnMainThread`、overload、choose、class loader、loaded class、deopt、字段、DSL/fast hook | 官方 bridge 另有 ClassFactory、registerClass、openClassFile、enumerateMethods、backtrace | 部分/扩展 | P1 |
 | Host 协议 | 自研注入器、REPL、HTTP RPC | Device、Session、Script message、Portal、Compiler | 不同架构 | 非当前范围 |
 
 ### 4.1 当前已经做得较完整的部分
@@ -428,7 +428,7 @@ cargo build --offline --release --target aarch64-linux-android
 
 ### Goal 08：Java 标准 facade 兼容（P1）
 
-状态：**首批范围已完成（2026-07-26）**；`ClassFactory`、`registerClass`、`openClassFile`、`scheduleOnMainThread`、`enumerateMethods` 按本 Goal 原定计划留作后续子 goal。
+状态：**首批范围已完成（2026-07-26）**；`scheduleOnMainThread` 与 `Java.vm` 已由 Goal 08b 补齐，`ClassFactory`、`registerClass`、`openClassFile`、`enumerateMethods`、`backtrace` 仍留作后续子 goal。
 
 前置条件（已满足）：
 
@@ -447,7 +447,7 @@ cargo build --offline --release --target aarch64-linux-android
 已知限制：
 
 - `enumerateLoadedClasses` 依赖 JVMTI，而 agent 默认不 late-load JVMTI 插件（需要目标进程环境里 `RF_JAVA_CHOOSE_JVMTI_LATE_LOAD=1`）。该默认是有意的安全策略，因此这里没有绕过它；API 在插件不可用时抛出说明该前提的错误，设备回归据此做条件性校验。上游在 ART 上走 `art::ClassLinker::VisitClasses`，不需要 JVMTI——补齐它需要解析该符号与 ClassLinker 实例并处理 runnable thread，属于独立课题。
-- 数组内容的回归用真实 Java 调用（`java.util.Arrays.toString`）校验而非内部访问器：`Java._arrayGet()` 只为对象数组设计，传基本类型数组的类名会使目标进程崩溃。这是既有缺陷，与本 Goal 新增的 API 无关，但值得单独修。
+- ~~`Java._arrayGet()` 只为对象数组设计，传基本类型数组会使目标进程崩溃~~：已在 `2e4aea2` 修复。`js_java_array_get` 现按元素签名分派到八个 `Get<Type>ArrayRegion`，索引访问也会把对象元素包成 wrapper 再交给脚本；回归改为直接读回元素，同时保留经 `java.util.Arrays.toString` 的 Java 侧校验。
 
 目标：在保留 ART fast hook 和 managed DSL 的前提下，提高 frida-java-bridge 脚本复用率。
 
@@ -455,7 +455,7 @@ cargo build --offline --release --target aarch64-linux-android
 
 - 首批 aliases：`perform/performNow`、`available`、`androidVersion`。
 - loaded class、class loader、`cast/retain/array`、对象 dispose 生命周期。
-- `ClassFactory`、registerClass/openClassFile、main-thread 调度分成后续子 goal。
+- `ClassFactory`、registerClass/openClassFile、main-thread 调度分成后续子 goal（main-thread 调度与 `Java.vm` 已由 Goal 08b 完成）。
 - 在开始实现前固定一份 frida-java-bridge 源码或版本；当前 `/home/qiu/Android/frida` 不包含该仓库的完整源码，不能只凭记忆追平。
 
 验收：
@@ -463,6 +463,33 @@ cargo build --offline --release --target aarch64-linux-android
 - 同一测试 App 分别由官方 Frida 和 rustFrida 运行兼容脚本，比较结构化结果。
 - spawn/attach、boot/app ClassLoader、静态/实例/重载方法均覆盖。
 - retain/dispose 后不泄漏 JNI global ref，不访问退休 ArtMethod。
+
+### Goal 08b：`Java.vm` 与 `Java.scheduleOnMainThread`（P1）
+
+状态：**已完成（2026-07-26）**。
+
+实现前按 Goal 08 的前置条件取回固定版本的源码：`frida-java-bridge-7.0.12.tgz` 的 sha256 与 `tests/compat/frida-java-bridge.json` 记录的 `8a3b6323…b2b850` 一致，语义据此对照而非凭记忆。基线固定的是成员名单，语义须回到源码核对——这次正是这样用的。
+
+落地证据：
+
+- `Java.vm` 的 `perform/getEnv/tryGetEnv` 落地。JavaVM 早已由 `jni_core::get_or_init_vm()` 缓存、invoke table 的封装也已存在，缺的只是 JS 绑定。`getEnv` 背后的查询刻意不做 attach——`getEnv` 与 `tryGetEnv` 的区别只在于对未 attach 线程的处理，两种情况必须可分；`perform` 在需要时 attach，且只在 attach 是自己做的时候才 detach。抛错文案与上游逐字一致。
+- `Env` 只带 `handle` 与 `vm`，即上游 `Env` 构造函数写死的两个字段。脚本取 `Java.vm` 是为了拿一个能交给自己 NativeFunction 的 `JNIEnv*`，这一点是精确的；上游那一百多个 JNI 封装是另一层表面，项目自有的 `Jni` 对象已经覆盖，且上游 `index.d.ts` 把 `Env` 标成 `any`，没有承诺更多。
+- `Java.scheduleOnMainThread` 落地。JS 函数在没有 `registerClass` 的前提下无法作为 Runnable 交给 Java，因此任务入队后由主线程必经的 native 点取走；与上游一样选 `epoll_wait`（主 Looper 空闲时阻塞在其中），并用绑定主 Looper 的 Handler 唤醒它。
+- `tests/device/run_goal08_java.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成 `%reload` 前后两轮，每轮 65 项断言全部通过；主线程任务按 FIFO 各执行一次，抛错的任务不阻断其后队列；App 存活且没有新增 tombstone。
+- 八项设备回归、兼容测试 19 项、API 快照 `--check`、rustfmt 和 diff 检查均通过。
+
+与上游的一处有意分歧：
+
+- 上游的 `epoll_wait` 探针装上就不再卸载。rustFrida 不能这样：进入 JavaScript 要取引擎锁，而那个等待没有超时，常驻探针会让任意一段慢脚本在持锁期间卡住 App 主线程。因此探针只在有待办任务时存在，队列排空后摘除，没有调度时主线程完全不进引擎。摘除动作放在 pump 上执行，而不是在正被摘除的探针内部完成。
+- 唤醒用的 Handler 每次调用重建而不缓存：缓存的 wrapper 需要一个 global ref，而 reload 时没有任何环节会释放它。
+
+仍然延后的成员及原因（各自需要独立的重型基础设施，不适合并进本子 goal）：
+
+- `backtrace`：上游用一个大 CModule 实现 ART `StackVisitor` 子类。走 `Thread.getStackTrace()` 只能得到 className/methodName/fileName，缺 `signature`/`origin`/`methodFlags`/`id`——形状不全的 `Java.backtrace()` 比没有更糟，脚本会读到 `undefined`。
+- `registerClass`：需要运行时 DEX 生成（上游的 `lib/mkdex.js`）。
+- `openClassFile`：依赖 `registerClass` 那条 DexFile 路径。
+- `enumerateMethods`：需要 `"java"` 类型的 ApiResolver，而当前 ApiResolver 只支持 module 类型。
+- `classFactory`：`loader` 的读写点已经具备（`reflect.rs` 的 `get_app_classloader_local_ref` 与 `set_classloader_override`），但上游的 `ClassFactory.get(loader)` 是 per-factory 的 loader scoping，而当前 `Java.setClassLoader` 是进程级全局覆盖；补齐需要把 loader 显式传进 `find_class_safe`。
 
 ### Goal 09：按需补充外围模块（P2/P3）
 

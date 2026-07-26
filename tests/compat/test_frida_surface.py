@@ -161,14 +161,22 @@ Object.defineProperties(globalThis, {
         self.assertTrue(spec["integrity"].startswith("sha512-"))
         self.assertEqual(len(spec["sha256"]), 64)
 
-        # Every upstream member must be accounted for: implemented already, in
-        # scope for Goal 08, or explicitly deferred. An unclassified member means
-        # the pinned bridge moved and nobody looked.
+        # Every upstream member must be accounted for: implemented already, done
+        # by some goal, or explicitly deferred. An unclassified member means the
+        # pinned bridge moved and nobody looked. Buckets are read from the file
+        # rather than named here, so a later sub-goal only adds a key.
         status = spec["rustFridaStatus"]
-        categorised = set(status["implementedBeforeGoal08"]) | set(status["goal08"]) | set(status["deferred"])
+        self.assertIn("deferred", status, "the baseline must say what is still outstanding")
+        buckets = list(status.values())
+        categorised = set().union(*buckets)
         upstream = set(spec["upstreamMembers"])
         self.assertEqual(upstream - categorised, set(), "unclassified frida-java-bridge members")
         self.assertEqual(categorised - upstream, set(), "classified members the pinned bridge does not have")
+
+        # A member must not sit in two buckets: that would hide a regression
+        # where something moves to "done" while still listed as deferred.
+        total = sum(len(bucket) for bucket in buckets)
+        self.assertEqual(total, len(categorised), "a member is classified more than once")
 
     def test_java_bridge_version_matches_the_local_frida_checkout(self):
         lock_path = FRIDA_SOURCE / "subprojects/frida-tools/agents/tracer/package-lock.json"

@@ -78,7 +78,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
 | Memory | compatible | Goal 06 |  |
 | Stalker | compatible | Goal 05 |  |
-| Java facade | partial | Goal 08 | `ClassFactory`, `registerClass`, `openClassFile`, `scheduleOnMainThread`, `enumerateMethods` |
+| Java facade | partial | Goal 08 | `ClassFactory`, `registerClass`, `openClassFile`, `enumerateMethods`, `backtrace` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |
 
 ## Verification

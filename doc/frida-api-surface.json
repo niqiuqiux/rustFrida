@@ -54,8 +54,8 @@
           "ClassFactory",
           "registerClass",
           "openClassFile",
-          "scheduleOnMainThread",
-          "enumerateMethods"
+          "enumerateMethods",
+          "backtrace"
         ],
         "status": "partial"
       },
@@ -627,6 +627,14 @@
       {
         "path": "Java.ACC_PUBLIC",
         "type": "number"
+      },
+      {
+        "path": "Java.vm",
+        "type": "object"
+      },
+      {
+        "path": "Java.scheduleOnMainThread",
+        "type": "function"
       },
       {
         "path": "Jni.addr",
