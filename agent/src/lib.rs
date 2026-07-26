@@ -21,7 +21,6 @@ mod pthread_shim;
 mod raw_thread;
 pub mod recompiler;
 pub mod safepoint;
-mod trace;
 mod vma_name;
 
 #[cfg(feature = "frida-gum")]
@@ -45,12 +44,10 @@ use crate::communication::{
     shutdown_stream, start_log_writer, write_stream, GLOBAL_STREAM,
 };
 use crate::crash_handler::install_panic_hook;
-use libc::{kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
-use std::process;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -511,27 +508,6 @@ fn process_cmd(command: &str) {
         crate::communication::write_stream_sync(format!("[command diag] {}\n", name).as_bytes());
     }
     match command.split_whitespace().next() {
-        Some("trace") => {
-            let tid = command
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            raw_thread::spawn_detached(b"wwb-trace\0", move || {
-                match trace::gum_modify_thread(tid) {
-                    Ok(pid) => {
-                        write_stream(format!("clone success {}", pid).as_bytes());
-                    }
-                    Err(e) => {
-                        write_stream(format!("error: {}", e).as_bytes());
-                    }
-                }
-                unsafe {
-                    kill(process::id() as pid_t, SIGSTOP);
-                }
-            })
-            .expect("spawn raw wwb-trace thread");
-        }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
             let tid = command

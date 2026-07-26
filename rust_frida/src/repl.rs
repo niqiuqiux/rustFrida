@@ -436,7 +436,6 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
     CMDS.get_or_init(|| {
         #[allow(unused_mut)]
         let mut v: Vec<(&'static str, &'static str, &'static str)> = vec![
-            ("trace", "[tid]", "ptrace 指令追踪"),
             ("jhook", "", "Java/JNI hooking"),
             ("jsinit", "", "初始化 QuickJS 引擎"),
             ("loadjs", "<script>", "执行 JavaScript 代码"),

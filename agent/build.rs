@@ -3,7 +3,6 @@ fn main() -> anyhow::Result<()> {
     let map_path = profile_dir.join("libagent.map");
 
     // 编译 C 代码
-    cc::Build::new().file("src/transform.c").compile("my_c_lib");
 
     // Do not link hide_soinfo.c in the custom-linker injection path.
     // That code is only valid for Android linker/dlopen-managed modules; our
