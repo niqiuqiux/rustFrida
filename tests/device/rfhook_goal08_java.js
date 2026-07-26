@@ -238,4 +238,35 @@ function runJavaChecks() {
     assertThrows("synchronized rejects a dead handle", function () {
         Java.synchronized({ __jptr: 0 }, function () {});
     });
+
+    // -------------------------------------------------------------- vm ----
+
+    // Inside Java.perform the thread is attached, so getEnv must succeed and
+    // must agree with tryGetEnv.
+    var env = Java.vm.getEnv();
+    assertTrue("vm.getEnv returned an env", env !== null && env !== undefined);
+    assertTrue("env.handle is a non-null pointer", !env.handle.isNull());
+    assertEqual("env.vm is the vm object", env.vm, Java.vm);
+    assertTrue("vm.handle is a non-null pointer", !Java.vm.handle.isNull());
+    assertEqual("tryGetEnv agrees with getEnv", Java.vm.tryGetEnv().handle.toString(), env.handle.toString());
+
+    // The JNIEnv is per-thread, so it must sit inside a mapping and differ from
+    // the JavaVM itself.
+    assertTrue("env differs from the vm handle", env.handle.toString() !== Java.vm.handle.toString());
+
+    var performedEnv = null;
+    Java.vm.perform(function (e) { performedEnv = e; });
+    assertTrue("vm.perform passed an env", performedEnv !== null);
+    assertEqual("vm.perform reused the attached env", performedEnv.handle.toString(), env.handle.toString());
+
+    // perform must return the callback's value and propagate its errors.
+    assertEqual("vm.perform returns the callback result", Java.vm.perform(function () { return 7; }), 7);
+    assertThrows("vm.perform propagates body errors", function () {
+        Java.vm.perform(function () { throw new Error("vm boom"); });
+    });
+    assertThrows("vm.perform rejects a non-function", function () { Java.vm.perform(42); });
+
+    // Still usable after a throw: a botched detach would show up here.
+    assertTrue("vm still usable after a throw", !Java.vm.getEnv().handle.isNull());
+    assertEqual("Java.vm is stable across reads", Java.vm, Java.vm);
 }

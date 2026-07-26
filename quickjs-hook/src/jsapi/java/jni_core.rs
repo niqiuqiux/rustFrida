@@ -1111,7 +1111,7 @@ fn scoped_jni_env_inner() -> Result<ScopedJniEnv, String> {
     }
 }
 
-unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option<JniEnv>, String> {
+pub(super) unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option<JniEnv>, String> {
     if vm_ptr.is_null() {
         return Err("JavaVM pointer is null".to_string());
     }
@@ -1130,7 +1130,7 @@ unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option
 
 /// Attach the current thread to the JavaVM and return its JNIEnv*.
 /// Idempotent — returns existing env if thread is already attached.
-unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
+pub(super) unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
     if vm_ptr.is_null() {
         return Err("JavaVM pointer is null".to_string());
     }
@@ -1156,7 +1156,7 @@ unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv,
     Ok(env_ptr as JniEnv)
 }
 
-unsafe fn detach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<(), String> {
+pub(super) unsafe fn detach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<(), String> {
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
     let detach_fn: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32 = std::mem::transmute(*vm_table.add(5)); // DetachCurrentThread = index 5
     let ret = detach_fn(vm_ptr);

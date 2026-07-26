@@ -86,6 +86,80 @@ unsafe extern "C" fn js_java_is_main_thread(
     JSValue::bool(tid == libc::getpid()).raw()
 }
 
+// ------------------------------------------------------------- Java.vm ----
+//
+// Upstream's `VM` is `perform` / `getEnv` / `tryGetEnv` over the JavaVM invoke
+// table. The pieces are already here — `get_or_init_vm` caches the JavaVM the
+// process created, and the invoke-table wrappers sit next to it — so these are
+// only the JavaScript bindings.
+//
+// `getEnv` and `tryGetEnv` must be able to tell "attached" from "not attached",
+// which is why the query below never attaches as a side effect; the bootstrap
+// decides what to do about a detached thread.
+
+unsafe extern "C" fn js_java_vm_handle(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    match super::jni_core::get_or_init_vm() {
+        Ok(vm) => ffi::qjs_new_int64(ctx, vm as usize as i64),
+        Err(reason) => throw_internal_error(ctx, format!("Java.vm is unavailable: {reason}")),
+    }
+}
+
+/// The calling thread's `JNIEnv*`, or `null` when it is not attached.
+unsafe extern "C" fn js_java_vm_get_env(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let vm = match super::jni_core::get_or_init_vm() {
+        Ok(vm) => vm,
+        Err(reason) => return throw_internal_error(ctx, format!("Java.vm is unavailable: {reason}")),
+    };
+    match super::jni_core::get_current_thread_env(vm) {
+        Ok(Some(env)) => ffi::qjs_new_int64(ctx, env as usize as i64),
+        Ok(None) => JSValue::null().raw(),
+        Err(reason) => throw_internal_error(ctx, format!("Java.vm.getEnv() failed: {reason}")),
+    }
+}
+
+/// Attach the calling thread and return its `JNIEnv*`.
+unsafe extern "C" fn js_java_vm_attach(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let vm = match super::jni_core::get_or_init_vm() {
+        Ok(vm) => vm,
+        Err(reason) => return throw_internal_error(ctx, format!("Java.vm is unavailable: {reason}")),
+    };
+    match super::jni_core::attach_current_thread(vm) {
+        Ok(env) => ffi::qjs_new_int64(ctx, env as usize as i64),
+        Err(reason) => throw_internal_error(ctx, format!("Java.vm.perform(): {reason}")),
+    }
+}
+
+unsafe extern "C" fn js_java_vm_detach(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let vm = match super::jni_core::get_or_init_vm() {
+        Ok(vm) => vm,
+        Err(reason) => return throw_internal_error(ctx, format!("Java.vm is unavailable: {reason}")),
+    };
+    match super::jni_core::detach_current_thread(vm) {
+        Ok(()) => JSValue::undefined().raw(),
+        Err(reason) => throw_internal_error(ctx, format!("Java.vm.perform(): {reason}")),
+    }
+}
+
 /// Read a jobject handle passed from JavaScript.
 unsafe fn required_handle(
     ctx: *mut ffi::JSContext,
@@ -441,5 +515,9 @@ pub(super) fn register_java_compat_api(ctx_ptr: *mut ffi::JSContext, java_obj: f
         add_cfunction_to_object(ctx_ptr, java_obj, "_deleteGlobalRef", js_java_delete_global_ref, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "_isInstanceOf", js_java_is_instance_of, 2);
         add_cfunction_to_object(ctx_ptr, java_obj, "_newArray", js_java_new_array, 2);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_vmHandle", js_java_vm_handle, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_vmGetEnv", js_java_vm_get_env, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_vmAttachCurrentThread", js_java_vm_attach, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_vmDetachCurrentThread", js_java_vm_detach, 0);
     }
 }

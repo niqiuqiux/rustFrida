@@ -2031,4 +2031,69 @@
             return value === 0n ? 0 : value;
         return 0;
     }
+
+    // ------------------------------------------------------------ Java.vm ----
+    //
+    // Upstream's Env wraps the whole JNI function table; ours carries the two
+    // fields upstream's own constructor sets — `handle` and `vm` — and stops
+    // there. A script reaches for Java.vm to get a JNIEnv* it can hand to its
+    // own NativeFunction, and that much is exact; pretending to offer the
+    // hundred-odd JNI wrappers would only fail later and less clearly. The
+    // project's own `Jni` object already covers that ground.
+
+    function _makeEnv(handle) {
+        return Object.freeze({ handle: ptr(handle), vm: Java.vm });
+    }
+
+    var _vm = null;
+
+    function _buildVm() {
+        return Object.freeze({
+            get handle() {
+                return ptr(Java._vmHandle());
+            },
+
+            // Attaches the calling thread if needed, and detaches afterwards
+            // only when this call is what attached it — detaching a thread the
+            // VM owns would take its JNI state down with it.
+            perform: function(fn) {
+                if (typeof fn !== "function")
+                    throw new Error("Java.vm.perform() requires a function argument");
+
+                var existing = Java._vmGetEnv();
+                if (existing !== null)
+                    return fn(_makeEnv(existing));
+
+                var handle = Java._vmAttachCurrentThread();
+                try {
+                    return fn(_makeEnv(handle));
+                } finally {
+                    Java._vmDetachCurrentThread();
+                }
+            },
+
+            getEnv: function() {
+                var handle = Java._vmGetEnv();
+                if (handle === null)
+                    throw new Error("Current thread is not attached to the Java VM; " +
+                                    "please move this code inside a Java.perform() callback");
+                return _makeEnv(handle);
+            },
+
+            tryGetEnv: function() {
+                var handle = Java._vmGetEnv();
+                return handle === null ? null : _makeEnv(handle);
+            }
+        });
+    }
+
+    Object.defineProperty(Java, "vm", {
+        get: function() {
+            if (_vm === null)
+                _vm = _buildVm();
+            return _vm;
+        },
+        enumerable: true,
+        configurable: true
+    });
 })();
