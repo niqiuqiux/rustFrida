@@ -18,6 +18,7 @@
     "ApiResolver",
     "Interceptor",
     "Stalker",
+    "Arm64Relocator",
     "CModule",
     "NativeFunction",
     "NativeCallback",
@@ -49,7 +50,8 @@
     { "name": "ApiResolver", "type": "function", "classification": "partial" },
     { "name": "Hook", "type": "object", "classification": "extension" },
     { "name": "Interceptor", "type": "object", "classification": "partial" },
-    { "name": "Stalker", "type": "object", "classification": "partial" },
+    { "name": "Stalker", "type": "object", "classification": "compatible" },
+    { "name": "Arm64Relocator", "type": "function", "classification": "compatible" },
     { "name": "CModule", "type": "function", "classification": "partial" },
     { "name": "NativeFunction", "type": "function", "classification": "compatible" },
     { "name": "NativeCallback", "type": "function", "classification": "compatible" },
@@ -118,6 +120,7 @@
     { "path": "Stalker.follow", "type": "function" },
     { "path": "Stalker.addCallProbe", "type": "function" },
     { "path": "Stalker.parse", "type": "function" },
+    { "path": "Stalker.statistics", "type": "function" },
     { "path": "Hook.NORMAL", "type": "number" },
     { "path": "Hook.WXSHADOW", "type": "number" },
     { "path": "Java.use", "type": "function" },
@@ -160,9 +163,9 @@
     },
     {
       "area": "Stalker",
-      "status": "partial",
+      "status": "compatible",
       "goal": "05",
-      "missing": ["Arm64Writer", "Arm64Relocator", "drop statistics"]
+      "missing": []
     },
     {
       "area": "Java facade",
