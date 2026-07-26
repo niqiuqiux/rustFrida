@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 06 已完成）
+> 状态：执行中（Goal 00 至 Goal 06 已完成，Goal 07 进行中）
 >
 > 更新日期：2026-07-26
 >
@@ -67,7 +67,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 | 领域 | 当前 rustFrida | 最新 GumJS | 状态 | 优先级 |
 | --- | --- | --- | --- | --- |
-| 核心运行时 | QuickJS、`console`、`gc`、HTTP `rpc.exports` | `Frida`、`Script`、`send/recv`、timer、`gc`、`Worker`、`hexdump` | 部分 | P1/P2 |
+| 核心运行时 | QuickJS、`console`、`gc`、`send/recv`、timer、`Script`、`Frida`、`hexdump`、HTTP `rpc.exports` | 同名 API 另有 `Worker` | 部分 | P1/P2 |
 | 数值与指针 | `ptr`、`NULL`、NativePointer 大部分运算和读写 | 另有 `Int64`、`UInt64`、pointer sign/blend、`ArrayBuffer.wrap/unwrap` | 部分 | P1 |
 | Native 调用 | ARM64 `NativeFunction`、`SystemFunction`，支持 ABI/options、variadic、嵌套 struct | 同名 API | 已有 | P1 |
 | Native callback | 通用 `NativeCallback`；CModule 函数指针继续用于高频 callback | 通用 `NativeCallback` | 已有/扩展 | P0/P1 |
@@ -98,9 +98,8 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
-1. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
-2. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
-3. `Memory.scan()` 只有 callbacks 形态，Promise 包装待消息循环。
+1. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
+2. 缺少 `Worker`，且 timer 在 `%reload` 后的生命周期尚未通过验收（见 Goal 07）。
 
 ## 5. 架构与稳定性风险
 
@@ -371,6 +370,22 @@ cargo build --offline --release --target aarch64-linux-android
 - monitor/scan callback 在 reload/unload 时可取消且不重入已销毁 runtime。
 
 ### Goal 07：标准消息循环与 Script API（P1/P2）
+
+状态：**进行中（2026-07-26）。功能已落地并在单次会话内全部验证通过，但未满足本文件 §8 的 `%reload` 验收门槛，因此不标记完成。**
+
+已落地：
+
+- `send(payload, data?)` 与 `recv(type?, callback)` 落地。新增 agent→host 的 `0x88` SEND 帧与 host→agent 的 `0x03` POST 帧，body 均为 `[json_len:u32][json][binary]`；REPL 新增 `post <json>` 命令，纯文本会被包装成 `{"type":"send","payload":...}`。recv 采用上游的一次性回调语义，未被认领的消息留在队列里等待后续 `recv()`。
+- `setTimeout/setInterval/clearTimeout/clearInterval/setImmediate/clearImmediate` 与 `Script.nextTick` 由一个懒启动的 pump 线程驱动；它经既有引擎 guard 进入 JS，并在每次回调后 drain QuickJS job queue——这正是 promise 在顶层脚本返回后仍能 settle 的原因。未调度任何 timer 的脚本不会创建该线程。
+- `Script`（runtime/id/nextTick/pin/unpin/bindWeak/unbindWeak）、`Frida`（version/heapSize）与 `hexdump()` 落地。
+- `Memory.scan()` 现在返回 Promise（Goal 06 遗留项），callbacks 形态保留；扫描线程在回调后同样 drain job queue。
+- 单轮设备验证（PLC110 / Android 16）33 项断言全部通过：nextTick 先于零延迟 timeout、短延迟先于长延迟、clearTimeout 生效、setInterval 自停、promise 由 timer settle、send 携带二进制数据到达 host、recv 的通配与具名一次性回调、`Memory.scan` promise 解析与坏 pattern 同步抛出、hexdump 输出。
+
+未通过的验收项：
+
+- `%reload` 后 timer 与 messaging 均恢复正常（各完成两轮），但第二轮的 `Memory.scan` 阶段使目标进程崩溃，因此整体回归仍失败。复现：`python3 tests/device/run_goal07_messaging.py --device <serial>`，第二轮在 `Memory.scan returns a promise` 之后断开。
+- 期间已修掉三类真实缺陷，值得记录以免重复踩：pump 线程用标志表示"已结束"而调用方随即卸载 agent（改为 join）；`cut_timers()` 不释放 callback 导致 `JS_FreeRuntime` 的引用计数断言失败（改为在等待后于安全点释放）；soft cleanup 中 join pump 会与持有引擎的清理线程死锁（改为 soft 只等回调离开 JS、hard 才 join）。剩余崩溃疑似同类的线程/上下文生命周期问题，需要继续排查扫描线程与 reload 后新 context 的交互。
+- Worker 尚未实现，按本 Goal 原定顺序排在最后。
 
 目标：支持依赖 Frida message loop 的通用脚本。
 

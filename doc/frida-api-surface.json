@@ -7,13 +7,8 @@
         "area": "Core runtime",
         "goal": "07",
         "missing": [
-          "Frida",
-          "Script",
-          "send",
-          "recv",
-          "timers",
           "Worker",
-          "hexdump"
+          "reload-safe timers"
         ],
         "status": "partial"
       },
@@ -44,10 +39,8 @@
       {
         "area": "Memory",
         "goal": "06",
-        "missing": [
-          "scan Promise wrapper"
-        ],
-        "status": "partial"
+        "missing": [],
+        "status": "compatible"
       },
       {
         "area": "Stalker",
@@ -85,6 +78,13 @@
     ],
     "documentedGlobals": [
       "console",
+      "Frida",
+      "Script",
+      "send",
+      "recv",
+      "setTimeout",
+      "setInterval",
+      "hexdump",
       "gc",
       "ptr",
       "Int64",
@@ -120,6 +120,61 @@
         "classification": "compatible",
         "name": "console",
         "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "Frida",
+        "type": "object"
+      },
+      {
+        "classification": "partial",
+        "name": "Script",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "send",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "recv",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "setTimeout",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "setInterval",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "clearTimeout",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "clearInterval",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "setImmediate",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "clearImmediate",
+        "type": "function"
+      },
+      {
+        "classification": "compatible",
+        "name": "hexdump",
+        "type": "function"
       },
       {
         "classification": "compatible",
@@ -550,6 +605,22 @@
       {
         "path": "rpc.exports",
         "type": "object"
+      },
+      {
+        "path": "Script.nextTick",
+        "type": "function"
+      },
+      {
+        "path": "Script.runtime",
+        "type": "string"
+      },
+      {
+        "path": "Frida.version",
+        "type": "string"
+      },
+      {
+        "path": "Memory.scan",
+        "type": "function"
       }
     ],
     "schemaVersion": 1

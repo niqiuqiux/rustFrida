@@ -23,6 +23,17 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Name | Expected type | Classification |
 | --- | --- | --- |
 | `console` | `object` | compatible |
+| `Frida` | `object` | partial |
+| `Script` | `object` | partial |
+| `send` | `function` | compatible |
+| `recv` | `function` | compatible |
+| `setTimeout` | `function` | compatible |
+| `setInterval` | `function` | compatible |
+| `clearTimeout` | `function` | compatible |
+| `clearInterval` | `function` | compatible |
+| `setImmediate` | `function` | compatible |
+| `clearImmediate` | `function` | compatible |
+| `hexdump` | `function` | compatible |
 | `gc` | `function` | compatible |
 | `ptr` | `function` | compatible |
 | `NULL` | `object` | compatible |
@@ -61,11 +72,11 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 
 | Area | Status | Roadmap goal | Missing upstream surface |
 | --- | --- | --- | --- |
-| Core runtime | partial | Goal 07 | `Frida`, `Script`, `send`, `recv`, `timers`, `Worker`, `hexdump` |
+| Core runtime | partial | Goal 07 | `Worker`, `reload-safe timers` |
 | Native ABI | compatible | Goal 04 |  |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
-| Memory | partial | Goal 06 | `scan Promise wrapper` |
+| Memory | compatible | Goal 06 |  |
 | Stalker | compatible | Goal 05 |  |
 | Java facade | partial | Goal 08 | `perform`, `performNow`, `ClassFactory`, `retain`, `cast`, `array` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |

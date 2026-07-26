@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `MemoryAccessMonitor`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `Frida`, `Script`, `send()`, `recv()`, `setTimeout()`, `setInterval()`, `hexdump()`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `MemoryAccessMonitor`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -1540,6 +1540,41 @@ Interceptor.attach(Jni.addr("RegisterNatives"), {
 ```
 
 ---
+
+## 消息与定时器
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `send(payload[, data])` | `any, ArrayBuffer\|TypedArray\|number[]` | `undefined` |
+| `recv([type, ]callback)` | `string?, function` | `{wait()}` |
+| `setTimeout(fn[, delay, ...args])` | `function, number` | `number` |
+| `setInterval(fn, delay[, ...args])` | `function, number` | `number` |
+| `clearTimeout(id)` / `clearInterval(id)` | `number` | `undefined` |
+| `setImmediate(fn[, ...args])` / `clearImmediate(id)` | `function` / `number` | `number` / `undefined` |
+| `Script.nextTick(fn[, ...args])` | `function` | `undefined` |
+| `hexdump(target[, options])` | `NativePointer\|ArrayBuffer, {length, offset, header, ansi}` | `string` |
+
+`send()` 经 agent socket 送到 host，host 侧以 `[send]` 前缀打印；带二进制数据时附 `(+N bytes of data)`。host 侧用 REPL 的 `post <json>` 向脚本的 `recv()` 投递消息，非 JSON 文本会被包装成 `{"type":"send","payload":"<文本>"}`。
+
+`recv()` 与上游一致是**一次性**回调：消息送达即摘除处理器，因此在回调里再次 `recv()` 可以重新武装。没有匹配处理器的消息留在队列中，等下一次 `recv()` 注册时投递。
+
+定时器由一个懒启动的后台线程驱动——脚本顶层执行早已返回，而 timer 还要继续。该线程经与其他 native 回调相同的引擎 guard 进入 JS，并在每次回调后 drain QuickJS 的 job queue；这正是 promise 能在顶层返回之后 settle 的原因，也让 `Memory.scan().then()` 可用。没有调度过 timer 的脚本不会创建这个线程。
+
+```js
+send({ hello: "world" });
+send({ withData: true }, new Uint8Array([1, 2, 3]).buffer);
+
+recv("ping", function (message, data) {
+    send({ pong: message.payload });
+});
+
+var id = setInterval(function () { send({ tick: Date.now() }); }, 1000);
+setTimeout(function () { clearInterval(id); }, 5000);
+```
+
+`Script` 提供 `runtime`（`"QJS"`）、`id`、`nextTick()`、`pin()/unpin()`、`bindWeak()/unbindWeak()`；`Frida` 提供 `version`（当前 Gum 的版本）与 `heapSize`。
+
+**已知限制**：`%reload` 后 timer 与消息通道会正常重建，但当前版本在 reload 后的第二轮 `Memory.scan()` 仍会使目标进程崩溃，详见 `doc/frida-upgrade-roadmap.md` 的 Goal 07。若脚本依赖 `%reload`，暂时避免在 reload 后再次调用 `Memory.scan()`。`Worker` 尚未实现。
 
 ## Memory
 
