@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 04 已完成）
+> 状态：执行中（Goal 00 至 Goal 05 已完成）
 >
 > 更新日期：2026-07-26
 >
@@ -76,7 +76,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | Process | 基本属性、模块/范围/线程枚举和目录查询、module/thread observer | 另有 findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
 | Thread/符号诊断 | `Thread.backtrace()`、Backtracer、DebugSymbol、ApiResolver(module)、Instruction | 另有非 module resolver、硬件断点/观察点、CFG | 部分 | P0/P1 |
 | Interceptor | 自研 engine 的 attach/replace/revert/detachAll；`flush` 是兼容 no-op；支持 stealth | Gum Interceptor defaults/options、replaceFast、事务 flush、完整 invocation context | 部分/扩展 | P1 |
-| Stalker | follow/unfollow、事件、parse、transform 遍历、callout、probe、native sink、reload cleanup | transform iterator 同时暴露架构 writer，和 Instruction/Writer/Relocator 深度集成 | 部分 | P0/P1 |
+| Stalker | follow/unfollow、事件、parse、transform 遍历、callout、probe、native sink、reload cleanup、iterator 上的 Arm64Writer/Arm64Relocator、statistics | transform iterator 同时暴露架构 writer，和 Instruction/Writer/Relocator 深度集成 | 已有/扩展 | P0/P1 |
 | CModule | TinyCC、symbol 注入、导出指针、metadata 回收 | 官方 CModule builtins、dispose 和完整 ownership 语义 | 部分/扩展 | P2 |
 | File | 同步 File 构造、读写、seek、静态 read/write helpers | GumJS File 行为及异步 I/O 生态 | 部分 | P2 |
 | Stream/Socket | 无 | IOStream、InputStream、OutputStream、Socket | 缺失 | P2 |
@@ -98,9 +98,9 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
-1. Stalker transform 只能遍历、keep、callout 和 chaining return，不能调用 ARM64 writer 发射或替换指令。
-2. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
-3. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
+1. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
+2. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
+3. Memory 缺少 `patchCode`、异步 `scan`、`findPointers` 和 `MemoryAccessMonitor`。
 
 ## 5. 架构与稳定性风险
 
@@ -132,9 +132,10 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 
 ### 5.6 已知可观测性缺口
 
-- Stalker 队列满时静默丢弃事件，没有 dropped counter。
-- call-probe anchor 会保留到 Stalker runtime 关闭，需要覆盖目标模块卸载和地址复用场景。
 - README 仍有个别实现漂移，例如 `Memory.alloc()` 源码使用 `calloc`，文档却描述为 RWX；应由 API 基线 goal 统一校正。
+- `run_goal01_module_unload.py` 在当前设备的 shutdown 阶段稳定产生 tombstone；见 Goal 05 的既有缺口记录。
+
+Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理。
 
 ## 6. Goal 路线
 
@@ -299,6 +300,24 @@ cargo build --offline --release --target aarch64-linux-android
 - detach/revert/reload 后 thunk 不再执行，并在安全点回收。
 
 ### Goal 05：Stalker ARM64 writer 与可观测性（P0/P1）
+
+状态：**已完成（2026-07-26）**。
+
+落地证据：
+
+- transform iterator 现在同时是 ARM64 writer，暴露上游 `gumjs_arm64_writer_entries` 的全部 76 个成员（`dispose` 由 facade 持有，因为 Stalker output writer 归 Gum 所有）；`Arm64Relocator` 暴露上游全部 10 个成员。
+- opcode 编号、参数规格和 property/function 划分由 `quickjs-hook/src/jsapi/stalker_writer.rs` 单一定义，agent 侧按常量分发，JS 侧完全由 spec 表驱动；寄存器/条件码/index mode 名称由 Gum 绑定生成，不在 JS 侧硬编码 Capstone 数值。
+- `tests/compat/test_frida_surface.py` 直接解析该 Rust 表并与上游基线交叉验证成员集合与 kind；该测试在开发中即抓出把 `eoi`/`readOne` 误判为 property/function 的偏差。
+- writer 与 relocator 仅在 transform callback 内有效：token 失效后每个成员稳定抛异常，callback 返回时 facade 先销毁该次创建的全部 relocator 再释放 frame。
+- `Stalker.statistics()`（rustFrida 扩展）报告 dropped events、active/pending/retired traces、call probe 与 anchor 数量以及每线程队列水位；队列满时只计数不扩容。
+- call-probe anchor 记录建立时的模块 identity，地址被另一模块复用时重建；不再被任何用户 probe 需要且没有线程被 follow 时在安全点回收。
+- `tests/device/run_goal05_stalker_writer.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成两轮 `%reload` 与最终 shutdown，45 项断言全部通过；目标进程存活且没有新增 tombstone。
+- 设备回归覆盖：用 relocator 手工重发指令后原函数语义不变、`putBLabel`/`putLabel` 跳转确实被执行（否则受保护的 fallthrough 会写标志位）、callout 从生成代码触发、writer 拒绝未知寄存器/条件码、relocator dispose 后拒绝使用且可重复 dispose、一格队列产生可读的 dropped count 且结果不被破坏。
+- Goal 02/03/04 设备回归、兼容测试 16 项、API 快照 `--check`、rustfmt 和 diff 检查均通过。
+
+已知既有缺口（不由本 Goal 引入）：
+
+- `tests/device/run_goal01_module_unload.py` 的 `--mode full` 与 `--mode hfollow` 在当前设备上于 shutdown 阶段（`cut_process_observers` 之后）稳定产生 tombstone：`wwb-loader` 线程 SIGABRT/SI_QUEUE，测试主体断言全部通过后才崩溃。在 Goal 05 改动前的 `89577ec` 上用同样步骤可完全复现，因此属于 Goal 01 场景的既有 shutdown 缺陷，需要单独立项排查。
 
 目标：补齐上游 transform 的代码生成能力，并提高事件丢弃可见性。
 

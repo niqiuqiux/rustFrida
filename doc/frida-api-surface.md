@@ -39,7 +39,8 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `ApiResolver` | `function` | partial |
 | `Hook` | `object` | extension |
 | `Interceptor` | `object` | partial |
-| `Stalker` | `object` | partial |
+| `Stalker` | `object` | compatible |
+| `Arm64Relocator` | `function` | compatible |
 | `CModule` | `function` | partial |
 | `NativeFunction` | `function` | compatible |
 | `NativeCallback` | `function` | compatible |
@@ -64,7 +65,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
 | Memory | partial | Goal 06 | `patchCode`, `async scan`, `findPointers`, `MemoryAccessMonitor`, `alloc options` |
-| Stalker | partial | Goal 05 | `Arm64Writer`, `Arm64Relocator`, `drop statistics` |
+| Stalker | compatible | Goal 05 |  |
 | Java facade | partial | Goal 08 | `perform`, `performNow`, `ClassFactory`, `retain`, `cast`, `array` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |
 

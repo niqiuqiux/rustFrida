@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -1842,8 +1842,43 @@ Stalker.removeCallProbe(probeId);
 | `Stalker.trustThreshold` | `int32` | 读写 Gum 信任阈值 |
 | `Stalker.queueCapacity` | `uint32` | 后续 `follow()` 使用的事件数上限 |
 | `Stalker.queueDrainInterval` | `uint32` | 后续 `follow()` 的自动派发周期（毫秒）；`0` 禁用 |
+| `Stalker.statistics()` | — | 队列丢弃、trace、call probe 与 anchor 计数（rustFrida 扩展） |
 
-`transform(iterator)` 当前提供 `iterator.next()`、`iterator.keep()`、`iterator.memoryAccess`、`iterator.putCallout(callback, data?)` 和 `iterator.putChainingReturn()`。`next()` 返回的指令快照包含 `id/address/next/size/mnemonic/opStr/bytes` 与 `toString()`；iterator 只在当前 transform 回调内有效。
+`transform(iterator)` 提供 `iterator.next()`、`iterator.keep()`、`iterator.memoryAccess`、`iterator.putCallout(callback, data?)` 和 `iterator.putChainingReturn()`。`next()` 返回的指令快照包含 `id/address/next/size/mnemonic/opStr/bytes` 与 `toString()`；iterator 只在当前 transform 回调内有效。
+
+与上游一致，iterator 同时就是当前输出块的 `Arm64Writer`，可直接发射指令：属性 `pc/code/base/offset`，方法 `flush()`、`reset()`、`skip()`、`sign()`、`canBranchDirectlyBetween()`、`putLabel()` 以及全部 `putXxx()` 系列。寄存器接受 `"x0"`…`"x30"`、`"w0"`…`"w30"`、`"sp"`、`"lr"`、`"fp"`、`"wsp"`、`"wzr"`、`"xzr"`、`"nzcv"`、`"ip0"`、`"ip1"`、`"s0"`…`"s31"`、`"d0"`…`"d31"`、`"q0"`…`"q31"`；条件码接受 `"eq"`…`"nv"`；index mode 接受 `"post-adjust"`、`"signed-offset"`、`"pre-adjust"`。label 用字符串命名，作用域是单次 transform 回调。
+
+`new Arm64Relocator(inputCode, iterator)` 把一段原始指令重定位到该 writer，提供 `readOne()`、`writeOne()`、`writeAll()`、`skipOne()`、`peekNextWriteInsn()`、`peekNextWriteSource()`、`reset()`、`dispose()` 和属性 `input/eob/eoi`。它只能在 transform 回调内构造，回调返回时自动销毁；`dispose()` 可重复调用。
+
+```js
+Stalker.follow(tid, {
+    transform(iterator) {
+        var instruction;
+        while ((instruction = iterator.next()) !== null) {
+            if (instruction.address.equals(target)) {
+                // 在原指令前插入受保护的跳转
+                iterator.putPushRegReg("x16", "x17");
+                iterator.putBLabel("skip");
+                iterator.putBrkImm(0x11);   // 被跳过
+                iterator.putLabel("skip");
+                iterator.putPopRegReg("x16", "x17");
+
+                // 自行重发这条指令（PC 相对编码由 relocator 修正）
+                var relocator = new Arm64Relocator(instruction.address, iterator);
+                relocator.readOne();
+                relocator.writeOne();
+                relocator.dispose();
+                continue;                   // 已手工发射，不再 keep()
+            }
+            iterator.keep();
+        }
+    }
+});
+```
+
+writer 与 relocator 都绑定当前 transform 回调的生命周期：回调返回后再访问任何成员都会抛出 `invalid operation outside a Stalker transform callback`。
+
+`Stalker.statistics()` 返回 `{droppedEvents, activeTraces, pendingTraces, retiredTraces, activeCallProbes, retiredCallProbes, callProbeAnchors, retiredCallouts, liveCallouts, liveCallProbes, traces}`，其中 `traces[]` 为每线程的 `{threadId, queueCapacity, queuedEvents, droppedEvents}`。队列满时事件被丢弃而不是扩容，`droppedEvents` 单调累加，unfollow 后仍保留已退休 trace 的计数。
 
 JavaScript callout 在被跟踪线程同步执行，接收实时可读写的 ARM64 `CpuContext`：`pc/sp/nzcv/x0..x28/fp/lr/q0..q31`。通用寄存器返回 `NativePointer`，`nzcv` 返回整数，向量寄存器返回 16 字节 `ArrayBuffer`，赋值时也接受 `ArrayBuffer`、TypedArray 或字节数组。该对象只在当前 callout 回调内有效，离开回调后继续访问会抛出异常。
 
@@ -1851,7 +1886,7 @@ JavaScript callout 在被跟踪线程同步执行，接收实时可读写的 ARM
 
 `%reload` 会先停止 Stalker 并注销当前脚本的模块观察器，但保留进程级 Gum/GLib runtime；新脚本初始化时重新注册观察器。只有 agent 最终退出时才释放 Gum，避免同一进程内重复初始化 Frida 的 startup callbacks。
 
-与 Frida 17.15.5 的当前主要差异是 transform 尚未暴露 ARM64 writer 方法。`putCallout()`、`onEvent/data` 与 `addCallProbe()` 已支持 JavaScript、`NativeCallback` 或 CModule/原生指针回调；JavaScript callout 可同步读写完整 ARM64 `CpuContext`，调用探针也可同步读取和修改参数。`queueDrainInterval` 已按每次 `follow()` 时的配置周期派发 `onReceive/onCallSummary`，设为 `0` 可禁用自动派发；`unfollow()`、`flush()` 和 `garbageCollect()` 仍会同步排空队列。
+transform iterator 已覆盖 Frida 17.15.5 `Arm64Writer` 与 `Arm64Relocator` 的全部 JavaScript 成员（`dispose()` 在 iterator 上是空操作，因为输出 writer 归 Gum 所有）。`putCallout()`、`onEvent/data` 与 `addCallProbe()` 已支持 JavaScript、`NativeCallback` 或 CModule/原生指针回调；JavaScript callout 可同步读写完整 ARM64 `CpuContext`，调用探针也可同步读取和修改参数。`queueDrainInterval` 已按每次 `follow()` 时的配置周期派发 `onReceive/onCallSummary`，设为 `0` 可禁用自动派发；`unfollow()`、`flush()` 和 `garbageCollect()` 仍会同步排空队列。
 
 ## QBDI Trace
 
