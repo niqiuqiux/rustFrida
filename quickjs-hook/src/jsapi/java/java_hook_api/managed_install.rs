@@ -1032,9 +1032,7 @@ unsafe fn install_managed_method_helper(
     };
     let spec = get_art_method_spec(env, art_method);
     let ep_offset = spec.entry_point_offset;
-    let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
-    let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
@@ -1073,10 +1071,8 @@ unsafe fn install_managed_method_helper(
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
         spec.access_flags_offset,
-        data_off,
         ep_offset,
         original_access_flags,
-        original_data,
         original_entry_point,
         class_global_ref,
     );
@@ -1147,7 +1143,6 @@ unsafe fn install_managed_method_helper(
                 art_method,
                 original_access_flags,
                 original_entry_point,
-                original_data,
                 hook_type: HookType::Managed {
                     replacement_art_method: helper_art_method,
                     sentinel_addr: 0,
@@ -1199,9 +1194,7 @@ unsafe fn install_count_orig_fast_path(
 
     let spec = get_art_method_spec(env, art_method);
     let ep_offset = spec.entry_point_offset;
-    let data_off = spec.data_offset;
     let original_access_flags = std::ptr::read_volatile((art_method as usize + spec.access_flags_offset) as *const u32);
-    let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
     let bridge = find_art_bridge_functions(env, ep_offset);
 
@@ -1222,10 +1215,8 @@ unsafe fn install_count_orig_fast_path(
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
         spec.access_flags_offset,
-        data_off,
         ep_offset,
         original_access_flags,
-        original_data,
         original_entry_point,
         class_global_ref,
     );
@@ -1267,7 +1258,6 @@ unsafe fn install_count_orig_fast_path(
                 art_method,
                 original_access_flags,
                 original_entry_point,
-                original_data,
                 hook_type: HookType::Managed {
                     replacement_art_method: 0,
                     sentinel_addr: 0,

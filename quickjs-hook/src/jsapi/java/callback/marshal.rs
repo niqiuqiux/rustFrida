@@ -489,15 +489,6 @@ unsafe fn convert_java_array_to_js(
     Some(arr)
 }
 
-unsafe fn marshal_borrowed_java_object_to_js(
-    ctx: *mut ffi::JSContext,
-    env: JniEnv,
-    obj: *mut std::ffi::c_void,
-    class_name_hint: Option<&str>,
-) -> ffi::JSValue {
-    marshal_java_object_to_js_inner(ctx, env, obj, class_name_hint, false, false, 0)
-}
-
 pub(super) unsafe fn marshal_local_java_object_to_js(
     ctx: *mut ffi::JSContext,
     env: JniEnv,

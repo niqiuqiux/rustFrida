@@ -163,15 +163,6 @@ pub(super) unsafe extern "C" fn js_java_release_instance_refs(
     ffi::JS_NewBigUint64(ctx, released)
 }
 
-pub(super) unsafe fn enumerate_instance_refs(
-    env: JniEnv,
-    class_name: &str,
-    include_subtypes: bool,
-    max_count: usize,
-) -> Result<Vec<u64>, String> {
-    enumerate_instance_refs_with_options(env, class_name, include_subtypes, max_count, true)
-}
-
 pub(super) unsafe fn enumerate_instance_refs_with_options(
     env: JniEnv,
     class_name: &str,

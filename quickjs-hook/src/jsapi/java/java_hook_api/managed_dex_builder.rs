@@ -3,8 +3,11 @@ use std::collections::BTreeSet;
 use super::super::jni_core::JniEnv;
 use super::super::reflect::{enumerate_methods, enumerate_methods_declared_only};
 
+// DEX access_flags 常量表按 dex-format 抄全，用不上的成员也留着——照着规范查表时
+// 缺项比多项更容易出错。
 pub(super) const ACC_PUBLIC: u32 = 0x0001;
 pub(super) const ACC_PRIVATE: u32 = 0x0002;
+#[allow(dead_code)]
 pub(super) const ACC_PROTECTED: u32 = 0x0004;
 pub(super) const ACC_STATIC: u32 = 0x0008;
 pub(super) const ACC_FINAL: u32 = 0x0010;
@@ -13,6 +16,7 @@ pub(super) const ACC_VOLATILE: u32 = 0x0040;
 pub(super) const ACC_NATIVE: u32 = 0x0100;
 pub(super) const ACC_SYNTHETIC: u32 = 0x1000;
 pub(super) const ACC_CONSTRUCTOR: u32 = 0x0001_0000;
+#[allow(dead_code)]
 pub(super) const ACC_DECLARED_SYNCHRONIZED: u32 = 0x0002_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

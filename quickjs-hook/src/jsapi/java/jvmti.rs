@@ -94,52 +94,6 @@ pub(super) unsafe fn jvmti_enumerate_instances(
     Ok(out)
 }
 
-pub(super) unsafe fn jvmti_enumerate_instance_mirrors(
-    target_cls: *mut c_void,
-    max_count: usize,
-) -> Result<Vec<u64>, String> {
-    let hits = collect_tagged_instances(target_cls, max_count)?;
-
-    let mut out = Vec::with_capacity(hits.objects.len());
-    for obj in &hits.objects {
-        if let Some(mirror) = decode_jvmti_object_ref(*obj) {
-            out.push(mirror);
-        }
-    }
-
-    clear_tags_and_deallocate(hits);
-    Ok(out)
-}
-
-pub(super) unsafe fn jvmti_enumerate_instance_mirrors_by_signature(
-    class_signature: &str,
-    max_count: usize,
-) -> Result<Vec<u64>, String> {
-    let jvmti = get_or_init_jvmti_env()?;
-    let Some(target) = find_loaded_class_by_signature(jvmti, class_signature)? else {
-        return Err(format!("loaded class not found: {}", class_signature));
-    };
-
-    output_verbose(&format!(
-        "[jvmti] loaded class signature matched {} -> {:?}",
-        class_signature, target.klass
-    ));
-
-    let hits = collect_tagged_instances(target.klass, max_count);
-    deallocate_if_nonnull(jvmti, target.classes_raw as *mut u8);
-    let hits = hits?;
-
-    let mut out = Vec::with_capacity(hits.objects.len());
-    for obj in &hits.objects {
-        if let Some(mirror) = decode_jvmti_object_ref(*obj) {
-            out.push(mirror);
-        }
-    }
-
-    clear_tags_and_deallocate(hits);
-    Ok(out)
-}
-
 /// Every loaded class, as Java-style names such as `java.lang.String`.
 ///
 /// JVMTI reports JNI signatures (`Ljava/lang/String;`); array and primitive
@@ -183,79 +137,6 @@ fn class_name_from_signature(signature: &str) -> String {
     match signature.strip_prefix('L').and_then(|rest| rest.strip_suffix(';')) {
         Some(name) => name.replace('/', "."),
         None => signature.to_string(),
-    }
-}
-
-pub(super) unsafe fn jvmti_class_mirror_by_signature(class_signature: &str) -> Result<Option<u64>, String> {
-    let jvmti = get_or_init_jvmti_env()?;
-    let Some(target) = find_loaded_class_by_signature(jvmti, class_signature)? else {
-        return Ok(None);
-    };
-
-    output_verbose(&format!(
-        "[jvmti] loaded class signature matched {} -> {:?}",
-        class_signature, target.klass
-    ));
-
-    let mirror = decode_jvmti_object_ref(target.klass);
-    deallocate_if_nonnull(jvmti, target.classes_raw as *mut u8);
-    Ok(mirror)
-}
-
-struct LoadedClassMatch {
-    klass: *mut c_void,
-    classes_raw: *mut *mut c_void,
-}
-
-unsafe fn find_loaded_class_by_signature(
-    jvmti: *mut c_void,
-    expected_signature: &str,
-) -> Result<Option<LoadedClassMatch>, String> {
-    let get_loaded_classes: JvmtiGetLoadedClassesFn =
-        std::mem::transmute(jvmti_fn_ptr(jvmti, JVMTI_GET_LOADED_CLASSES));
-    let get_class_signature: JvmtiGetClassSignatureFn =
-        std::mem::transmute(jvmti_fn_ptr(jvmti, JVMTI_GET_CLASS_SIGNATURE));
-
-    let mut count: i32 = 0;
-    let mut classes: *mut *mut c_void = ptr::null_mut();
-    let ret = get_loaded_classes(jvmti, &mut count, &mut classes);
-    if ret != JVMTI_ERROR_NONE {
-        return Err(format!("GetLoadedClasses failed: {}", ret));
-    }
-
-    let mut matched = None;
-    let n = count.max(0) as usize;
-    for i in 0..n {
-        let klass = *classes.add(i);
-        if klass.is_null() {
-            continue;
-        }
-
-        let mut signature: *mut c_char = ptr::null_mut();
-        let mut generic: *mut c_char = ptr::null_mut();
-        let ret = get_class_signature(jvmti, klass, &mut signature, &mut generic);
-        if ret == JVMTI_ERROR_NONE && !signature.is_null() {
-            let sig = std::ffi::CStr::from_ptr(signature).to_string_lossy();
-            if sig.as_ref() == expected_signature {
-                matched = Some(klass);
-            }
-        }
-        deallocate_if_nonnull(jvmti, signature as *mut u8);
-        deallocate_if_nonnull(jvmti, generic as *mut u8);
-
-        if matched.is_some() {
-            break;
-        }
-    }
-
-    if let Some(klass) = matched {
-        Ok(Some(LoadedClassMatch {
-            klass,
-            classes_raw: classes,
-        }))
-    } else {
-        deallocate_if_nonnull(jvmti, classes as *mut u8);
-        Ok(None)
     }
 }
 
@@ -331,37 +212,6 @@ unsafe fn clear_tags_and_deallocate(hits: TaggedInstances) {
 
     deallocate_if_nonnull(hits.jvmti, hits.objects_raw as *mut u8);
     deallocate_if_nonnull(hits.jvmti, hits.tags_raw as *mut u8);
-}
-
-unsafe fn decode_jvmti_object_ref(obj: *mut c_void) -> Option<u64> {
-    const KIND_MASK: u64 = 0x3;
-    const KIND_LOCAL: u64 = 0x1;
-
-    let raw = obj as u64;
-    if raw == 0 {
-        return None;
-    }
-
-    let entry = match raw & KIND_MASK {
-        KIND_LOCAL => raw & !KIND_MASK,
-        0 => raw,
-        _ => return None,
-    };
-    if entry < 0x1000 || !crate::jsapi::util::is_addr_accessible(entry, 4) {
-        return None;
-    }
-
-    let compressed = std::ptr::read_volatile(entry as *const u32) as u64;
-    if compressed >= 0x1000 && crate::jsapi::util::is_addr_accessible(compressed, 4) {
-        return Some(compressed);
-    }
-
-    let raw_root = std::ptr::read_volatile(entry as *const u64) & super::PAC_STRIP_MASK;
-    if raw_root >= 0x1000 && crate::jsapi::util::is_addr_accessible(raw_root, 4) {
-        return Some(raw_root);
-    }
-
-    None
 }
 
 unsafe fn get_or_init_jvmti_env() -> Result<*mut c_void, String> {

@@ -322,10 +322,6 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::Throw { src });
     }
 
-    pub(super) fn add_try_item(&mut self, start: DexLabel, end: DexLabel, handler_type: String, handler: DexLabel) {
-        self.add_try_handlers(start, end, vec![IrCatchHandler { handler_type, handler }], None);
-    }
-
     pub(super) fn add_try_handlers(
         &mut self,
         start: DexLabel,

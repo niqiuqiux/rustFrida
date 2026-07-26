@@ -119,6 +119,9 @@ pub(super) unsafe fn cache_fields_for_class(env: JniEnv, class_name: &str) {
     }
 }
 
+/// 从 class mirror 指针建字段缓存，给拿不到 jclass 的 raw clone 线程用。目前那条路径
+/// 还是走 cache_fields_for_class()，所以这里暂时没有调用方。
+#[allow(dead_code)]
 pub(super) unsafe fn cache_fields_for_class_mirror(_env: JniEnv, class_name: &str, class_mirror: u64) {
     super::safe_mem::refresh_mem_regions();
     if class_mirror < 0x1000 || !super::safe_mem::is_readable(class_mirror, 4) {

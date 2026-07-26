@@ -66,10 +66,10 @@ impl HookType {
 #[derive(Clone)]
 pub(super) struct JavaHookData {
     pub(super) art_method: u64,
-    // Frida-style original method state（unhook 时恢复全部字段）
+    // Frida-style original method state。只存 unhook 会写回去的那些：restore_art_method_fields()
+    // 刻意不还原 data_，免得拿旧快照盖掉 ART 后来自己做的更新。
     pub(super) original_access_flags: u32,
     pub(super) original_entry_point: u64, // quickCode / entry_point_
-    pub(super) original_data: u64,        // data_ / jniCode
     // Hook 路径类型
     pub(super) hook_type: HookType,
     // Backup clone for callOriginal (heap, 原始状态副本)

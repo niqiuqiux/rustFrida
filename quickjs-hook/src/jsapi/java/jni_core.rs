@@ -859,7 +859,10 @@ pub(super) const JNI_MONITOR_ENTER: usize = 217;
 pub(super) const JNI_MONITOR_EXIT: usize = 218;
 pub(super) const JNI_REGISTER_NATIVES: usize = 215;
 pub(super) const JNI_UNREGISTER_NATIVES: usize = 216;
+// JNIEnv 函数表下标按 jni.h 的顺序抄，暂时没调用方的也留着：查表时相邻下标互为参照。
+#[allow(dead_code)]
 pub(super) const JNI_GET_PRIMITIVE_ARRAY_CRITICAL: usize = 222;
+#[allow(dead_code)]
 pub(super) const JNI_RELEASE_PRIMITIVE_ARRAY_CRITICAL: usize = 223;
 pub(super) const JNI_NEW_DIRECT_BYTE_BUFFER: usize = 229;
 pub(super) const JNI_GET_DIRECT_BUFFER_ADDRESS: usize = 230;

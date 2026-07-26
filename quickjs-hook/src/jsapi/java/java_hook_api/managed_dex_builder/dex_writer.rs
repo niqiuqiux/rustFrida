@@ -170,6 +170,9 @@ impl DexBuilder {
         self.classes.push(class);
     }
 
+    /// 目前生成的 helper dex 只引用方法，不引用字段，所以还没有调用方。留着是因为
+    /// field_ids 段本身是写出去的，缺的只是往里加项的入口。
+    #[allow(dead_code)]
     pub(super) fn add_field_ref(&mut self, field: FieldRef) -> FieldRef {
         self.field_refs.insert(field.clone());
         field

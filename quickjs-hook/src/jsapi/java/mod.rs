@@ -73,10 +73,6 @@ pub unsafe fn finish_java_worker_thread_from_native(
     java_hook_api::finish_java_worker_thread_from_native(env, worker_cls)
 }
 
-pub(crate) unsafe fn decode_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
-    art_class::decode_jobject(env, obj)
-}
-
 pub(crate) unsafe fn decode_global_jobject_raw(env: jni_core::JniEnv, obj: *mut std::ffi::c_void) -> Option<u64> {
     art_class::decode_global_jobject(env, obj)
 }

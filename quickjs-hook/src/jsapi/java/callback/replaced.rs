@@ -23,6 +23,10 @@ pub(in crate::jsapi::java) fn set_replacement_method(original: u64, replacement:
 /// Register original -> real Java replacement ArtMethod. Router modes 4/5 use
 /// the normal replacement ABI but skips declaring_class_ synchronization,
 /// because replacement belongs to helper dex and is managed by ART/GC.
+///
+/// 还没有 Rust 侧调用方：目前只有 hook_engine_art.c 自己按 mode 4 往路由表里写。
+/// 这条路多做一件事——同时登记 REPLACED_METHODS——C 那边做不到，所以留着。
+#[allow(dead_code)]
 pub(in crate::jsapi::java) fn set_managed_replacement_method(
     original: u64,
     replacement: u64,

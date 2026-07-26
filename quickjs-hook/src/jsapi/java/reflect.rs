@@ -157,17 +157,25 @@ pub(super) struct ReflectIds {
     /// Global ref to java.lang.String class (for IsInstanceOf checks in callbacks)
     #[allow(dead_code)]
     pub(super) string_class: *mut std::ffi::c_void,
+    // 下面六个和 string_class 一样，是初始化时一次性查好的 List/Array marshaling id。
+    // 现在的 marshal 路径按 JNI 签名分派，还没有回头读它们。
     /// Global ref to java.util.List for automatic List/ArrayList marshaling
+    #[allow(dead_code)]
     pub(super) list_class: *mut std::ffi::c_void,
     /// java.util.List.size() -> int
+    #[allow(dead_code)]
     pub(super) list_size_mid: *mut std::ffi::c_void,
     /// java.util.List.get(int) -> Object
+    #[allow(dead_code)]
     pub(super) list_get_mid: *mut std::ffi::c_void,
     /// Global ref to java.lang.reflect.Array for automatic Java array marshaling
+    #[allow(dead_code)]
     pub(super) array_class: *mut std::ffi::c_void,
     /// Array.getLength(Object) -> int
+    #[allow(dead_code)]
     pub(super) array_get_length_mid: *mut std::ffi::c_void,
     /// Array.get(Object, int) -> Object
+    #[allow(dead_code)]
     pub(super) array_get_mid: *mut std::ffi::c_void,
     /// java.lang.Boolean.booleanValue() -> boolean
     pub(super) boolean_value_mid: *mut std::ffi::c_void,

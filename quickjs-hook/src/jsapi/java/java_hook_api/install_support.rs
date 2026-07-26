@@ -25,10 +25,8 @@ pub(super) unsafe fn delete_global_ref_best_effort(class_global_ref: usize) {
 pub(super) struct JavaHookInstallGuard {
     art_method: u64,
     access_flags_offset: usize,
-    data_offset: usize,
     entry_point_offset: usize,
     original_access_flags: u32,
-    original_data: u64,
     original_entry_point: u64,
     replacement_addr: usize,
     class_global_ref: usize,
@@ -44,20 +42,16 @@ impl JavaHookInstallGuard {
     pub(super) fn new(
         art_method: u64,
         access_flags_offset: usize,
-        data_offset: usize,
         entry_point_offset: usize,
         original_access_flags: u32,
-        original_data: u64,
         original_entry_point: u64,
         class_global_ref: usize,
     ) -> Self {
         Self {
             art_method,
             access_flags_offset,
-            data_offset,
             entry_point_offset,
             original_access_flags,
-            original_data,
             original_entry_point,
             replacement_addr: 0,
             class_global_ref,
