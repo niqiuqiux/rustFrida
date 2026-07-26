@@ -72,12 +72,14 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 
 | Area | Status | Roadmap goal | Missing upstream surface |
 | --- | --- | --- | --- |
-| Core runtime | partial | Goal 07 | `Worker` |
+| Core runtime | partial | Goal 07 | `Worker`, `Script.load`, `Script.evaluate`, `Script.registerSourceMap`, `Script.findSourceMap`, `Script.derefWeak`, `Script.setGlobalAccessHandler`, `SourceMap`, `ArrayBuffer.wrap`, `ArrayBuffer.prototype.unwrap`, `NativePointer.prototype.sign`, `NativePointer.prototype.blend` |
 | Native ABI | compatible | Goal 04 |  |
-| Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
-| Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
+| Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints`, `Thread.sleep` |
+| Module and Process | partial | Goal 03 | `Process.runOnThread`, `Process.setExceptionHandler`, `Process.findThreadById`, `Process.enumerateSystemRanges`, `Process.findFunctionRange`, `ModuleMap.prototype.handle` |
+| Interceptor | partial | Goal 10 | `Interceptor.replaceFast`, `Interceptor.defaults` |
 | Memory | compatible | Goal 06 |  |
 | Stalker | compatible | Goal 05 |  |
+| Code writer | partial | Goal 10 | `standalone Arm64Writer`, `standalone Arm64Relocator`, `CModule.builtins`, `CModule.prototype.dispose` |
 | Java facade | partial | Goal 08 | `ClassFactory`, `registerClass`, `openClassFile`, `enumerateMethods`, `backtrace` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |
 

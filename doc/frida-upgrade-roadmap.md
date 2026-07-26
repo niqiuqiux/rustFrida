@@ -1,6 +1,7 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 08b 已完成；八项设备回归全部通过）
+> 状态：执行中（Goal 00 至 Goal 08b 已完成；八项设备回归全部通过。Goal 09、Goal 10 待做，
+> 其中 Goal 10 来自 §4.2 的成员级实测）
 >
 > 更新日期：2026-07-26
 >
@@ -98,7 +99,30 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
+以下清单来自 2026-07-26 的一次设备实测：把 `doc/frida-api-surface.json` 里抽取的上游成员表
+（`gumjs_*_entries`）逐条在真机运行时上 resolve，261 条成员里 60 条缺失。其中约一半是
+形状差异而非能力差异——`DebugSymbol`、`Instruction`、`Module` 实例在上游是 class，在
+rustFrida 是带同名字段的普通对象，脚本读得到；`Interceptor.attach()` 的返回值同样有
+`detach()`，`onEnter` 的 `this` 同样有 `context`/`threadId`/`depth`/`returnAddress`。
+剩下的是真缺口：
+
 1. 缺少 `Worker`、`Java.ClassFactory` 与 `Java.registerClass`。
+2. `Arm64Writer` 没有独立全局，`Arm64Relocator` 只接受 Stalker transform iterator 作为
+   output。也就是说「`Memory.alloc()` + `new Arm64Writer(ptr)` 自己生成一段代码」这种
+   上游常见写法在 rustFrida 上跑不了；ARM64 writer 的能力目前只在 transform 回调内可达。
+3. `Interceptor` 少 `replaceFast` 与 `defaults`。
+4. `Script` 的弱引用三件套只有两件：有 `bindWeak`/`unbindWeak`，没有 `derefWeak`；
+   另外少 `load`、`evaluate`、`registerSourceMap`、`findSourceMap`、`setGlobalAccessHandler`，
+   `SourceMap` 类也没有。
+5. `Process` 少 `runOnThread`、`setExceptionHandler`、`findThreadById`、
+   `enumerateSystemRanges`、`findFunctionRange`。
+6. `NativePointer` 少 `sign`/`blend`（ARM64 PAC），`ArrayBuffer` 少 `wrap`/`unwrap`。
+7. `Thread` 少 `sleep`；`ModuleMap` 实例少 `handle`（rustFrida 的 ModuleMap 是 JS facade，
+   没有底层 Gum 句柄）。
+
+已核实**不是**缺口的：`recv(...).wait()` 存在（上游靠内部 `_waitForEvent` 实现，
+rustFrida 自己实现了同样的同步等待）；`NativeFunction` 接受 `exceptions`/`scheduling`
+选项；`ptr().toMatchPattern()` 存在。
 
 ## 5. 架构与稳定性风险
 
@@ -502,6 +526,39 @@ cargo build --offline --release --target aarch64-linux-android
 - Profiler/Sampler 依赖 Interceptor、Backtracer 和 callback 生命周期，必须排在 Goal 02/04 之后。
 - Android 不需要的 Kernel 或跨平台 API可以返回明确的 unsupported，不追求空壳对象。
 
+### Goal 10：独立代码生成与 Interceptor 补齐（P1/P2）
+
+状态：**未开始**。由 2026-07-26 的成员级实测发现（见 §4.2），此前不属于任何 Goal。
+
+目标：让 ARM64 代码生成脱离 Stalker transform 回调，并补上 Interceptor 的两个上游入口。
+
+范围：
+
+- 独立 `Arm64Writer`：能对任意可写内存（典型是 `Memory.alloc()` 的返回值）构造。当前
+  writer 的方法只挂在 transform iterator 上，opcode 表（`quickjs-hook/src/jsapi/stalker_writer.rs`）
+  已经齐备，缺的是一个不依赖 transform token 的 writer 宿主。
+- 独立 `Arm64Relocator`：`output` 参数接受上面的 writer，而不是只认 transform iterator。
+- `Interceptor.replaceFast`、`Interceptor.defaults`。
+- 顺带评估 `CModule.builtins` 与 `CModule.prototype.dispose`，它们和代码生成的
+  ownership 模型是同一类问题。
+
+约束与风险：
+
+- 独立 writer 的生命周期不再由 Gum 的 transform 输出托管，`dispose` 必须真的做事，
+  而 transform iterator 上的 `dispose` 必须继续保持 no-op（写出的代码归 Gum 所有）。
+  这两条语义不能共用同一个实现。
+- `flush()` 与 I-cache 刷新的责任要写清楚：独立 writer 写完后由谁刷，重复 flush 是否幂等。
+- `replaceFast` 走的是 Gum Interceptor 的快速路径，而 rustFrida 的 native hook 走自研
+  engine。落地前必须先明确这个 target 的 owner 是谁，不能让两套 Interceptor 同时管
+  （见 §5.1）。
+
+验收：
+
+- `Memory.alloc()` + `new Arm64Writer()` 生成一段可调用的函数并通过 `NativeFunction` 执行。
+- 独立 relocator 把一段已有代码搬到新位置后仍可执行。
+- Stalker transform 内的 writer 行为不变，Goal 05 的设备回归继续通过。
+- `%reload` 与 shutdown 后不残留可执行映射或未 dispose 的 writer。
+
 ## 7. 推荐执行顺序
 
 | 阶段 | Goals | 原因 |
@@ -511,7 +568,8 @@ cargo build --offline --release --target aarch64-linux-android
 | C | 04 -> 05 | 先解决 callback ABI，再扩展 Stalker writer 和 native callback 组合 |
 | D | 06、07 | Memory 可相对独立；消息循环需要已有 callback/owner 模型 |
 | E | 08 | Java 差异大，应在通用 runtime 生命周期稳定后推进 |
-| F | 09 | 按实际使用需求选择，不作为“完整 Frida”阻塞项 |
+| F | 10 | 独立 writer 复用 Goal 05 已建好的 opcode 表；`replaceFast` 需要 §5.1 的 owner 结论已经稳定 |
+| G | 09 | 按实际使用需求选择，不作为“完整 Frida”阻塞项 |
 
 ## 8. 所有 Goal 的统一验收门槛
 

@@ -100,7 +100,14 @@ Object.defineProperties(globalThis, {
 
         self.assertEqual(
             areas_by_name["Module and Process"]["missing"],
-            ["runOnThread", "exception handler"],
+            [
+                "Process.runOnThread",
+                "Process.setExceptionHandler",
+                "Process.findThreadById",
+                "Process.enumerateSystemRanges",
+                "Process.findFunctionRange",
+                "ModuleMap.prototype.handle",
+            ],
         )
 
     def test_goal04_native_abi_surface_is_pinned(self):
@@ -136,6 +143,33 @@ Object.defineProperties(globalThis, {
 
         self.assertEqual(areas_by_name["Stalker"]["status"], "compatible")
         self.assertEqual(areas_by_name["Stalker"]["missing"], [])
+
+    def test_interceptor_and_code_writer_areas_are_pinned(self):
+        """Both areas came out of a device sweep against the upstream member tables.
+
+        Stalker itself is complete, but the ARM64 writer only exists as members on
+        the transform iterator, and `Arm64Relocator` refuses any output that is not
+        that iterator — so neither is usable for standalone code generation.
+        """
+        spec = frida_surface.load_json(frida_surface.SPEC_PATH)
+        areas_by_name = {entry["area"]: entry for entry in spec["compatibilityAreas"]}
+
+        self.assertEqual(areas_by_name["Interceptor"]["status"], "partial")
+        self.assertEqual(
+            areas_by_name["Interceptor"]["missing"],
+            ["Interceptor.replaceFast", "Interceptor.defaults"],
+        )
+
+        self.assertEqual(areas_by_name["Code writer"]["status"], "partial")
+        self.assertEqual(
+            areas_by_name["Code writer"]["missing"],
+            [
+                "standalone Arm64Writer",
+                "standalone Arm64Relocator",
+                "CModule.builtins",
+                "CModule.prototype.dispose",
+            ],
+        )
 
     def test_writer_opcode_table_is_well_formed(self):
         tables = frida_surface.read_writer_tables()

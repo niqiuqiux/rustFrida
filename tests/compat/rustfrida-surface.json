@@ -594,7 +594,18 @@
       "status": "partial",
       "goal": "07",
       "missing": [
-        "Worker"
+        "Worker",
+        "Script.load",
+        "Script.evaluate",
+        "Script.registerSourceMap",
+        "Script.findSourceMap",
+        "Script.derefWeak",
+        "Script.setGlobalAccessHandler",
+        "SourceMap",
+        "ArrayBuffer.wrap",
+        "ArrayBuffer.prototype.unwrap",
+        "NativePointer.prototype.sign",
+        "NativePointer.prototype.blend"
       ]
     },
     {
@@ -609,7 +620,8 @@
       "goal": "02",
       "missing": [
         "non-module ApiResolver types",
-        "Thread hardware breakpoints/watchpoints"
+        "Thread hardware breakpoints/watchpoints",
+        "Thread.sleep"
       ]
     },
     {
@@ -617,8 +629,21 @@
       "status": "partial",
       "goal": "03",
       "missing": [
-        "runOnThread",
-        "exception handler"
+        "Process.runOnThread",
+        "Process.setExceptionHandler",
+        "Process.findThreadById",
+        "Process.enumerateSystemRanges",
+        "Process.findFunctionRange",
+        "ModuleMap.prototype.handle"
+      ]
+    },
+    {
+      "area": "Interceptor",
+      "status": "partial",
+      "goal": "10",
+      "missing": [
+        "Interceptor.replaceFast",
+        "Interceptor.defaults"
       ]
     },
     {
@@ -632,6 +657,17 @@
       "status": "compatible",
       "goal": "05",
       "missing": []
+    },
+    {
+      "area": "Code writer",
+      "status": "partial",
+      "goal": "10",
+      "missing": [
+        "standalone Arm64Writer",
+        "standalone Arm64Relocator",
+        "CModule.builtins",
+        "CModule.prototype.dispose"
+      ]
     },
     {
       "area": "Java facade",
