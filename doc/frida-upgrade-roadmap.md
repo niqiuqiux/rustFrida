@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 08 已完成首批范围）
+> 状态：执行中（Goal 00 至 Goal 08 已完成首批范围；八项设备回归首次全部通过）
 >
 > 更新日期：2026-07-26
 >
@@ -130,10 +130,24 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 
 ### 5.6 已知可观测性缺口
 
-- `run_goal01_module_unload.py` 在当前设备的 shutdown 阶段稳定产生 tombstone；见 Goal 05 的既有缺口记录。
 - `pthread_shim` 的线程不带独立 TLS，agent 因此只能有一个后台 JS 线程；见 Goal 07 的 §7.1。
 
-Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理；`Memory.alloc()` 的页权限与生命周期漂移已由 Goal 06 校正。
+Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理；`Memory.alloc()` 的页权限与生命周期漂移已由 Goal 06 校正；shutdown 阶段的两处线程崩溃已由 §5.7 修复。
+
+### 5.7 shutdown 阶段不得留下无人等待的线程
+
+两处 tombstone 都是同一个形态：某个线程还在执行 agent 代码，而 shutdown 已经把它脚下的东西拆掉了。两者都在 `993d41c` 修复。
+
+**Gum 不再 deinit。** 丢弃最后一个 `Gum` 句柄会执行 `gum_deinit_embedded()`，它在拆除过程中重新进入 `gobject_perform_init`（gtype.c:4481）——此时 GObject 类型系统已被销毁，取 rwlock 用的指针丢掉了 load base，每次都是 `0x47c00`，在 `wwb-loader` 线程上 SIGSEGV。符号化方法见下。修复是让 `release_gum()` 泄漏该句柄：此时更早的清理阶段已经 unfollow Stalker、revert Interceptor、disconnect module-registry observer，没有任何 Gum 回调还指向 agent；Gum 自己的析构器链表在它的堆里而不是 `atexit`，agent 被 munmap 后不会有人去跑它。
+
+**延时任务必须走 pump。** `schedule_internal_shared_entry_refresh` 原先起一个 detached 线程，在三次尝试之间 sleep。没有人 join 它，shutdown 可以在它还在 agent 里时就 munmap——Goal 08 关闭后观察到 `rf-art-refresh` 线程在已卸载内存上执行。改为投递到 timer pump 的延时后台任务：teardown 会丢弃未开始的任务并 join pump，同时也守住了 §7.1 的单后台线程约束。
+
+符号化 tombstone 的可复现步骤（`release` 构建被 strip，符号必须来自产生该 tombstone 的同一个二进制）：
+
+1. `cargo build --profile release-symbols --target aarch64-linux-android`，跑两遍（`rustfrida` 用 `include_bytes!` 嵌入 `libagent.so`，一遍只会嵌入上一次的 agent）。
+2. 用 `--rustfrida target/aarch64-linux-android/release-symbols/rustfrida` 复现。
+3. `load_base = pc − (mapping_offset + pc_in_module + delta)`，其中 `delta` 是可执行 LOAD 段的 `vaddr − offset`（`llvm-readelf -lW`）。tombstone 的寄存器区通常已经带着 load base——本例中 `x23` 就是。
+4. `llvm-addr2line -f -C -i -e libagent.so <vaddr>`。`lr` 同样要符号化：崩溃点往往只说明"锁坏了"，调用者才说明是谁把它弄坏的。
 
 ## 6. Goal 路线
 
@@ -315,7 +329,7 @@ cargo build --offline --release --target aarch64-linux-android
 
 已知既有缺口（不由本 Goal 引入）：
 
-- `tests/device/run_goal01_module_unload.py` 的 `--mode full` 与 `--mode hfollow` 在当前设备上于 shutdown 阶段（`cut_process_observers` 之后）稳定产生 tombstone：`wwb-loader` 线程 SIGABRT/SI_QUEUE，测试主体断言全部通过后才崩溃。在 Goal 05 改动前的 `89577ec` 上用同样步骤可完全复现，因此属于 Goal 01 场景的既有 shutdown 缺陷，需要单独立项排查。
+- ~~`tests/device/run_goal01_module_unload.py` 的 `--mode full` 与 `--mode hfollow` 在当前设备上于 shutdown 阶段（`cut_process_observers` 之后）稳定产生 tombstone~~：已在 `993d41c` 修复，详见 §5.7。
 
 目标：补齐上游 transform 的代码生成能力，并提高事件丢弃可见性。
 
