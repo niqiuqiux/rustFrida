@@ -100,29 +100,38 @@ fn mark_original_entry_mutated(art_method: u64) {
     });
 }
 
+/// Re-normalise the shared entry a few times after the hook goes in, because ART
+/// can restore it from a compiled entry point moments later.
+///
+/// The retries run on the timer pump rather than on a detached thread that
+/// sleeps between them. Nothing joins such a thread, so teardown could unmap the
+/// agent while it was still inside this code — the `rf-art-refresh` thread was
+/// observed faulting on unmapped memory after a Goal 08 shutdown. Queued tasks
+/// are dropped on teardown and the pump itself is joined, which closes that
+/// window; it also keeps to the agent's one-background-thread rule.
 fn schedule_internal_shared_entry_refresh(art_method: u64, ep_offset: usize, bridge: &'static ArtBridgeFunctions) {
-    let _ = crate::raw_thread::spawn_detached(b"rf-art-refresh\0", move || {
-        for delay_ms in [120_i64, 400, 900] {
-            crate::raw_thread::sleep_ms(delay_ms);
-            let still_registered =
-                with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
-            if !still_registered {
-                return;
-            }
-            let refreshed = unsafe {
-                normalize_internal_shared_entry_if_needed(
-                    art_method,
-                    ep_offset,
-                    std::ptr::null_mut(),
-                    bridge,
-                    "delayed-entry-refresh",
-                )
-            };
-            if refreshed {
-                mark_original_entry_mutated(art_method);
-            }
-        }
-    });
+    for delay_ms in [120_u64, 400, 900] {
+        let _ =
+            crate::jsapi::timers::submit_background_task_after(std::time::Duration::from_millis(delay_ms), move || {
+                let still_registered =
+                    with_registry(&JAVA_HOOK_REGISTRY, |registry| registry.contains_key(&art_method)).unwrap_or(false);
+                if !still_registered {
+                    return;
+                }
+                let refreshed = unsafe {
+                    normalize_internal_shared_entry_if_needed(
+                        art_method,
+                        ep_offset,
+                        std::ptr::null_mut(),
+                        bridge,
+                        "delayed-entry-refresh",
+                    )
+                };
+                if refreshed {
+                    mark_original_entry_mutated(art_method);
+                }
+            });
+    }
 }
 
 unsafe fn free_callback_bytes(ctx: *mut ffi::JSContext, callback_bytes: [u8; 16]) {

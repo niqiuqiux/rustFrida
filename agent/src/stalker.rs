@@ -345,9 +345,26 @@ fn retain_gum() -> Result<Gum, String> {
     Ok(slot.get_or_insert_with(Gum::obtain).clone())
 }
 
+/// Drop the agent's handle on Gum without letting the singleton deinitialise.
+///
+/// Dropping the last `Gum` runs `gum_deinit_embedded()`, and that reliably
+/// crashes this agent: while tearing itself down Gum touches a `GUM_TYPE_*`
+/// macro, which re-enters `gobject_perform_init` (gtype.c) after the GObject
+/// type system has already been torn down. It then takes a rwlock through a
+/// pointer that has lost its load base — `0x47c00` on every run — and faults on
+/// the `wwb-loader` thread just as shutdown finishes.
+///
+/// Leaking is safe here and only leaks memory the agent is about to lose
+/// anyway: the earlier cleanup phases have already unfollowed Stalker, reverted
+/// the Interceptor and disconnected the module-registry observer, so no Gum
+/// callback can point into the agent by the time this runs. Gum's own
+/// destructor list lives in its heap rather than in `atexit`, so nothing tries
+/// to run it after the agent is unmapped.
 fn release_gum() -> Result<(), String> {
     let mut slot = gum_slot().lock().map_err(|_| "Gum runtime lock poisoned".to_string())?;
-    *slot = None;
+    if let Some(gum) = slot.take() {
+        std::mem::forget(gum);
+    }
     Ok(())
 }
 

@@ -76,7 +76,14 @@ static RETIRED_TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
 /// thread it creates shares one TLS block and only one of them can safely run.
 /// Rather than each feature spawning its own, they queue their work here and
 /// the single pump thread runs it.
-type BackgroundTask = Box<dyn FnOnce() + Send>;
+/// A queued job, optionally held back until `due`. Work that needs to happen
+/// "in a little while" belongs here rather than in a thread of its own that
+/// sleeps: such a thread has nobody to join it, so teardown cannot tell whether
+/// it is still inside agent code when the agent is unmapped.
+struct BackgroundTask {
+    due: Instant,
+    run: Box<dyn FnOnce() + Send>,
+}
 static BACKGROUND_TASKS: Mutex<Vec<BackgroundTask>> = Mutex::new(Vec::new());
 
 fn lock_timers() -> std::sync::MutexGuard<'static, TimerState> {
@@ -171,22 +178,47 @@ pub fn scheduled_timer_count() -> usize {
 /// Long tasks delay timers, which is the price of having exactly one thread;
 /// see [`BACKGROUND_TASKS`] for why there is only one.
 pub fn submit_background_task(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    submit_background_task_after(Duration::ZERO, task)
+}
+
+/// Run `task` on the pump thread once `delay` has passed.
+///
+/// Teardown drops whatever has not started yet and joins the pump, so a delayed
+/// task can never run after the agent is unmapped — which is exactly what a
+/// detached sleeping thread could not promise.
+pub fn submit_background_task_after(delay: Duration, task: impl FnOnce() + Send + 'static) -> Result<(), String> {
     ensure_pump()?;
     BACKGROUND_TASKS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .push(Box::new(task));
+        .push(BackgroundTask {
+            due: Instant::now() + delay,
+            run: Box::new(task),
+        });
     TIMERS_CV.notify_all();
     Ok(())
 }
 
-fn take_background_task() -> Option<BackgroundTask> {
+/// Take the earliest task that is due, if any.
+fn take_background_task(now: Instant) -> Option<Box<dyn FnOnce() + Send>> {
     let mut tasks = BACKGROUND_TASKS.lock().unwrap_or_else(|error| error.into_inner());
-    if tasks.is_empty() {
-        None
-    } else {
-        Some(tasks.remove(0))
-    }
+    let index = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.due <= now)
+        .min_by_key(|(_, task)| task.due)
+        .map(|(index, _)| index)?;
+    Some(tasks.remove(index).run)
+}
+
+/// When the earliest queued task comes due, so the pump does not idle past it.
+fn next_background_due() -> Option<Instant> {
+    BACKGROUND_TASKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .map(|task| task.due)
+        .min()
 }
 
 /// Drop queued work that has not started yet, for teardown.
@@ -288,7 +320,7 @@ fn pump_loop() {
     while !PUMP_STOP.load(Ordering::SeqCst) {
         // Queued work first: a caller waiting on a scan should not sit behind
         // an idle poll.
-        if let Some(task) = take_background_task() {
+        if let Some(task) = take_background_task(Instant::now()) {
             PUMP_IN_CALLBACK.store(true, Ordering::SeqCst);
             task();
             PUMP_IN_CALLBACK.store(false, Ordering::SeqCst);
@@ -302,6 +334,11 @@ fn pump_loop() {
             } else {
                 next_due(&state)
             }
+        };
+        // A task waiting out its delay is a deadline like any timer's.
+        let due = match (due, next_background_due()) {
+            (Some(timer), Some(task)) => Some(timer.min(task)),
+            (timer, task) => timer.or(task),
         };
 
         let now = Instant::now();
