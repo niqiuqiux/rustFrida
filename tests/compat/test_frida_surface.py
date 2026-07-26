@@ -153,6 +153,43 @@ Object.defineProperties(globalThis, {
                 for character in entry["argSpec"]:
                     self.assertIn(character, "rcmusalbA", f"{entry['name']} uses an unknown spec character")
 
+    def test_java_bridge_baseline_is_pinned(self):
+        spec = frida_surface.read_java_bridge_spec()
+
+        self.assertEqual(spec["package"], "frida-java-bridge")
+        self.assertEqual(spec["version"], "7.0.12")
+        self.assertTrue(spec["integrity"].startswith("sha512-"))
+        self.assertEqual(len(spec["sha256"]), 64)
+
+        # Every upstream member must be accounted for: implemented already, in
+        # scope for Goal 08, or explicitly deferred. An unclassified member means
+        # the pinned bridge moved and nobody looked.
+        status = spec["rustFridaStatus"]
+        categorised = set(status["implementedBeforeGoal08"]) | set(status["goal08"]) | set(status["deferred"])
+        upstream = set(spec["upstreamMembers"])
+        self.assertEqual(upstream - categorised, set(), "unclassified frida-java-bridge members")
+        self.assertEqual(categorised - upstream, set(), "classified members the pinned bridge does not have")
+
+    def test_java_bridge_version_matches_the_local_frida_checkout(self):
+        lock_path = FRIDA_SOURCE / "subprojects/frida-tools/agents/tracer/package-lock.json"
+        if not lock_path.exists():
+            self.skipTest("local Frida source checkout is unavailable")
+
+        spec = frida_surface.read_java_bridge_spec()
+        lock = frida_surface.load_json(lock_path)
+        entry = lock["packages"]["node_modules/frida-java-bridge"]
+        self.assertEqual(entry["version"], spec["version"])
+        self.assertEqual(entry["integrity"], spec["integrity"])
+
+    def test_java_members_cover_the_goal08_scope(self):
+        spec = frida_surface.read_java_bridge_spec()
+        implemented = frida_surface.read_java_members()
+
+        for name in spec["rustFridaStatus"]["implementedBeforeGoal08"]:
+            self.assertIn(name, implemented, f"{name} was implemented before Goal 08 but is gone")
+        for name in spec["rustFridaStatus"]["goal08"]:
+            self.assertIn(name, implemented, f"{name} is in Goal 08 scope but is not defined")
+
     @unittest.skipUnless(FRIDA_SOURCE.exists(), "local Frida source checkout is unavailable")
     def test_writer_opcode_table_matches_upstream_arm64_surface(self):
         baseline = frida_surface.build_baseline(FRIDA_SOURCE)

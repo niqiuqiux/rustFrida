@@ -19,6 +19,9 @@ JSON_OUTPUT = REPO_ROOT / "doc/frida-api-surface.json"
 MARKDOWN_OUTPUT = REPO_ROOT / "doc/frida-api-surface.md"
 DEVICE_OUTPUT = REPO_ROOT / "tests/device/rfhook_frida_surface.js"
 WRITER_TABLE_PATH = REPO_ROOT / "quickjs-hook/src/jsapi/stalker_writer.rs"
+JAVA_BRIDGE_SPEC_PATH = REPO_ROOT / "tests/compat/frida-java-bridge.json"
+JAVA_BOOT_PATH = REPO_ROOT / "quickjs-hook/src/jsapi/java/java_boot.js"
+JAVA_NATIVE_PATH = REPO_ROOT / "quickjs-hook/src/jsapi/java/mod.rs"
 
 # `dispose` stays in the JavaScript facade: the Stalker output writer is owned by
 # Gum, so a script must not be able to tear it down mid-block.
@@ -230,6 +233,44 @@ def extract_writer_tables(source: str) -> dict[str, list[dict[str, str]]]:
 
 def read_writer_tables() -> dict[str, list[dict[str, str]]]:
     return extract_writer_tables(WRITER_TABLE_PATH.read_text(encoding="utf-8"))
+
+
+def read_java_bridge_spec() -> dict[str, Any]:
+    """The pinned frida-java-bridge baseline.
+
+    The bridge is not part of the local Frida checkout, so its version is pinned
+    from the tarball frida-tools resolves, with the same integrity hash. Goal 08
+    requires a fixed source before implementing against it.
+    """
+    return load_json(JAVA_BRIDGE_SPEC_PATH)
+
+
+def extract_java_members(boot_source: str, native_source: str) -> set[str]:
+    """Members reachable as `Java.<name>`.
+
+    They come from two places: assignments in the JavaScript bootstrap, and
+    functions registered onto the Java object from Rust.
+    """
+    members = {match.group(1) for match in re.finditer(r"^\s*Java\.(\w+)\s*=", boot_source, re.MULTILINE)}
+    members |= {
+        match.group(1)
+        for match in re.finditer(
+            r'add_cfunction_to_object\(\s*ctx_ptr\s*,\s*java_obj\s*,\s*"(\w+)"', native_source
+        )
+    }
+    # Properties defined on the Java object by the bootstrap.
+    members |= {
+        match.group(1)
+        for match in re.finditer(r'Object\.defineProperty\(Java,\s*"(\w+)"', boot_source)
+    }
+    return members
+
+
+def read_java_members() -> set[str]:
+    return extract_java_members(
+        JAVA_BOOT_PATH.read_text(encoding="utf-8"),
+        JAVA_NATIVE_PATH.read_text(encoding="utf-8"),
+    )
 
 
 def read_documented_globals() -> list[str]:

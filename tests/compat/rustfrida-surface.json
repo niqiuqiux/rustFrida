@@ -153,6 +153,14 @@
     { "path": "Java.ready", "type": "function" },
     { "path": "Java.choose", "type": "function" },
     { "path": "Java.enumerateClassLoadersSync", "type": "function" },
+    { "path": "Java.perform", "type": "function" },
+    { "path": "Java.performNow", "type": "function" },
+    { "path": "Java.cast", "type": "function" },
+    { "path": "Java.retain", "type": "function" },
+    { "path": "Java.array", "type": "function" },
+    { "path": "Java.synchronized", "type": "function" },
+    { "path": "Java.enumerateLoadedClassesSync", "type": "function" },
+    { "path": "Java.ACC_PUBLIC", "type": "number" },
     { "path": "Jni.addr", "type": "function" },
     { "path": "rpc.exports", "type": "object" },
     { "path": "Script.nextTick", "type": "function" },
@@ -201,7 +209,7 @@
       "area": "Java facade",
       "status": "partial",
       "goal": "08",
-      "missing": ["perform", "performNow", "ClassFactory", "retain", "cast", "array"]
+      "missing": ["ClassFactory", "registerClass", "openClassFile", "scheduleOnMainThread", "enumerateMethods"]
     },
     {
       "area": "Optional modules",
