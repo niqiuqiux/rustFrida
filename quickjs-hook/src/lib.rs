@@ -105,10 +105,13 @@ pub fn set_qbdi_helper_blob(blob: Vec<u8>) {
     *QBDI_HELPER_BLOB.lock().unwrap_or_else(|e| e.into_inner()) = Some(blob);
 }
 
+// 两个 setter 无条件存在（agent 不看 feature 就往里塞），读取方只有 qbdi JS API。
+#[cfg(feature = "qbdi")]
 pub(crate) fn qbdi_output_dir() -> Option<&'static str> {
     QBDI_OUTPUT_DIR.get().map(|s| s.as_str())
 }
 
+#[cfg(feature = "qbdi")]
 pub(crate) fn qbdi_helper_blob() -> Option<Vec<u8>> {
     QBDI_HELPER_BLOB.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }

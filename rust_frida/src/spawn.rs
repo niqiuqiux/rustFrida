@@ -208,10 +208,6 @@ fn is_boot_heap(entry: &MapEntry) -> bool {
 }
 
 /// 判断给定地址是否在 boot heap 区域中
-fn is_boot_heap_addr(addr: u64, maps: &[MapEntry]) -> bool {
-    maps.iter().any(|e| is_boot_heap(e) && addr >= e.start && addr < e.end)
-}
-
 fn is_private_rw_mapping(entry: &MapEntry) -> bool {
     entry.is_readable() && entry.is_writable() && !entry.is_executable() && !entry.is_shared()
 }

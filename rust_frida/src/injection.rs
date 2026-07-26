@@ -75,7 +75,6 @@ fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InjectionResult {
     pub(crate) host_fd: RawFd,
-    pub(crate) target_pid: i32,
     pub(crate) loader_ctx_addr: u64,
     pub(crate) agent_current_thread_eval_impl: u64,
     pub(crate) loader_alloc_base: u64,
@@ -1068,7 +1067,6 @@ fn run_loader_handshake(
     // 但对于 rustFrida，REPL 通信走 host_repl_fd
     Ok(InjectionResult {
         host_fd: host_repl_fd.into_raw(),
-        target_pid,
         loader_ctx_addr: loader_ctx_addr as u64,
         agent_current_thread_eval_impl: loader_ctx.agent_current_thread_eval_impl,
         loader_alloc_base: loader_alloc_base as u64,

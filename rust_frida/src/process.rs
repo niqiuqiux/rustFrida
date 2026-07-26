@@ -146,27 +146,6 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
 }
 
 /// 获取进程寄存器（pub 接口供 code-swap 使用）
-/// 轮询 /proc/pid/status 等待进程进入 stopped 状态
-pub(crate) fn wait_process_stopped(pid: u32, timeout: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Ok(data) = std::fs::read(format!("/proc/{}/status", pid)) {
-            let status = String::from_utf8_lossy(&data);
-            for line in status.lines() {
-                if line.starts_with("State:") && line.contains("stopped") {
-                    return true;
-                }
-            }
-        } else {
-            return false; // 进程不存在
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
 pub(crate) fn get_registers_pub(pid: i32) -> Result<UserRegs, String> {
     get_registers(pid)
 }
@@ -536,16 +515,6 @@ fn write_remote_mem(pid: i32, addr: usize, data: *const u8, size: usize) -> Resu
     }
 
     Ok(())
-}
-
-/// 向远程进程内存写入任意类型的数据的泛型包装
-///
-/// # 参数
-/// * `pid` - 目标进程ID
-/// * `addr` - 目标地址
-/// * `data` - 要写入的数据（任意类型）
-pub(crate) fn write_memory<T>(pid: i32, addr: usize, data: &T) -> Result<(), String> {
-    write_remote_mem(pid, addr, data as *const T as *const u8, size_of_val(data))
 }
 
 /// 向远程进程内存写入字节数组
