@@ -51,12 +51,11 @@
         "area": "Java facade",
         "goal": "08",
         "missing": [
-          "perform",
-          "performNow",
           "ClassFactory",
-          "retain",
-          "cast",
-          "array"
+          "registerClass",
+          "openClassFile",
+          "scheduleOnMainThread",
+          "enumerateMethods"
         ],
         "status": "partial"
       },
@@ -596,6 +595,38 @@
       {
         "path": "Java.enumerateClassLoadersSync",
         "type": "function"
+      },
+      {
+        "path": "Java.perform",
+        "type": "function"
+      },
+      {
+        "path": "Java.performNow",
+        "type": "function"
+      },
+      {
+        "path": "Java.cast",
+        "type": "function"
+      },
+      {
+        "path": "Java.retain",
+        "type": "function"
+      },
+      {
+        "path": "Java.array",
+        "type": "function"
+      },
+      {
+        "path": "Java.synchronized",
+        "type": "function"
+      },
+      {
+        "path": "Java.enumerateLoadedClassesSync",
+        "type": "function"
+      },
+      {
+        "path": "Java.ACC_PUBLIC",
+        "type": "number"
       },
       {
         "path": "Jni.addr",

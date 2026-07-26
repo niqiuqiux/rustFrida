@@ -910,6 +910,51 @@ cd /home/qiu/Android/kernel_hook/wxshadow
 
 Frida 风格：**`this`** = 实例（静态方法时为 class 载体），**`arguments`** = Java 参数。
 
+### Frida 兼容入口
+
+上游 frida-java-bridge 的常用成员可直接使用，项目原有的 `Java.ready()`、`.impl`、managed DSL、stealth hook 全部保留：
+
+| API | 说明 |
+| --- | --- |
+| `Java.available` | 进程是否加载了 ART；在 class loader 就绪前即可查询 |
+| `Java.androidVersion` | 平台版本字符串，如 `"16"` |
+| `Java.perform(fn)` | 等 VM 与 class loader 就绪后执行，语义同 `Java.ready()` |
+| `Java.performNow(fn)` | 立即在当前线程执行 |
+| `Java.isMainThread()` | 当前线程是否为 VM 主线程 |
+| `Java.cast(obj, klass)` | 按另一个类重新解释对象；类型不符时抛错 |
+| `Java.retain(obj)` | 建立 global ref，用返回 wrapper 的 `$dispose()` 释放 |
+| `Java.array(type, elements)` | 构造 Java 数组；基本类型名如 `"int"`，其余按类名 |
+| `Java.synchronized(obj, fn)` | 持有对象 monitor 执行 `fn`，异常时也会释放 |
+| `Java.enumerateLoadedClasses(+Sync)` | 枚举已加载类（见下方限制） |
+| `Java.ACC_*` | 12 个 `java.lang.reflect.Modifier` 常量 |
+
+```js
+Java.perform(function () {
+    var text = Java.use("java.lang.String").$new("hello");
+
+    var asObject = Java.cast(text, "java.lang.Object");
+
+    var retained = Java.retain(text);
+    try {
+        // retained 可以跨出当前调用继续使用
+    } finally {
+        retained.$dispose();
+    }
+
+    var Arrays = Java.use("java.util.Arrays");
+    var numbers = Java.array("int", [1, 2, 3]);
+    console.log(Arrays.toString("([I)Ljava/lang/String;", numbers));  // [1, 2, 3]
+
+    Java.synchronized(text, function () {
+        // 持有 text 的 monitor
+    });
+});
+```
+
+`Java.retain()` 返回的 wrapper 拥有那个 global ref：`$dispose()` 之后句柄被清零，重复调用是空操作，因此可以安全地放在 `finally` 里。
+
+**已知限制**：`Java.enumerateLoadedClasses()` 走 JVMTI，而 agent 默认不 late-load JVMTI 插件（需要目标进程环境里 `RF_JAVA_CHOOSE_JVMTI_LATE_LOAD=1`）——这个默认是为了不干扰 ART。插件不可用时该 API 会抛出说明前提的错误。`Java.enumerateClassLoaders()` 不依赖 JVMTI，始终可用。`Java.ClassFactory`、`registerClass`、`openClassFile`、`scheduleOnMainThread` 尚未实现。
+
 ```js
 Java.ready(function() {
     var Activity = Java.use("android.app.Activity");

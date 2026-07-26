@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 07 已完成，Worker 除外）
+> 状态：执行中（Goal 00 至 Goal 08 已完成首批范围）
 >
 > 更新日期：2026-07-26
 >
@@ -81,7 +81,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | File | 同步 File 构造、读写、seek、静态 read/write helpers | GumJS File 行为及异步 I/O 生态 | 部分 | P2 |
 | Stream/Socket | 无 | IOStream、InputStream、OutputStream、Socket | 缺失 | P2 |
 | 工具模块 | 无 | Checksum、SQLite、Cloak、Sampler、Profiler、Kernel | 缺失 | P2/P3 |
-| Java | `use`、`implementation/impl`、overload、choose、class loader、deopt、字段、DSL/fast hook | 官方 bridge 另有 perform、ClassFactory、retain/cast/array、loaded-class、main-thread 等生态 | 部分/扩展 | P1 |
+| Java | `use`、`perform/performNow`、`available`、`androidVersion`、`cast/retain/array`、`synchronized`、`ACC_*`、overload、choose、class loader、loaded class、deopt、字段、DSL/fast hook | 官方 bridge 另有 ClassFactory、registerClass、main-thread 调度 | 部分/扩展 | P1 |
 | Host 协议 | 自研注入器、REPL、HTTP RPC | Device、Session、Script message、Portal、Compiler | 不同架构 | 非当前范围 |
 
 ### 4.1 当前已经做得较完整的部分
@@ -98,8 +98,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
-1. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
-2. 缺少 `Worker`。
+1. 缺少 `Worker`、`Java.ClassFactory` 与 `Java.registerClass`。
 
 ## 5. 架构与稳定性风险
 
@@ -414,6 +413,27 @@ cargo build --offline --release --target aarch64-linux-android
 - reload 会取消旧 timer/recv/worker，最终 shutdown 无残留线程。
 
 ### Goal 08：Java 标准 facade 兼容（P1）
+
+状态：**首批范围已完成（2026-07-26）**；`ClassFactory`、`registerClass`、`openClassFile`、`scheduleOnMainThread`、`enumerateMethods` 按本 Goal 原定计划留作后续子 goal。
+
+前置条件（已满足）：
+
+- frida-java-bridge 不在本机 Frida 检出里，改由 frida-tools 的 `agents/tracer/package-lock.json` 固定：版本 `7.0.12`，integrity `sha512-xpoTFPQk…CHRTqg==`，tarball sha256 `8a3b6323…b2b850`。基线记录在 `tests/compat/frida-java-bridge.json`，包含从 `index.d.ts` 提取的 36 个公开成员及其分类。
+- `tests/compat/test_frida_surface.py` 校验该基线：版本与 integrity 必须与本机 Frida 的 lock 一致；每个上游成员必须落在"已实现/本 Goal/后续"三类之一，未分类即失败——固定的 bridge 一旦变动不会无人察觉。
+
+落地证据：
+
+- `Java.perform/performNow`、`available`、`androidVersion`、`isMainThread`、`synchronized`、12 个 `ACC_*` 常量落地。`perform` 复用既有 `Java.ready()` 的就绪语义（含 raw-clone worker 路径），`performNow` 同步执行。
+- `Java.cast`、`retain`、`array` 落地。`cast` 走真实的 `IsInstanceOf` 校验，转换到无关类会抛错而不是产出一个方法逐个失败的 wrapper；`retain` 建立 global ref 并由 wrapper 的 `$dispose()` 释放，重复 dispose 是空操作；`array` 支持 8 种基本类型与对象数组。
+- `Java.enumerateLoadedClasses(+Sync)` 经 JVMTI 的 `GetLoadedClasses` 实现，签名转成 Java 风格类名。
+- `Java.ready()`、`.impl`、managed DSL、stealth hook、`hook/fastHook/deopt` 等既有扩展全部保留，兼容层建立在它们之上而非替换。
+- `tests/device/run_goal08_java.py --device 3B65AU009YA00000` 在 PLC110（Android 16）spawn `com.example.rfhooktarget`，完成 `%reload` 前后两轮，每轮 47 项断言全部通过；App 存活且没有新增 tombstone。
+- Goal 05/06/07 设备回归、兼容测试 19 项、API 快照 `--check`、交叉构建、rustfmt 和 diff 检查均通过。
+
+已知限制：
+
+- `enumerateLoadedClasses` 依赖 JVMTI，而 agent 默认不 late-load JVMTI 插件（需要目标进程环境里 `RF_JAVA_CHOOSE_JVMTI_LATE_LOAD=1`）。该默认是有意的安全策略，因此这里没有绕过它；API 在插件不可用时抛出说明该前提的错误，设备回归据此做条件性校验。上游在 ART 上走 `art::ClassLinker::VisitClasses`，不需要 JVMTI——补齐它需要解析该符号与 ClassLinker 实例并处理 runnable thread，属于独立课题。
+- 数组内容的回归用真实 Java 调用（`java.util.Arrays.toString`）校验而非内部访问器：`Java._arrayGet()` 只为对象数组设计，传基本类型数组的类名会使目标进程崩溃。这是既有缺陷，与本 Goal 新增的 API 无关，但值得单独修。
 
 目标：在保留 ART fast hook 和 managed DSL 的前提下，提高 frida-java-bridge 脚本复用率。
 
