@@ -63,6 +63,10 @@ pub use jsapi::java::raw_clone_java_executor_hook_active;
 pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
+pub use jsapi::memory::{
+    cut_memory_monitor, cut_memory_scans, dispatch_memory_access, install_memory_monitor_backend,
+    wait_for_memory_scans, MemoryAccessInfo, MemoryMonitorBackend,
+};
 pub use jsapi::module::find_loaded_function_addresses;
 pub use jsapi::module::{
     cut_process_observers, free_process_observers, install_module_backend, install_process_observer_backend,

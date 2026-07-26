@@ -12,10 +12,11 @@ use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 use quickjs_hook::shutdown_qbdi_helper;
 use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
-    cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, cut_process_observers,
-    detach_current_jni_thread, drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks,
-    get_or_init_engine, init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused,
-    set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    cut_art_controller_walkstack_guards, cut_java_hooks, cut_memory_monitor, cut_memory_scans, cut_native_hooks,
+    cut_process_observers, detach_current_jni_thread, drain_thunk_in_flight, free_art_controller_state,
+    free_java_hooks, free_native_hooks, get_or_init_engine, init_hook_engine, load_script, load_script_with_filename,
+    set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    wait_for_memory_scans,
 };
 use std::collections::VecDeque;
 use std::ptr;
@@ -28,6 +29,9 @@ use crate::communication::{log_msg, write_stream};
 const JAVA_WORKER_EVAL_TIMEOUT_MS: u64 = 60_000;
 const JAVA_WORKER_BUSY_FAST_FAIL_MS: u64 = 500;
 const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
+/// A scan only checks for cancellation between chunks, so allow for one chunk
+/// of an unlucky range before declaring the scan stuck.
+const MEMORY_SCAN_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -254,6 +258,8 @@ pub fn init() -> Result<(), String> {
     crate::diagnostics::install_quickjs_backend();
     #[cfg(feature = "frida-gum")]
     crate::module_backend::install_quickjs_backend();
+    #[cfg(feature = "frida-gum")]
+    crate::memory_monitor::install_quickjs_backend();
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
@@ -575,6 +581,15 @@ pub fn cleanup() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    // Background scans re-enter this runtime, so stop them before anything
+    // starts tearing the context down.
+    cut_memory_scans();
+    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+        log_msg("[quickjs] memory scan callbacks did not stop; keeping agent resident\n".to_string());
+        return false;
+    }
+    cut_memory_monitor();
+    stage("phase1 cut_memory_scans", &mut t);
     if let Err(error) = cut_process_observers() {
         log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
         return false;
@@ -788,6 +803,15 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    // Background scans re-enter this runtime, so stop them before anything
+    // starts tearing the context down.
+    cut_memory_scans();
+    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+        log_msg("[quickjs] memory scan callbacks did not stop; keeping agent resident\n".to_string());
+        return false;
+    }
+    cut_memory_monitor();
+    stage("phase1 cut_memory_scans", &mut t);
     if let Err(error) = cut_process_observers() {
         log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
         return false;
@@ -925,6 +949,12 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase1 cut_java_hooks", &mut t);
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
+    cut_memory_scans();
+    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+        return Err("Memory.scan 回调未停止，软清理已放弃".to_string());
+    }
+    cut_memory_monitor();
+    stage("phase1 cut_memory_scans", &mut t);
     cut_process_observers()?;
     stage("phase1 cut_process_observers", &mut t);
     #[cfg(feature = "frida-gum")]

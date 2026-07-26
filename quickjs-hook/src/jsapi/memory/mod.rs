@@ -2,10 +2,14 @@
 
 mod alloc;
 mod helpers;
+mod monitor;
 mod operations;
+mod patch;
+mod pointers;
 mod read;
 mod safe_access;
 mod scan;
+mod scan_async;
 mod write;
 pub(crate) mod writest;
 
@@ -13,9 +17,16 @@ use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;
 
 use alloc::*;
+pub use monitor::{
+    cut_memory_monitor, dispatch_memory_access, install_memory_monitor_backend, MemoryAccessInfo, MemoryMonitorBackend,
+};
 use operations::*;
+use patch::memory_patch_code;
+use pointers::{memory_check_code_pointer, memory_find_pointers};
 use read::*;
 use scan::memory_scan_sync;
+use scan_async::memory_scan;
+pub use scan_async::{cut_memory_scans, wait_for_memory_scans};
 pub(crate) fn safe_read_exact(address: u64, output: &mut [u8]) -> Result<(), String> {
     safe_access::read_exact(address, output).map_err(|error| error.to_string())
 }
@@ -94,8 +105,12 @@ pub fn register_memory_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, obj, "copy", memory_copy, 3);
         add_cfunction_to_object(ctx_ptr, obj, "dup", memory_dup, 2);
         add_cfunction_to_object(ctx_ptr, obj, "flushCodeCache", memory_flush_code_cache, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "patchCode", memory_patch_code, 3);
+        add_cfunction_to_object(ctx_ptr, obj, "findPointers", memory_find_pointers, 3);
+        add_cfunction_to_object(ctx_ptr, obj, "checkCodePointer", memory_check_code_pointer, 1);
         add_cfunction_to_object(ctx_ptr, obj, "queryProtection", memory_query_protection, 1);
         add_cfunction_to_object(ctx_ptr, obj, "scanSync", memory_scan_sync, 3);
+        add_cfunction_to_object(ctx_ptr, obj, "scan", memory_scan, 4);
         add_cfunction_to_object(ctx_ptr, obj, "readS8", memory_read_s8, 1);
         add_cfunction_to_object(ctx_ptr, obj, "readU8", memory_read_u8, 1);
         add_cfunction_to_object(ctx_ptr, obj, "readS16", memory_read_s16, 1);
@@ -149,6 +164,8 @@ pub fn register_memory_api(ctx: &JSContext) {
     // Set Memory on global object
     global.set_property(ctx.as_ptr(), "Memory", memory);
     global.free(ctx.as_ptr());
+
+    monitor::register_memory_monitor(ctx);
 }
 
 #[cfg(test)]

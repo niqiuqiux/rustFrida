@@ -14,14 +14,28 @@ static NATIVE_POINTER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 /// NativePointer class name
 const NATIVE_POINTER_CLASS_NAME: &[u8] = b"NativePointer\0";
 
+/// How an owned allocation must be released. `Memory.alloc()` returns heap
+/// memory for sub-page sizes and whole pages otherwise, and the two cannot be
+/// freed the same way.
+enum OwnedAllocationKind {
+    Heap,
+    Pages { size: usize },
+}
+
 struct OwnedAllocation {
     addr: u64,
+    kind: OwnedAllocationKind,
 }
 
 impl Drop for OwnedAllocation {
     fn drop(&mut self) {
         unsafe {
-            libc::free(self.addr as *mut libc::c_void);
+            match self.kind {
+                OwnedAllocationKind::Heap => libc::free(self.addr as *mut libc::c_void),
+                OwnedAllocationKind::Pages { size } => {
+                    libc::munmap(self.addr as *mut libc::c_void, size);
+                }
+            }
         }
     }
 }
@@ -112,7 +126,27 @@ pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
 
 /// Create a NativePointer that owns a libc allocation.
 pub(crate) fn create_owned_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
-    create_native_pointer_with_owner(ctx, addr, Some(Arc::new(OwnedAllocation { addr })))
+    create_native_pointer_with_owner(
+        ctx,
+        addr,
+        Some(Arc::new(OwnedAllocation {
+            addr,
+            kind: OwnedAllocationKind::Heap,
+        })),
+    )
+}
+
+/// Like [`create_owned_native_pointer`], but the allocation is unmapped rather
+/// than freed when the last pointer derived from it is collected.
+pub(crate) fn create_owned_pages_native_pointer(ctx: *mut ffi::JSContext, addr: u64, size: usize) -> JSValue {
+    create_native_pointer_with_owner(
+        ctx,
+        addr,
+        Some(Arc::new(OwnedAllocation {
+            addr,
+            kind: OwnedAllocationKind::Pages { size },
+        })),
+    )
 }
 
 fn clone_native_pointer_parts(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<(u64, Option<Arc<OwnedAllocation>>)> {

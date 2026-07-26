@@ -11,13 +11,13 @@ const MAX_PATTERN_SIZE: usize = 1024 * 1024;
 const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct MatchPattern {
+pub(super) struct MatchPattern {
     bytes: Vec<u8>,
     masks: Vec<u8>,
 }
 
 impl MatchPattern {
-    fn parse(input: &str) -> Result<Self, &'static str> {
+    pub(super) fn parse(input: &str) -> Result<Self, &'static str> {
         let mut parts = input.split(':');
         let match_part = parts.next().unwrap_or_default();
         let mask_part = parts.next();
@@ -66,7 +66,7 @@ impl MatchPattern {
         Ok(Self { bytes, masks })
     }
 
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.bytes.len()
     }
 
@@ -162,6 +162,78 @@ fn scan_range(address: u64, size: usize, pattern: &MatchPattern) -> Result<Vec<u
     }
 
     Ok(matches)
+}
+
+/// Scan `size` bytes at `address`, reporting each match to `on_match`.
+///
+/// Returning `false` from `on_match` stops the scan, which is how the async
+/// scan aborts once its runtime is going away. Unlike [`scan_range`] this never
+/// accumulates matches, so a scan over a large range costs a fixed amount of
+/// memory regardless of how many hits it produces.
+pub(super) fn scan_range_chunked(
+    address: u64,
+    size: usize,
+    pattern: &MatchPattern,
+    mut on_match: impl FnMut(u64) -> bool,
+) -> Result<(), String> {
+    if size < pattern.len() {
+        return Ok(());
+    }
+    if address.checked_add(size as u64).is_none() {
+        return Err("address range overflow".to_string());
+    }
+
+    let mut tail: Vec<u8> = Vec::new();
+    let mut offset = 0usize;
+    let mut next_allowed = address;
+
+    while offset < size {
+        let amount = (size - offset).min(SCAN_CHUNK_SIZE);
+        let mut chunk = vec![0u8; amount];
+        if let Err(error) = read_exact(address + offset as u64, &mut chunk) {
+            return Err(error.to_string());
+        }
+
+        let combined_base = address + offset as u64 - tail.len() as u64;
+        tail.extend_from_slice(&chunk);
+
+        let mut index = 0usize;
+        while index + pattern.len() <= tail.len() {
+            let candidate = combined_base + index as u64;
+            if candidate >= next_allowed && pattern.matches(&tail[index..index + pattern.len()]) {
+                if !on_match(candidate) {
+                    return Ok(());
+                }
+                next_allowed = candidate + pattern.len() as u64;
+                index += pattern.len();
+            } else {
+                index += 1;
+            }
+        }
+
+        let keep = pattern.len().saturating_sub(1).min(tail.len());
+        if keep == 0 {
+            tail.clear();
+        } else {
+            let keep_start = tail.len() - keep;
+            tail.copy_within(keep_start.., 0);
+            tail.truncate(keep);
+        }
+        offset += amount;
+    }
+    Ok(())
+}
+
+/// Read and validate a pattern argument shared by the sync and async entries.
+pub(super) unsafe fn parse_pattern_argument(
+    ctx: *mut ffi::JSContext,
+    value: JSValue,
+    operation: &str,
+) -> Result<MatchPattern, ffi::JSValue> {
+    let Some(text) = value.is_string().then(|| value.to_string(ctx)).flatten() else {
+        return Err(throw_message(ctx, &format!("{operation}: pattern must be a string")));
+    };
+    MatchPattern::parse(&text).map_err(|message| throw_message(ctx, &format!("{operation}: {message}")))
 }
 
 unsafe fn throw_message(ctx: *mut ffi::JSContext, message: &str) -> ffi::JSValue {
