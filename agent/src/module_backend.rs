@@ -1,7 +1,5 @@
 //! Gum-backed services for the Frida-compatible Module object model.
 
-#![cfg(feature = "frida-gum")]
-
 use frida_gum::Gum;
 use frida_gum_sys as gum_sys;
 use quickjs_hook::{

@@ -1,7 +1,5 @@
 //! Frida Gum Stalker backend and legacy CLI bridge.
 
-#![cfg(feature = "frida-gum")]
-
 use crate::communication::{log_msg, write_stream};
 use crate::stalker_writer;
 use frida_gum::interceptor::Interceptor;

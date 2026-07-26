@@ -521,6 +521,14 @@ fn art_controller_reload_paused() -> bool {
 // 初始化
 // ============================================================================
 
+/// 是否给 `ArtMethod::PrettyMethod` 装 guard hook。
+///
+/// 保持关闭。PrettyMethod 会从 ART/JD 的崩溃与信号路径进入，把它绕进我们的 hook pool 意味着
+/// 一旦某个信号处理器阻塞在那里，该线程就再也挂不起来。改为依赖下面的 OAT header guard 与
+/// SIGSEGV walkstack guard。开关写成具名常量而不是 `if false &&`，是为了让这段代码继续参与
+/// 编译、不至于悄悄腐烂，同时让"这是有意关掉的"一眼可见。
+const INSTALL_PRETTY_METHOD_HOOK: bool = false;
+
 /// 惰性初始化 artController: 安装 Layer 1 (共享 stub 路由) + Layer 2 (DoCall hook)。
 ///
 /// 每个 JS 引擎生命周期内最多初始化一次；cleanup 后允许重新初始化。
@@ -872,12 +880,8 @@ pub(super) fn ensure_art_controller_initialized(
         }
     }
 
-    // PrettyMethod can run from ART/JD crash and signal paths. Routing it
-    // through our hook pool can leave a thread unsuspendable if a signal handler
-    // blocks there, so keep this guard disabled and rely on the OAT-header and
-    // SIGSEGV walkstack guards below.
     let mut pretty_method_hook_target: u64 = 0;
-    if false && bridge.pretty_method != 0 {
+    if INSTALL_PRETTY_METHOD_HOOK && bridge.pretty_method != 0 {
         if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("PrettyMethod", bridge.pretty_method, std::ptr::null_mut()) }
         {

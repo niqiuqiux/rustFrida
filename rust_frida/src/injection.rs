@@ -385,9 +385,8 @@ fn choose_injection_thread_once(pid: i32) -> (i32, i32) {
             score -= 1200;
         } else if wchan.trim() == "0" {
             score -= 600;
-        } else if wchan.contains("epoll") {
-            score += 80;
         } else if wchan.contains("futex") || wchan.contains("poll") {
+            // "epoll" 也落在这里——它本来就含 "poll"。
             score += 80;
         }
         if comm.contains("LigIO")

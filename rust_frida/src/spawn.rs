@@ -1117,9 +1117,8 @@ fn normalize_component_name(package: &str, name: &str) -> String {
 }
 
 fn normalize_process_name(package: &str, process: &str) -> String {
-    if process.starts_with(':') {
-        format!("{}{}", package, process)
-    } else if process.starts_with('.') {
+    // ":remote" 是 app 私有进程，".remote" 是相对名，两种都要补上包名；其余是全局进程名，原样用。
+    if process.starts_with(':') || process.starts_with('.') {
         format!("{}{}", package, process)
     } else {
         process.to_string()

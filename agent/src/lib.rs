@@ -346,9 +346,13 @@ fn init_eval_and_respond(script: &str, filename: &str) {
     }
 }
 
+/// # Safety
+///
+/// 由 loader 跨 ABI 边界按符号名调用（见 `rust_frida/src/injection.rs`）。两对指针/长度必须
+/// 各自描述一段在调用期间有效的可读内存；指针为空时对应长度必须为 0。
 #[cfg(feature = "quickjs")]
 #[no_mangle]
-pub extern "C" fn rustfrida_loadjs_current_thread(
+pub unsafe extern "C" fn rustfrida_loadjs_current_thread(
     script_ptr: *const u8,
     script_len: usize,
     filename_ptr: *const u8,

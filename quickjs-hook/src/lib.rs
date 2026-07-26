@@ -24,6 +24,10 @@
 //! ```
 
 #![allow(clippy::missing_safety_doc)]
+// 这个 crate 到处把 `*mut JSContext` 当不透明句柄传。指针只可能来自 QuickJS 自己——它调用我们
+// 注册的 C 函数时传进来——在回调期间必定有效，调用方无从提供别的值。把这些函数一律改成
+// `unsafe fn` 会波及几百个调用点，却换不来任何实际的安全性。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod completion;
 pub mod context;

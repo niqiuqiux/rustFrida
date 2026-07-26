@@ -3,8 +3,6 @@
 //! This module provides JavaScript loading and execution capabilities
 //! using the quickjs-hook crate.
 
-#![cfg(feature = "quickjs")]
-
 use crate::vma_name::set_anon_vma_name_raw;
 use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 

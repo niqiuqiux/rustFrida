@@ -213,16 +213,10 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     };
 
-    let (art_method, is_static) = if raw_clone {
-        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-            Ok(r) => r,
-            Err(msg) => return throw_internal_error(ctx, msg),
-        }
-    } else {
-        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-            Ok(r) => r,
-            Err(msg) => return throw_internal_error(ctx, msg),
-        }
+    // raw clone 的分支就在上面：那条路上 env 是 null，resolve_art_method 自己认这个空 env。
+    let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+        Ok(r) => r,
+        Err(msg) => return throw_internal_error(ctx, msg),
     };
 
     let spec = get_art_method_spec(env, art_method);

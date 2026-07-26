@@ -786,7 +786,13 @@ unsafe fn resolve_looper_wake_fd_offset() -> Option<u32> {
         let pc = wake + off as u64;
         let inst = std::ptr::read_volatile(pc as *const u32);
         // ldr w0, [x19, #imm] in Looper::wake before write(fd, ...).
-        if (inst & 0xffff_fc00) == 0xb940_1660 {
+        //
+        // LDR (immediate, unsigned offset, 32-bit) 的 imm12 在 [21:10]，所以通配它的掩码是
+        // 0xffc003ff，剩下 0xb9400000 的固定位加上 Rn=x19 (19 << 5) 与 Rt=w0。此处原本写的是
+        // `(inst & 0xffff_fc00) == 0xb940_1660`——那个掩码盖住的恰好是 Rn/Rt，把 imm12 留了下来，
+        // 而 0xb9401660 就是某台机器上抓到的 `ldr w0, [x19, #20]` 原样。两者互相矛盾，条件恒假，
+        // 于是这个 offset 永远解析不出来。
+        if (inst & 0xffc0_03ff) == 0xb940_0260 {
             let imm12 = (inst >> 10) & 0x0fff;
             let byte_offset = imm12 << 2;
             if byte_offset > 0 && byte_offset < 0x400 {

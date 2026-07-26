@@ -3663,9 +3663,8 @@ impl DexImage {
 
 fn class_name_to_descriptor(class_name: &str) -> String {
     let normalized = class_name.replace('.', "/");
-    if normalized.starts_with('[') {
-        normalized
-    } else if normalized.starts_with('L') && normalized.ends_with(';') {
+    // 已经是数组描述符或者已经是 Lxxx; 形式的，原样返回。
+    if normalized.starts_with('[') || (normalized.starts_with('L') && normalized.ends_with(';')) {
         normalized
     } else {
         format!("L{};", normalized)

@@ -1,7 +1,5 @@
 //! Gum-backed implementation of the QuickJS diagnostics facade.
 
-#![cfg(feature = "frida-gum")]
-
 use frida_gum_sys as gum_sys;
 use quickjs_hook::{
     ApiResolverMatch, DebugSymbolDetails, DiagnosticsBackend, DiagnosticsCpuContext, InstructionDetails,
