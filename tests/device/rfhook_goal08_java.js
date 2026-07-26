@@ -269,4 +269,40 @@ function runJavaChecks() {
     // Still usable after a throw: a botched detach would show up here.
     assertTrue("vm still usable after a throw", !Java.vm.getEnv().handle.isNull());
     assertEqual("Java.vm is stable across reads", Java.vm, Java.vm);
+
+    // ------------------------------------------- scheduleOnMainThread ----
+
+    assertEqual(
+        "scheduleOnMainThread is a function",
+        typeof Java.scheduleOnMainThread,
+        "function"
+    );
+    assertThrows("scheduleOnMainThread rejects a non-function", function () {
+        Java.scheduleOnMainThread(42);
+    });
+
+    // The tasks run on the app's main thread, some Looper turns from now, so
+    // the result is checked from a timer rather than inline. Ordering matters:
+    // the queue is FIFO, and one throwing task must not stop the next.
+    var mainThreadLog = [];
+    Java.scheduleOnMainThread(function () {
+        mainThreadLog.push(Java.isMainThread() ? "main" : "other");
+    });
+    Java.scheduleOnMainThread(function () {
+        throw new Error("scheduled boom");
+    });
+    Java.scheduleOnMainThread(function () {
+        mainThreadLog.push("third");
+    });
+
+    setTimeout(function () {
+        try {
+            assertEqual("scheduled tasks ran on the main thread", mainThreadLog[0], "main");
+            assertEqual("a throwing task did not stop the queue", mainThreadLog[1], "third");
+            assertEqual("every scheduled task ran once", mainThreadLog.length, 2);
+            console.log("[goal08][MAIN-THREAD-READY] scheduleOnMainThread verified");
+        } catch (error) {
+            console.log("[goal08][FAIL] " + (error && error.message ? error.message : error));
+        }
+    }, 1500);
 }

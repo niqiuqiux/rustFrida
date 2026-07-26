@@ -2096,4 +2096,90 @@
         enumerable: true,
         configurable: true
     });
+
+    // ------------------------------------------ Java.scheduleOnMainThread ----
+    //
+    // A JavaScript function cannot be handed to Java as a Runnable without
+    // registerClass, so the work is queued here and collected on the main
+    // thread from a native point that thread is bound to pass through. Like
+    // upstream, that point is epoll_wait — the main Looper blocks in it
+    // whenever it has nothing to do, and a Handler bound to the main Looper is
+    // what wakes it back out.
+    //
+    // Unlike upstream the hook does not stay installed. Entering JavaScript
+    // takes the engine lock, and that wait has no timeout: with the hook always
+    // in place, any slow script running elsewhere would stall the app's main
+    // thread for as long as it held the engine. Installing the hook only while
+    // there is work pending, and dropping it once the queue drains, keeps the
+    // main thread out of the engine entirely when nothing is scheduled.
+
+    var _pendingMainOps = [];
+    var _pollListener = null;
+    var _pollReleaseScheduled = false;
+
+    Java.scheduleOnMainThread = function(fn) {
+        if (typeof fn !== "function")
+            throw new Error("Java.scheduleOnMainThread() requires a function argument");
+
+        _pendingMainOps.push(fn);
+
+        // Install before waking the Looper: the drain happens when the main
+        // thread next enters epoll_wait, which is right after it handles the
+        // message below.
+        if (_pollListener === null) {
+            var epollWait = Module.findExportByName("libc.so", "epoll_wait");
+            if (epollWait === null || epollWait.isNull()) {
+                _pendingMainOps.pop();
+                throw new Error("Java.scheduleOnMainThread(): epoll_wait not found in libc");
+            }
+            _pollListener = Interceptor.attach(epollWait, { onEnter: _drainMainOps });
+            Interceptor.flush();
+        }
+
+        // Built fresh each time rather than cached: a cached wrapper would need
+        // a global ref that nothing releases on reload.
+        var Looper = Java.use("android.os.Looper");
+        var Handler = Java.use("android.os.Handler");
+        var wakeup = Handler.$new("(Landroid/os/Looper;)V", Looper.getMainLooper("()Landroid/os/Looper;"));
+        wakeup.sendEmptyMessage("(I)Z", 1);
+    };
+
+    function _drainMainOps() {
+        if (this.threadId !== Process.id)
+            return;
+
+        var task;
+        while ((task = _pendingMainOps.shift()) !== undefined) {
+            try {
+                task();
+            } catch (error) {
+                _rethrowLater(error);
+            }
+        }
+
+        _releasePollListenerLater();
+    }
+
+    // Report a failed task the way upstream does — out of band, so one bad
+    // task does not swallow the ones queued behind it.
+    function _rethrowLater(error) {
+        Script.nextTick(function() { throw error; });
+    }
+
+    // Detach from the pump rather than from inside the hook it would be
+    // removing. By the time this runs the main thread has long left the probe.
+    function _releasePollListenerLater() {
+        if (_pollListener === null || _pollReleaseScheduled)
+            return;
+        _pollReleaseScheduled = true;
+        Script.nextTick(function() {
+            _pollReleaseScheduled = false;
+            // Something may have been queued while this was waiting its turn.
+            if (_pollListener === null || _pendingMainOps.length !== 0)
+                return;
+            _pollListener.detach();
+            _pollListener = null;
+            Interceptor.flush();
+        });
+    }
 })();

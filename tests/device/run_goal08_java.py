@@ -132,10 +132,14 @@ def main():
         session = Session(command)
 
         session.wait_for(r"\[goal08\]\[READY\] Java facade verified")
+        # scheduleOnMainThread only completes once the app's Looper has taken a
+        # turn, so it reports separately from the synchronous checks.
+        session.wait_for(r"\[goal08\]\[MAIN-THREAD-READY\] scheduleOnMainThread verified")
         # The compatibility layer is rebuilt with the runtime, so a reload has to
         # produce the same surface rather than a half-initialised Java object.
         session.send("%reload")
         session.wait_for(r"\[goal08\]\[READY\] Java facade verified")
+        session.wait_for(r"\[goal08\]\[MAIN-THREAD-READY\] scheduleOnMainThread verified")
 
         app_pid = root_shell(f"pidof {args.package}", capture=True, check=False).stdout.strip()
         session.send("exit")
@@ -145,6 +149,8 @@ def main():
         output = "".join(session.output)
         if output.count("[goal08][READY]") != 2:
             raise RuntimeError("Goal 08 did not complete exactly once per runtime")
+        if output.count("[goal08][MAIN-THREAD-READY]") != 2:
+            raise RuntimeError("scheduleOnMainThread did not complete exactly once per runtime")
         if "[goal08][FAIL]" in output:
             raise RuntimeError("a check reported a failure")
         for marker in ("Fatal signal", "SIGSEGV", "SIGABRT", "cleanup timeout", "drain timeout"):
