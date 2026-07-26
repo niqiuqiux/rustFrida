@@ -927,6 +927,12 @@ Frida 风格：**`this`** = 实例（静态方法时为 class 载体），**`arg
 | `Java.synchronized(obj, fn)` | 持有对象 monitor 执行 `fn`，异常时也会释放 |
 | `Java.enumerateLoadedClasses(+Sync)` | 枚举已加载类（见下方限制） |
 | `Java.ACC_*` | 12 个 `java.lang.reflect.Modifier` 常量 |
+| `Java.vm` | `perform(fn)` / `getEnv()` / `tryGetEnv()`（见下） |
+| `Java.scheduleOnMainThread(fn)` | 在 App 主线程上执行 `fn` |
+
+`Java.vm.getEnv()` 返回的 `Env` 只带 `handle` 与 `vm` 两个字段，即上游 `Env` 构造函数写死的那两个——足够把 `JNIEnv*` 交给自己的 `NativeFunction`。上游那一百多个 JNI 方法封装不在这里，项目自有的 `Jni` 对象覆盖那部分（上游 `index.d.ts` 也把 `Env` 标成 `any`）。未 attach 的线程上 `getEnv()` 抛错、`tryGetEnv()` 返回 `null`；`perform()` 会在需要时 attach，并且只在 attach 是它自己做的时候才 detach。
+
+`Java.scheduleOnMainThread()` 把任务排队，由绑定主 Looper 的 Handler 唤醒主线程后取走，按 FIFO 各执行一次；某个任务抛错不会影响排在它后面的任务。与上游不同的是，用来接管主线程的 `epoll_wait` 探针只在有待办任务时存在——进入 JavaScript 要取引擎锁且没有超时，常驻探针会让任意一段慢脚本卡住 App 主线程。
 
 ```js
 Java.perform(function () {
@@ -953,7 +959,7 @@ Java.perform(function () {
 
 `Java.retain()` 返回的 wrapper 拥有那个 global ref：`$dispose()` 之后句柄被清零，重复调用是空操作，因此可以安全地放在 `finally` 里。
 
-**已知限制**：`Java.enumerateLoadedClasses()` 走 JVMTI，而 agent 默认不 late-load JVMTI 插件（需要目标进程环境里 `RF_JAVA_CHOOSE_JVMTI_LATE_LOAD=1`）——这个默认是为了不干扰 ART。插件不可用时该 API 会抛出说明前提的错误。`Java.enumerateClassLoaders()` 不依赖 JVMTI，始终可用。`Java.ClassFactory`、`registerClass`、`openClassFile`、`scheduleOnMainThread` 尚未实现。
+**已知限制**：`Java.enumerateLoadedClasses()` 走 JVMTI，而 agent 默认不 late-load JVMTI 插件（需要目标进程环境里 `RF_JAVA_CHOOSE_JVMTI_LATE_LOAD=1`）——这个默认是为了不干扰 ART。插件不可用时该 API 会抛出说明前提的错误。`Java.enumerateClassLoaders()` 不依赖 JVMTI，始终可用。`Java.ClassFactory`、`registerClass`、`openClassFile`、`enumerateMethods`、`Java.backtrace()` 尚未实现。
 
 ```js
 Java.ready(function() {

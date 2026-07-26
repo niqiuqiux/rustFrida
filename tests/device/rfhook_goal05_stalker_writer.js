@@ -282,3 +282,54 @@ assertEqual("no call probes remain", finalStats.activeCallProbes, 0);
 assertEqual("no probe anchors remain", finalStats.callProbeAnchors, 0);
 
 console.log("[goal05][READY] Stalker ARM64 writer verified");
+
+// -------------------------------------------- concurrent background work ----
+//
+// The Stalker drain worker and the timer pump are two agent-created threads.
+// The pthread shim clones without CLONE_SETTLS, so every thread it makes shares
+// one TLS block; two concurrent Memory.scan() calls were enough to crash the
+// target when that was found (roadmap §7.1). Every regression so far has
+// exercised one background thread at a time, so nothing covered the combination
+// the agent actually ships. This runs both at once and makes each one prove it
+// got work done.
+
+var concurrentTicks = 0;
+var concurrentBytes = 0;
+var churnRounds = 0;
+
+Stalker.queueCapacity = 16384;
+Stalker.queueDrainInterval = 10;
+
+var tickTimer = setInterval(function () { concurrentTicks++; }, 5);
+
+Stalker.follow(threadId, {
+    events: { call: true, ret: true },
+    onReceive: function (events) { concurrentBytes += events.byteLength; }
+});
+
+// Churn from a timer rather than a loop: a synchronous loop would hold the
+// engine throughout, and the point is to have both threads entering it.
+var churnTimer = setInterval(function () {
+    churn(64);
+    if (++churnRounds !== 20)
+        return;
+
+    clearInterval(churnTimer);
+    clearInterval(tickTimer);
+    Stalker.unfollow(threadId);
+    Stalker.flush();
+
+    setTimeout(function () {
+        try {
+            assertTrue("timers ran while Stalker was following", concurrentTicks > 10);
+            assertTrue("Stalker delivered events while timers ran", concurrentBytes > 0);
+            assertEqual("churn completed every round", churnRounds, 20);
+            for (var round = 0; round !== 4; round++)
+                Stalker.garbageCollect();
+            assertEqual("no traces remain after concurrent use", Stalker.statistics().activeTraces, 0);
+            console.log("[goal05][CONCURRENT-READY] drain worker and timer pump coexisted");
+        } catch (error) {
+            console.log("[goal05][FAIL] " + (error && error.message ? error.message : error));
+        }
+    }, 250);
+}, 10);

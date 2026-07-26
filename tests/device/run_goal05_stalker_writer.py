@@ -163,6 +163,10 @@ def main():
         session = Session(command)
         for round_number in (1, 2):
             session.wait_for(r"\[goal05\]\[READY\] Stalker ARM64 writer verified")
+            # The drain worker and the timer pump run concurrently in this part,
+            # which nothing else covers; it finishes on a timer, so it reports
+            # separately from the synchronous checks.
+            session.wait_for(r"\[goal05\]\[CONCURRENT-READY\] drain worker and timer pump coexisted")
             if round_number == 1:
                 session.send("%reload")
         session.send("exit")
@@ -170,8 +174,12 @@ def main():
             raise RuntimeError("rustfrida exited with a non-zero status")
 
         output = "".join(session.output)
+        if output.count("[goal05][CONCURRENT-READY]") != 2:
+            raise RuntimeError("the concurrent background-thread scenario did not complete once per runtime")
         if output.count("[goal05][READY]") != 2:
             raise RuntimeError("Goal 05 did not complete exactly once per runtime")
+        if "[goal05][FAIL]" in output:
+            raise RuntimeError("a check reported a failure")
         if "Stalker surface mismatch" in output:
             raise RuntimeError("Stalker surface mismatch reported by the device script")
         for marker in ("Fatal signal", "SIGSEGV", "SIGABRT", "SIGTRAP", "cleanup timeout", "drain timeout"):
