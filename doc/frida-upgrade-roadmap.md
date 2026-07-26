@@ -577,8 +577,24 @@ cargo build --offline --release --target aarch64-linux-android
 
 ```bash
 cargo build --release --target aarch64-linux-android
+cargo fmt --all -- --check
+cargo clippy --release --target aarch64-linux-android \
+    -p agent -p rust_frida -p quickjs-hook --no-deps
 git diff --check
 ```
+
+clippy 那条命令的两个限定不是随手加的：
+
+- `--no-deps` 是必须的。`frida-gum/src/lib.rs` 带着上游的 `#![deny(warnings)]`，在 clippy 下
+  每条 lint 都升级成错误，整个 workspace 编不过（本机一次是 329 个 `unnecessary_cast`，全部来自
+  bindgen 在本平台把常量生成成 `u32`——那些 `as u32` 在别的平台是必要的，不能"修"）。这是 vendored
+  的第三方代码，不动它，绕开即可。
+- 只列三个自有 crate，是因为其余 workspace 成员（qbdi-helper、ldmonitor 系列等）不在 Android
+  ARM64 的构建路径上。
+
+要求 clippy 零 error。warning 目前还有约 490 条，其中 250 条是 `manual_c_str_literals`
+（`b"x\0".as_ptr()` → `c"x"`）这类风格现代化，改动面大、收益低，暂不统一处理；但 deny 级别的
+lint 必须清空——`bad_bit_mask` 和 `overly_complex_bool_expr` 各自抓到过一个真问题。
 
 并满足：
 
