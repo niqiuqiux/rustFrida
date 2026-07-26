@@ -665,6 +665,9 @@
                 if (prop === "__origJobject") return target.__origJobject;
                 // Frida-compat hook invocation accessor（仅当 target 由 wrapCallback 注入时存在）
                 if (prop === "$orig") return target.__$orig;
+                // Present only on wrappers produced by Java.retain(), which own
+                // a global reference the script has to release.
+                if (prop === "$dispose") return target.__$dispose;
                 if (prop === Symbol.toPrimitive) return function(hint) {
                     if (hint === "string" || hint === "default") {
                         if (isArray) {
@@ -1817,4 +1820,210 @@
             catch (e) { console.log("[Java.choose] onComplete error: " + e); }
         }
     };
+
+    // ==================================================================
+    // Frida-compatible surface (Goal 08)
+    //
+    // Assembled on top of the project's own entry points rather than
+    // replacing them: `Java.ready()`, `.impl`, the managed DSL and the stealth
+    // hooks all keep working exactly as before.
+    // ==================================================================
+
+    Object.defineProperty(Java, "available", {
+        enumerable: true,
+        configurable: true,
+        get() { return Java._available(); }
+    });
+
+    var _androidVersionCache = null;
+    Object.defineProperty(Java, "androidVersion", {
+        enumerable: true,
+        configurable: true,
+        get() {
+            if (_androidVersionCache === null)
+                _androidVersionCache = Java._androidVersion();
+            return _androidVersionCache;
+        }
+    });
+
+    Java.isMainThread = function() {
+        return Java._isMainThread();
+    };
+
+    // Upstream's perform() defers until the VM is usable; that is exactly what
+    // Java.ready() already does, including the raw-clone worker path.
+    Java.perform = function(fn) {
+        if (typeof fn !== "function")
+            throw new Error("Java.perform() requires a function argument");
+        return Java.ready(fn);
+    };
+
+    // performNow() promises the caller it runs synchronously. Attaching the
+    // thread is handled by the JNI layer on first use, so the only thing that
+    // can go wrong here is being called before a class loader exists — which is
+    // the caller's contract to keep, same as upstream.
+    Java.performNow = function(fn) {
+        if (typeof fn !== "function")
+            throw new Error("Java.performNow() requires a function argument");
+        return fn();
+    };
+
+    // java.lang.reflect.Modifier values, which the class and method inspection
+    // helpers report. Spelled out rather than generated so the surface is
+    // readable here and checkable by the compatibility tests.
+    Object.defineProperty(Java, "ACC_PUBLIC", { enumerable: true, value: 0x0001 });
+    Object.defineProperty(Java, "ACC_PRIVATE", { enumerable: true, value: 0x0002 });
+    Object.defineProperty(Java, "ACC_PROTECTED", { enumerable: true, value: 0x0004 });
+    Object.defineProperty(Java, "ACC_STATIC", { enumerable: true, value: 0x0008 });
+    Object.defineProperty(Java, "ACC_FINAL", { enumerable: true, value: 0x0010 });
+    Object.defineProperty(Java, "ACC_SYNCHRONIZED", { enumerable: true, value: 0x0020 });
+    Object.defineProperty(Java, "ACC_BRIDGE", { enumerable: true, value: 0x0040 });
+    Object.defineProperty(Java, "ACC_VARARGS", { enumerable: true, value: 0x0080 });
+    Object.defineProperty(Java, "ACC_NATIVE", { enumerable: true, value: 0x0100 });
+    Object.defineProperty(Java, "ACC_ABSTRACT", { enumerable: true, value: 0x0400 });
+    Object.defineProperty(Java, "ACC_STRICT", { enumerable: true, value: 0x0800 });
+    Object.defineProperty(Java, "ACC_SYNTHETIC", { enumerable: true, value: 0x1000 });
+
+    // Serialises on the object's monitor, like a Java `synchronized` block.
+    Java.synchronized = function(obj, fn) {
+        if (typeof fn !== "function")
+            throw new Error("Java.synchronized(obj, fn) requires a function");
+        var handle = _handleOf(obj);
+        if (handle === 0)
+            throw new Error("Java.synchronized() requires a live Java object");
+        Java._monitorEnter(handle);
+        try {
+            return fn();
+        } finally {
+            Java._monitorExit(handle);
+        }
+    };
+
+
+    // --------------------------------------------------- loaded classes ---
+
+    Java.enumerateLoadedClassesSync = function() {
+        return Java._enumerateLoadedClasses();
+    };
+
+    Java.enumerateLoadedClasses = function(callbacks) {
+        if (!callbacks || typeof callbacks !== "object")
+            throw new Error("Java.enumerateLoadedClasses(callbacks) requires a callbacks object");
+        var names = Java._enumerateLoadedClasses();
+        if (typeof callbacks.onMatch === "function") {
+            for (var i = 0; i < names.length; i++) {
+                // Upstream passes the class handle as the second argument; the
+                // name is what scripts actually use, and a handle here would
+                // have to be kept alive across the whole enumeration.
+                if (callbacks.onMatch(names[i], null) === "stop")
+                    break;
+            }
+        }
+        if (typeof callbacks.onComplete === "function")
+            callbacks.onComplete();
+    };
+
+    // ------------------------------------------------- object lifetime ----
+
+    // Re-interpret a live object as another class. The instance check is real,
+    // so casting to an unrelated class throws instead of producing a wrapper
+    // whose methods would fail one by one later.
+    Java.cast = function(obj, klass) {
+        var handle = _handleOf(obj);
+        if (handle === 0)
+            throw new Error("Java.cast() requires a live Java object");
+
+        var className = null;
+        if (typeof klass === "string")
+            className = klass;
+        else if (klass !== null && klass !== undefined && typeof klass.$className === "string")
+            className = klass.$className;
+        if (className === null)
+            throw new Error("Java.cast(obj, klass) requires a class or class name");
+
+        if (!Java._isInstanceOf(handle, className))
+            throw new Error("Java.cast(): object is not an instance of " + className);
+
+        return _wrapJavaObj(handle, className, obj.__jraw === true, obj.__jglobal === true);
+    };
+
+    // Promote to a global reference so the object outlives the current frame.
+    // The returned wrapper owns that reference and releases it on $dispose().
+    Java.retain = function(obj) {
+        var handle = _handleOf(obj);
+        if (handle === 0)
+            throw new Error("Java.retain() requires a live Java object");
+        var className = (obj && typeof obj.__jclass === "string") ? obj.__jclass : "java.lang.Object";
+
+        var global = Java._newGlobalRef(handle);
+        var target = {
+            __jptr: global,
+            __jclass: className,
+            __jraw: false,
+            __jglobal: true
+        };
+        // Defined on the backing target rather than the proxy: adding a property
+        // to the proxy afterwards breaks the get/defineProperty invariant.
+        target.__$dispose = function() {
+            if (target.__jptr === 0)
+                return;
+            var doomed = target.__jptr;
+            // Clear first so a wrapper kept by the script cannot be used against
+            // a reference that is already gone.
+            target.__jptr = 0;
+            Java._deleteGlobalRef(doomed);
+        };
+        return _wrapJavaObjOnTarget(target);
+    };
+
+    // Build a Java array. Primitive element types are named as in Java
+    // ("int", "byte", ...); anything else is treated as a class name.
+    Java.array = function(type, elements) {
+        if (typeof type !== "string")
+            throw new Error("Java.array(type, elements) requires a type name");
+        if (!Array.isArray(elements))
+            throw new Error("Java.array(type, elements) requires an array of elements");
+
+        var primitive = ["boolean", "byte", "char", "short", "int", "long", "float", "double"].indexOf(type) !== -1;
+        var payload = elements;
+        if (!primitive) {
+            // Object elements cross as raw handles; null stays null.
+            payload = new Array(elements.length);
+            for (var i = 0; i < elements.length; i++)
+                payload[i] = _handleOf(elements[i]);
+        }
+
+        var handle = Java._newArray(type, payload);
+        var arrayClass = primitive
+            ? "[" + { boolean: "Z", byte: "B", char: "C", short: "S", int: "I", long: "J", float: "F", double: "D" }[type]
+            : "[L" + type + ";";
+        return _wrapJavaObj(handle, arrayClass, false, false);
+    };
+
+    // The raw jobject behind a wrapper, or 0 when there is none.
+    //
+    // Handles arrive as a number or a BigInt depending on how high the address
+    // sits, so both are accepted and 0 always means "no object".
+    function _handleOf(value) {
+        if (value === null || value === undefined)
+            return 0;
+        var direct = _asHandle(value);
+        if (direct !== 0)
+            return direct;
+        if (typeof value !== "object" && typeof value !== "function")
+            return 0;
+        var fromWrapper = _asHandle(value.__jptr);
+        if (fromWrapper !== 0)
+            return fromWrapper;
+        return _asHandle(value.$h);
+    }
+
+    function _asHandle(value) {
+        var kind = typeof value;
+        if (kind === "number")
+            return value;
+        if (kind === "bigint")
+            return value === 0n ? 0 : value;
+        return 0;
+    }
 })();

@@ -140,6 +140,52 @@ pub(super) unsafe fn jvmti_enumerate_instance_mirrors_by_signature(
     Ok(out)
 }
 
+/// Every loaded class, as Java-style names such as `java.lang.String`.
+///
+/// JVMTI reports JNI signatures (`Ljava/lang/String;`); array and primitive
+/// entries are reported verbatim by upstream too, so only object signatures are
+/// rewritten here.
+pub(super) unsafe fn jvmti_loaded_class_names() -> Result<Vec<String>, String> {
+    let jvmti = get_or_init_jvmti_env()?;
+    let get_loaded_classes: JvmtiGetLoadedClassesFn =
+        std::mem::transmute(jvmti_fn_ptr(jvmti, JVMTI_GET_LOADED_CLASSES));
+    let get_class_signature: JvmtiGetClassSignatureFn =
+        std::mem::transmute(jvmti_fn_ptr(jvmti, JVMTI_GET_CLASS_SIGNATURE));
+
+    let mut count: i32 = 0;
+    let mut classes: *mut *mut c_void = ptr::null_mut();
+    let ret = get_loaded_classes(jvmti, &mut count, &mut classes);
+    if ret != JVMTI_ERROR_NONE {
+        return Err(format!("GetLoadedClasses failed: {}", ret));
+    }
+
+    let mut names = Vec::with_capacity(count.max(0) as usize);
+    for index in 0..count.max(0) as usize {
+        let klass = *classes.add(index);
+        if klass.is_null() {
+            continue;
+        }
+        let mut signature: *mut c_char = ptr::null_mut();
+        let mut generic: *mut c_char = ptr::null_mut();
+        if get_class_signature(jvmti, klass, &mut signature, &mut generic) == JVMTI_ERROR_NONE && !signature.is_null() {
+            let raw = std::ffi::CStr::from_ptr(signature).to_string_lossy();
+            names.push(class_name_from_signature(raw.as_ref()));
+        }
+        deallocate_if_nonnull(jvmti, signature as *mut u8);
+        deallocate_if_nonnull(jvmti, generic as *mut u8);
+    }
+    deallocate_if_nonnull(jvmti, classes as *mut u8);
+    Ok(names)
+}
+
+/// `Ljava/lang/String;` becomes `java.lang.String`; anything else is kept.
+fn class_name_from_signature(signature: &str) -> String {
+    match signature.strip_prefix('L').and_then(|rest| rest.strip_suffix(';')) {
+        Some(name) => name.replace('/', "."),
+        None => signature.to_string(),
+    }
+}
+
 pub(super) unsafe fn jvmti_class_mirror_by_signature(class_signature: &str) -> Result<Option<u64>, String> {
     let jvmti = get_or_init_jvmti_env()?;
     let Some(target) = find_loaded_class_by_signature(jvmti, class_signature)? else {

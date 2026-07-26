@@ -34,6 +34,7 @@ pub mod art_controller;
 mod art_method;
 mod art_thread;
 pub(crate) mod callback;
+mod compat;
 #[allow(dead_code)]
 mod heap_scan;
 mod java_array_api;
@@ -1466,6 +1467,7 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     );
     add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
     add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+    compat::register_java_compat_api(ctx_ptr, java_obj);
     add_cfunction_to_object(ctx_ptr, java_obj, "_isRawCloneJsThread", js_is_raw_clone_js_thread, 0);
     add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
     add_cfunction_to_object(
