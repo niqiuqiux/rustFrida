@@ -691,7 +691,12 @@
                     }
                     // 数字索引 (prop 可能是字符串 "0" 或实际数字转来的 string)
                     if (typeof prop === "string" && /^\d+$/.test(prop)) {
-                        return Java._arrayGet(target.__jptr, +prop, target.__jclass, target.__jglobal === true);
+                        // Object elements come back as bare {__jptr, __jclass}
+                        // and need wrapping before the script can call methods
+                        // on them; primitives pass through untouched.
+                        return _wrapJavaReturn(
+                            Java._arrayGet(target.__jptr, +prop, target.__jclass, target.__jglobal === true)
+                        );
                     }
                     // toString 特殊: 让 JS side 显示一个简略摘要
                     if (prop === "toString") return function() {

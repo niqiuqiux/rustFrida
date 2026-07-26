@@ -200,6 +200,21 @@ function runJavaChecks() {
         "[goal08, null]"
     );
 
+    // Reading elements back must dispatch on the element type: routing a
+    // primitive array through GetObjectArrayElement is a JNI error that aborts
+    // the runtime, which is what used to happen here.
+    assertEqual("int array reads back through the index", ints[0], 1);
+    assertEqual("int array reads its last element", ints[3], 4);
+    assertEqual("byte array keeps the sign", Java.array("byte", [-1])[0], -1);
+    assertEqual("boolean array reads back", booleans[0], true);
+    assertEqual("double array reads back", doubles[1], 2.5);
+    assertEqual("long array reads back", longs[0], 10);
+    assertEqual("short array reads back", Java.array("short", [-300])[0], -300);
+    assertEqual("char array reads back", Java.array("char", [20320])[0], 20320);
+    assertEqual("float array reads back", Java.array("float", [0.5])[0], 0.5);
+    assertEqual("object array reads back", strings[0].toString(), "goal08");
+    assertEqual("object array keeps null", strings[1], null);
+
     assertThrows("array rejects a non-array", function () { return Java.array("int", 5); });
     assertThrows("array rejects an unknown class", function () {
         return Java.array("no.such.Class", []);

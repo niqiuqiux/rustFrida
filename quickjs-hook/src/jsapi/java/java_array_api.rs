@@ -15,9 +15,59 @@ use crate::value::JSValue;
 use super::callback::wrap_java_object_ref_for_array_elem;
 use super::jni_core::get_thread_env;
 use super::jni_core::{
-    jni_check_exc, jni_fn_ptr, jni_null_or_exc, GetArrayLengthFn, GetObjectArrayElementFn, JNI_GET_ARRAY_LENGTH,
-    JNI_GET_OBJECT_ARRAY_ELEMENT,
+    jni_check_exc, jni_fn_ptr, jni_null_or_exc, GetArrayLengthFn, GetObjectArrayElementFn, JniEnv,
+    JNI_GET_ARRAY_LENGTH, JNI_GET_BOOLEAN_ARRAY_REGION, JNI_GET_BYTE_ARRAY_REGION, JNI_GET_CHAR_ARRAY_REGION,
+    JNI_GET_DOUBLE_ARRAY_REGION, JNI_GET_FLOAT_ARRAY_REGION, JNI_GET_INT_ARRAY_REGION, JNI_GET_LONG_ARRAY_REGION,
+    JNI_GET_OBJECT_ARRAY_ELEMENT, JNI_GET_SHORT_ARRAY_REGION,
 };
+
+/// `Get<Type>ArrayRegion(env, array, start, length, buffer)`
+type GetPrimitiveArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut std::ffi::c_void);
+
+/// Read one element out of a primitive array.
+///
+/// `GetObjectArrayElement` on a primitive array is a hard JNI error that aborts
+/// the runtime, so the element type decides which accessor to use before any
+/// call is made.
+unsafe fn primitive_array_element(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    array: *mut std::ffi::c_void,
+    index: i32,
+    element_signature: char,
+) -> Option<ffi::JSValue> {
+    let (region_index, size) = match element_signature {
+        'Z' => (JNI_GET_BOOLEAN_ARRAY_REGION, 1usize),
+        'B' => (JNI_GET_BYTE_ARRAY_REGION, 1),
+        'C' => (JNI_GET_CHAR_ARRAY_REGION, 2),
+        'S' => (JNI_GET_SHORT_ARRAY_REGION, 2),
+        'I' => (JNI_GET_INT_ARRAY_REGION, 4),
+        'J' => (JNI_GET_LONG_ARRAY_REGION, 8),
+        'F' => (JNI_GET_FLOAT_ARRAY_REGION, 4),
+        'D' => (JNI_GET_DOUBLE_ARRAY_REGION, 8),
+        _ => return None,
+    };
+
+    let get_region: GetPrimitiveArrayRegionFn = std::mem::transmute(jni_fn_ptr(env, region_index));
+    let mut buffer = [0u8; 8];
+    get_region(env, array, index, 1, buffer.as_mut_ptr() as *mut std::ffi::c_void);
+    if jni_check_exc(env) {
+        return Some(ffi::qjs_undefined());
+    }
+
+    let bytes = &buffer[..size];
+    Some(match element_signature {
+        'Z' => JSValue::bool(bytes[0] != 0).raw(),
+        'B' => JSValue::int(bytes[0] as i8 as i32).raw(),
+        'C' => JSValue::int(u16::from_ne_bytes([bytes[0], bytes[1]]) as i32).raw(),
+        'S' => JSValue::int(i16::from_ne_bytes([bytes[0], bytes[1]]) as i32).raw(),
+        'I' => JSValue::int(i32::from_ne_bytes(bytes.try_into().expect("4 bytes"))).raw(),
+        'J' => ffi::qjs_new_int64(ctx, i64::from_ne_bytes(bytes.try_into().expect("8 bytes"))),
+        'F' => ffi::qjs_new_float64(ctx, f32::from_ne_bytes(bytes.try_into().expect("4 bytes")) as f64),
+        'D' => ffi::qjs_new_float64(ctx, f64::from_ne_bytes(bytes.try_into().expect("8 bytes"))),
+        _ => unreachable!("signature was matched above"),
+    })
+}
 
 fn element_class_from_array_class(arr_class: &str) -> String {
     if !arr_class.starts_with('[') {
@@ -81,9 +131,9 @@ pub(super) unsafe extern "C" fn js_java_array_length(
     JSValue::int(len).raw()
 }
 
-/// JS: `_arrayGet(jptr, idx, arrClass) -> wrapper`
-/// arrClass 格式例如 `"[Ljava.lang.StackTraceElement;"`。
-/// 元素类名 = 去掉首字符 `[`、去掉 `L` 前缀和 `;` 后缀（若存在）。
+/// JS: `_arrayGet(jptr, idx, arrClass) -> wrapper | 原始值`
+/// arrClass 例如 `"[Ljava.lang.StackTraceElement;"`（对象数组）或 `"[I"`（基本类型）。
+/// 对象数组返回 wrapper；基本类型数组返回对应的 JS 数值/布尔值。
 pub(super) unsafe extern "C" fn js_java_array_get(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -134,6 +184,13 @@ pub(super) unsafe extern "C" fn js_java_array_get(
         Ok(e) => e,
         Err(_) => return ffi::qjs_null(),
     };
+
+    // Primitive arrays must not go through GetObjectArrayElement.
+    if let Some(signature) = arr_class.strip_prefix('[').and_then(|rest| rest.chars().next()) {
+        if let Some(value) = primitive_array_element(ctx, env, jptr as *mut std::ffi::c_void, idx, signature) {
+            return value;
+        }
+    }
 
     let get_elem: GetObjectArrayElementFn = std::mem::transmute::<*const std::ffi::c_void, GetObjectArrayElementFn>(
         jni_fn_ptr(env, JNI_GET_OBJECT_ARRAY_ELEMENT),
