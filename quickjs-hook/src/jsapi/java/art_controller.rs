@@ -21,7 +21,7 @@ use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::{libart_dlsym, libart_find_symbol_contains, module_dlsym};
 use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::art_method::{get_instrumentation_spec, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS};
@@ -1732,9 +1732,37 @@ unsafe fn synchronize_replacement_methods() {
 static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
 
 /// 旧的 SIGSEGV handler (chain 用)
-static mut PREV_SIGSEGV_ACTION: libc::sigaction = unsafe { std::mem::zeroed() };
+///
+/// The signal handler reads this, and a signal handler cannot take a lock — the
+/// signal may arrive on a thread that already holds it. So the value is
+/// published as an immutable snapshot behind an atomic pointer: the handler
+/// loads the pointer and reads a struct nobody will mutate, and a concurrent
+/// install can never expose half of one.
+///
+/// Replaced snapshots are leaked deliberately. A handler on another thread may
+/// be reading one at the moment it is replaced and there is no point at which
+/// it is provably finished; each leak is a single `sigaction`, and a
+/// replacement only happens when something else takes SIGSEGV away from us.
+static PREV_SIGSEGV_ACTION: AtomicPtr<libc::sigaction> = AtomicPtr::new(std::ptr::null_mut());
 static WALKSTACK_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 static WALKSTACK_GUARD_USING_SIGCHAIN: AtomicBool = AtomicBool::new(false);
+
+/// Publish the disposition this guard displaced, unless it is our own handler.
+///
+/// Chaining to ourselves would recurse until the stack ran out, and two threads
+/// refreshing at once can each read back the handler the other just installed.
+fn publish_prev_sigsegv_action(action: libc::sigaction) {
+    if action.sa_sigaction == walkstack_sigsegv_handler as usize {
+        return;
+    }
+    PREV_SIGSEGV_ACTION.store(Box::into_raw(Box::new(action)), Ordering::Release);
+}
+
+/// The displaced disposition, or `None` if this guard never installed one.
+fn prev_sigsegv_action() -> Option<&'static libc::sigaction> {
+    // Safe to hand out a `'static` reference: snapshots are never freed.
+    unsafe { PREV_SIGSEGV_ACTION.load(Ordering::Acquire).as_ref() }
+}
 
 fn arm64_load_unsigned_base_reg(inst: u32) -> Option<usize> {
     // LDR{B,H,W,X} unsigned immediate:
@@ -1939,7 +1967,14 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     context: *mut libc::c_void,
 ) {
     unsafe fn chain_prev_sigsegv(sig: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
-        let prev = &PREV_SIGSEGV_ACTION;
+        let Some(prev) = prev_sigsegv_action() else {
+            // Nothing was displaced, so there is nobody to chain to. Fall back
+            // to what an unhandled SIGSEGV does rather than returning, which
+            // would re-run the faulting instruction forever.
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+            return;
+        };
         let prev_handler = prev.sa_sigaction;
         if prev.sa_flags & libc::SA_SIGINFO != 0 {
             let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
@@ -2164,8 +2199,10 @@ unsafe fn install_walkstack_sigsegv_guard() {
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     libc::sigemptyset(&mut sa.sa_mask);
 
-    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
+    let mut previous: libc::sigaction = std::mem::zeroed();
+    let ret = bionic_sigaction(libc::SIGSEGV, &sa, &mut previous);
     if ret == 0 {
+        publish_prev_sigsegv_action(previous);
         output_verbose("[artController] WalkStack SIGSEGV guard 已安装");
     } else {
         output_verbose(&format!(
@@ -2200,9 +2237,12 @@ unsafe fn uninstall_walkstack_sigsegv_guard() {
         return;
     }
 
-    let ret = bionic_sigaction(libc::SIGSEGV, &PREV_SIGSEGV_ACTION, std::ptr::null_mut());
+    let Some(previous) = prev_sigsegv_action() else {
+        return;
+    };
+    let ret = bionic_sigaction(libc::SIGSEGV, previous, std::ptr::null_mut());
     if ret == 0 {
-        PREV_SIGSEGV_ACTION = std::mem::zeroed();
+        PREV_SIGSEGV_ACTION.store(std::ptr::null_mut(), Ordering::Release);
         output_verbose("[artController] WalkStack SIGSEGV guard 已卸载");
     } else {
         output_verbose(&format!(
@@ -2238,7 +2278,7 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
 
     let mut previous: libc::sigaction = std::mem::zeroed();
     if bionic_sigaction(libc::SIGSEGV, &sa, &mut previous) == 0 {
-        PREV_SIGSEGV_ACTION = previous;
+        publish_prev_sigsegv_action(previous);
         WALKSTACK_GUARD_INSTALLED.store(true, Ordering::SeqCst);
     }
 }
