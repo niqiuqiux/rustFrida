@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 05 已完成）
+> 状态：执行中（Goal 00 至 Goal 06 已完成）
 >
 > 更新日期：2026-07-26
 >
@@ -71,7 +71,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | 数值与指针 | `ptr`、`NULL`、NativePointer 大部分运算和读写 | 另有 `Int64`、`UInt64`、pointer sign/blend、`ArrayBuffer.wrap/unwrap` | 部分 | P1 |
 | Native 调用 | ARM64 `NativeFunction`、`SystemFunction`，支持 ABI/options、variadic、嵌套 struct | 同名 API | 已有 | P1 |
 | Native callback | 通用 `NativeCallback`；CModule 函数指针继续用于高频 callback | 通用 `NativeCallback` | 已有/扩展 | P0/P1 |
-| Memory | 同步读写、分配、protect、copy/dup、scanSync、queryProtection、stealth patch | 另有 alloc options、patchCode、异步 scan、findPointers、MemoryAccessMonitor | 部分 | P1 |
+| Memory | 同步读写、alloc options、protect、copy/dup、scanSync、异步 scan、patchCode、findPointers、checkCodePointer、queryProtection、MemoryAccessMonitor、stealth patch | 同名 API | 已有/扩展 | P1 |
 | Module | 实例 API、ModuleMap、sections/dependencies/ensureInitialized/findSymbol；保留旧式静态入口 | 最新实例 API；旧式静态入口已由上游移除 | 已有/扩展 | P1 |
 | Process | 基本属性、模块/范围/线程枚举和目录查询、module/thread observer | 另有 findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
 | Thread/符号诊断 | `Thread.backtrace()`、Backtracer、DebugSymbol、ApiResolver(module)、Instruction | 另有非 module resolver、硬件断点/观察点、CFG | 部分 | P0/P1 |
@@ -100,7 +100,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 
 1. 缺少 `send/recv`、timer 和 Script 生命周期 API，依赖 Frida message loop 的脚本无法直接运行。
 2. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
-3. Memory 缺少 `patchCode`、异步 `scan`、`findPointers` 和 `MemoryAccessMonitor`。
+3. `Memory.scan()` 只有 callbacks 形态，Promise 包装待消息循环。
 
 ## 5. 架构与稳定性风险
 
@@ -132,10 +132,9 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 
 ### 5.6 已知可观测性缺口
 
-- README 仍有个别实现漂移，例如 `Memory.alloc()` 源码使用 `calloc`，文档却描述为 RWX；应由 API 基线 goal 统一校正。
 - `run_goal01_module_unload.py` 在当前设备的 shutdown 阶段稳定产生 tombstone；见 Goal 05 的既有缺口记录。
 
-Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理。
+Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理；`Memory.alloc()` 的页权限与生命周期漂移已由 Goal 06 校正。
 
 ## 6. Goal 路线
 
@@ -336,6 +335,25 @@ cargo build --offline --release --target aarch64-linux-android
 - 全部现有 Stalker device regression 继续通过。
 
 ### Goal 06：Memory 高级能力与 W^X 语义（P1）
+
+状态：**已完成（2026-07-26）**。
+
+落地证据：
+
+- `Memory.alloc(size, {protection, near, maxDistance})` 对齐上游语义：亚页大小走堆分配且只读写，页倍数走 mmap 并应用请求的 protection，要求可执行或 `near` 时必须是页倍数。页分配由 NativePointer 的 owner 释放（munmap 而非 free），修正了此前 `calloc` 与 README 所述 RWX 的漂移。
+- `near/maxDistance` 由 `/proc/self/maps` 的空洞驱动，候选按到目标的距离排序，用 `MAP_FIXED_NOREPLACE` 放置以免覆盖既有映射；旧内核忽略该 flag 时退化为 hint，结果仍按请求窗口复核。
+- `Memory.patchCode(address, size, apply)` 临时提权后调用 JS，优先保留 EXEC 位以免正在执行该页的线程失去执行权；无论 apply 是否抛异常都恢复保护并刷 I-cache，异常原样传播。
+- `Memory.findPointers(ranges, values, {mask})` 与 `Memory.checkCodePointer(ptr)` 落地；前者按指针对齐扫描并跳过不可读区段，后者先用 XPACI 剥离 PAC（按 HWCAP 判定，指令以原始编码发射以避开未启用的 `pauth` 汇编扩展）。
+- `Memory.scan()` 在独立线程扫描，onMatch/onError/onComplete 经既有引擎 guard 同步进入 JS；清理路径先 `cut_memory_scans()` 再等待 in-flight 回调，长扫描无法活过它要回调的 runtime。
+- `MemoryAccessMonitor.enable/disable` 由 Gum backend 实现。GumExceptor 只在 enable 时按需获取、disable 时释放，因此默认路径仍不 claim SIGSEGV（见 `agent/src/crash_handler.rs` 对 ART signal chain 的说明）。
+- `tests/device/run_goal06_memory.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成两轮 `%reload` 与最终 shutdown，每轮 49 项断言全部通过；目标进程存活且没有新增 tombstone。
+- 兼容测试 16 项、API 快照 `--check`、交叉构建、rustfmt 和 diff 检查均通过。
+
+已知限制：
+
+- `Memory.scan()` 只提供上游 `_scan` 的 callbacks 形态。上游的 Promise 包装来自 `runtime/core.js`，需要 job queue 才能 settle，随 Goal 07 的消息循环一并补齐。
+- 监视区被访问时每次 fault 都同步进入 JS，被监视线程因此显著变慢；这与上游模型一致，但在 rustFrida 的单引擎模型下更明显。相应地，由 `NativeFunction` 调用触发的访问会先被该调用自身的 fault 处理接管，不会报给监视器——监视器面向的是目标自身代码的访问。
+- 设备回归据此用独立 fixture 线程触发访问，并直接校验 disable 后每个页的保护位已恢复，而不是依赖被拖慢的线程跑完若干轮。
 
 目标：补齐常用高级 Memory API，并统一代码写入策略。
 

@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `MemoryAccessMonitor`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -1580,15 +1580,58 @@ Memory.flushCodeCache(code, 16);
 | `Memory.writeBytes(addr, bytes, stealth?)` / `p.writeBytes(bytes, stealth?)` | `AddressLike, ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
 | `Memory.writest(addr, bytes)` / `p.writest(bytes)` | `AddressLike, 4B 倍数指令字节` | `undefined` |
 | **分配 / 维护** | | |
-| `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (RWX, 零初始化) |
-| `Memory.allocUtf8String(s)` | `string` | `NativePointer` (RWX，末尾 `\0`) |
+| `Memory.alloc(size[, options])` | `number` (1…0x7fffffff), `{protection, near, maxDistance}` | `NativePointer`（零初始化） |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer`（堆，末尾 `\0`） |
+| `Memory.patchCode(addr, size, apply)` | `AddressLike, number, function` | `undefined` |
 | `Memory.flushCodeCache(addr, size)` | `AddressLike, number` | `undefined` |
+| **扫描 / 查找** | | |
+| `Memory.scanSync(addr, size, pattern)` | `AddressLike, number, string` | `[{address, size}]` |
+| `Memory.scan(addr, size, pattern, callbacks)` | `AddressLike, number, string, {onMatch, onError, onComplete}` | `undefined` |
+| `Memory.findPointers(ranges, values[, options])` | `[{base, size}], AddressLike[], {mask}` | `[{address, value}]` |
+| `Memory.checkCodePointer(ptr)` | `AddressLike` | `number`（首字节） |
+
+**`Memory.alloc()` 的分配来源**（与上游一致）：
+
+- `size` 不是页大小的整数倍 → 堆分配，只读写。请求 `protection` 含 `x` 或给了 `near` 时会拒绝，要求页倍数。
+- `size` 是页倍数 → `mmap` 整页并应用 `protection`（默认 `rw-`）。
+- 给了 `near` → 在 `[near - maxDistance, near + maxDistance]` 内放置，用于需要短跳转可达的代码页；找不到空洞时抛错。
+
+两种来源都由返回的 NativePointer 拥有：原指针及其 `add/sub/ptr(existing)` 派生指针全部被 GC 后自动释放（堆走 `free`，整页走 `munmap`），勿手动 `munmap`。
+
+`Memory.patchCode(addr, size, apply)` 在调用 `apply(ptr)` 期间临时开放写权限，并尽量保留 EXEC 位以免正在执行该页的线程失去执行权；无论 `apply` 是否抛异常都会恢复原保护并刷 I-cache，异常原样向上传播。需要隐身或不希望出现可写窗口时，改用 `writeBytes(bytes, 1)` 或 `writest()`。
+
+`Memory.scan()` 在独立线程扫描，回调经 JS 引擎 guard 同步进入；`%reload` 与 shutdown 会先取消扫描并等待 in-flight 回调结束。上游用 Promise 包装的 `scan` 依赖消息循环，尚未提供。
 
 **约束**：
 - 无效地址抛 `RangeError`；`readCString` 超过 4096B 抛
-- `Memory.alloc*` 是 RWX 堆内存；原指针及其 `add/sub/ptr(existing)` 派生指针全部被 GC 后自动释放，勿 `munmap`
-- 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache
-- `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect`
+- 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache（`patchCode` 已自动处理）
+- `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect` 或改用 `patchCode`
+
+### MemoryAccessMonitor
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `MemoryAccessMonitor.enable(ranges, callbacks)` | `[{base, size}], {onAccess}` | `undefined` |
+| `MemoryAccessMonitor.disable()` | — | `undefined` |
+
+`onAccess(details)` 收到 `{operation, from, address, rangeIndex, pageIndex, pagesCompleted, pagesTotal, threadId}`，其中 `operation` 是 `"read"` / `"write"` / `"execute"`。
+
+```js
+MemoryAccessMonitor.enable([{ base: target, size: 0x1000 }], {
+    onAccess(details) {
+        console.log(details.operation + " at " + details.address + " from " + details.from);
+    }
+});
+// ...
+MemoryAccessMonitor.disable();
+```
+
+监视通过移除页权限并捕获随后的访问故障实现，因此有几点必须清楚：
+
+- `enable()` 期间会获取 Gum 的 exceptor，也就是由 Gum 接管 `SIGSEGV`。agent 默认刻意不 claim 这条链（ART 的隐式空指针检查依赖它），所以只有显式启用监视时才会付出这个代价，`disable()` 后归还。在 ART 进程中长期开启需自行评估影响。
+- 每次故障都会同步进入 JavaScript，被监视线程因此明显变慢；这与上游模型一致。
+- 由 `NativeFunction` 调用触发的访问会先被该调用自身的 fault 处理接管，不会报给监视器。监视器面向的是目标自身代码的访问。
+- `disable()` 会恢复被监视范围内所有页的原保护位。
 
 ### Memory.protect / writeBytes / writest
 

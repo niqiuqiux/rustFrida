@@ -45,11 +45,7 @@
         "area": "Memory",
         "goal": "06",
         "missing": [
-          "patchCode",
-          "async scan",
-          "findPointers",
-          "MemoryAccessMonitor",
-          "alloc options"
+          "scan Promise wrapper"
         ],
         "status": "partial"
       },
@@ -94,6 +90,7 @@
       "Int64",
       "UInt64",
       "Memory",
+      "MemoryAccessMonitor",
       "File",
       "Process",
       "Module",
@@ -150,8 +147,13 @@
         "type": "function"
       },
       {
-        "classification": "partial",
+        "classification": "compatible",
         "name": "Memory",
+        "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "MemoryAccessMonitor",
         "type": "object"
       },
       {
@@ -335,6 +337,30 @@
       },
       {
         "path": "Memory.flushCodeCache",
+        "type": "function"
+      },
+      {
+        "path": "Memory.patchCode",
+        "type": "function"
+      },
+      {
+        "path": "Memory.scan",
+        "type": "function"
+      },
+      {
+        "path": "Memory.findPointers",
+        "type": "function"
+      },
+      {
+        "path": "Memory.checkCodePointer",
+        "type": "function"
+      },
+      {
+        "path": "MemoryAccessMonitor.enable",
+        "type": "function"
+      },
+      {
+        "path": "MemoryAccessMonitor.disable",
         "type": "function"
       },
       {

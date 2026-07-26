@@ -28,7 +28,8 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `NULL` | `object` | compatible |
 | `Int64` | `function` | compatible |
 | `UInt64` | `function` | compatible |
-| `Memory` | `object` | partial |
+| `Memory` | `object` | compatible |
+| `MemoryAccessMonitor` | `object` | compatible |
 | `File` | `function` | partial |
 | `Process` | `object` | partial |
 | `Module` | `function` | compatible |
@@ -64,7 +65,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Native ABI | compatible | Goal 04 |  |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |
-| Memory | partial | Goal 06 | `patchCode`, `async scan`, `findPointers`, `MemoryAccessMonitor`, `alloc options` |
+| Memory | partial | Goal 06 | `scan Promise wrapper` |
 | Stalker | compatible | Goal 05 |  |
 | Java facade | partial | Goal 08 | `perform`, `performNow`, `ClassFactory`, `retain`, `cast`, `array` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |
