@@ -13,6 +13,7 @@ pub mod module;
 pub mod ptr;
 pub mod rpc;
 pub mod stalker;
+pub mod stalker_writer;
 pub(crate) mod util;
 
 pub use console::register_console;

@@ -24,8 +24,14 @@
         calloutGetRegister: globalThis.__rf_stalker_callout_get_register,
         calloutSetRegister: globalThis.__rf_stalker_callout_set_register,
         takeRetiredCallouts: globalThis.__rf_stalker_take_retired_callouts,
+        statistics: globalThis.__rf_stalker_statistics,
         getTrustThreshold: globalThis.__rf_stalker_get_trust_threshold,
-        setTrustThreshold: globalThis.__rf_stalker_set_trust_threshold
+        setTrustThreshold: globalThis.__rf_stalker_set_trust_threshold,
+        writerSpec: globalThis.__rf_stalker_writer_spec,
+        writerInvoke: globalThis.__rf_stalker_writer_invoke,
+        relocatorCreate: globalThis.__rf_stalker_relocator_create,
+        relocatorDestroy: globalThis.__rf_stalker_relocator_destroy,
+        relocatorInvoke: globalThis.__rf_stalker_relocator_invoke
     };
 
     const eventTypes = Object.freeze({
@@ -144,6 +150,150 @@
         }
     });
 
+    // ARM64 code writer surface. The opcode table, argument specs and enum
+    // values all come from native so the JavaScript side never hardcodes
+    // Capstone or Gum numbering.
+    const writerSpec = native.writerSpec();
+    const writerRegisters = writerSpec.registers;
+    const writerConditions = writerSpec.conditions;
+    const writerIndexModes = writerSpec.indexModes;
+
+    // Gum treats a label id as an opaque key and never dereferences it, so the
+    // facade maps each label name to a unique integer. Ids are never reused, so
+    // a name reappearing in a later transform callback cannot bind to a label
+    // Gum already resolved.
+    let nextLabelId = 0x10000;
+    const transformLabels = new Map();
+
+    function labelIdFor(value) {
+        if (typeof value === "number") {
+            if (!Number.isInteger(value) || value <= 0)
+                throw new TypeError("label id must be a positive integer");
+            return value;
+        }
+        if (typeof value !== "string")
+            throw new TypeError("label must be a string");
+        let id = transformLabels.get(value);
+        if (id === undefined) {
+            id = nextLabelId++;
+            transformLabels.set(value, id);
+        }
+        return id;
+    }
+
+    function registerIdFor(value, methodName) {
+        if (typeof value === "string") {
+            const id = writerRegisters[value];
+            if (id === undefined)
+                throw new TypeError(methodName + "(): unknown register name '" + value + "'");
+            return id;
+        }
+        if (typeof value === "number" && Number.isInteger(value) && value >= 0)
+            return value;
+        throw new TypeError(methodName + "(): expected a register name");
+    }
+
+    function enumIdFor(table, value, kind, methodName) {
+        if (typeof value === "string") {
+            const id = table[value];
+            if (id === undefined)
+                throw new TypeError(methodName + "(): unknown " + kind + " '" + value + "'");
+            return id;
+        }
+        if (typeof value === "number" && Number.isInteger(value) && value >= 0)
+            return value;
+        throw new TypeError(methodName + "(): expected a " + kind);
+    }
+
+    // Accepts plain numbers, BigInt, and the NativePointer/Int64/UInt64 wrappers
+    // whose toString() yields a value BigInt can parse.
+    function integerFor(value, methodName) {
+        const kind = typeof value;
+        if (kind === "number" || kind === "bigint")
+            return value;
+        if (kind === "string")
+            return BigInt(value);
+        if (value !== null && kind === "object" && typeof value.toString === "function")
+            return BigInt(value.toString());
+        throw new TypeError(methodName + "(): expected an integer");
+    }
+
+    function callArgumentsFor(value, methodName) {
+        if (!Array.isArray(value))
+            throw new TypeError(methodName + "(): expected an array of arguments");
+        const flattened = [value.length];
+        for (const argument of value) {
+            if (typeof argument === "string") {
+                flattened.push(0, registerIdFor(argument, methodName));
+            } else {
+                flattened.push(1, integerFor(argument, methodName));
+            }
+        }
+        return flattened;
+    }
+
+    function convertWriterArguments(spec, methodName, args) {
+        const converted = new Array(spec.length);
+        for (let index = 0; index !== spec.length; index++) {
+            const value = args[index];
+            switch (spec[index]) {
+                case "r":
+                    converted[index] = registerIdFor(value, methodName);
+                    break;
+                case "c":
+                    converted[index] = enumIdFor(writerConditions, value, "condition code", methodName);
+                    break;
+                case "m":
+                    converted[index] = enumIdFor(writerIndexModes, value, "index mode", methodName);
+                    break;
+                case "l":
+                    converted[index] = labelIdFor(value);
+                    break;
+                case "u":
+                case "s":
+                    converted[index] = integerFor(value, methodName);
+                    break;
+                case "A":
+                    converted[index] = callArgumentsFor(value, methodName);
+                    break;
+                default:
+                    // "a" (address) and "b" (bytes) are forwarded untouched.
+                    converted[index] = value;
+                    break;
+            }
+        }
+        return converted;
+    }
+
+    function defineWriterMembers(target, state, methods, invoke) {
+        for (const method of methods) {
+            const { name, opcode, argSpec } = method;
+            if (method.kind === "property") {
+                Object.defineProperty(target, name, {
+                    enumerable: true,
+                    get() { return invoke(state, opcode, []); }
+                });
+                continue;
+            }
+            Object.defineProperty(target, name, {
+                enumerable: true,
+                value(...args) {
+                    if (args.length < argSpec.length)
+                        throw new TypeError(name + "() expects " + argSpec.length + " argument(s)");
+                    return invoke(state, opcode, convertWriterArguments(argSpec, name, args));
+                }
+            });
+        }
+    }
+
+    function invokeIteratorWriter(state, opcode, args) {
+        return native.writerInvoke(state.token, opcode, ...args);
+    }
+
+    // Lets `new Arm64Relocator(input, iterator)` find the transform token that
+    // owns the output writer without exposing the token to scripts.
+    const relocatorStates = new WeakMap();
+
     function createTransformEntry(callback) {
         const state = { token: 0 };
         const instruction = Object.create(instructionPrototype);
@@ -215,7 +365,49 @@
                 value() { native.transformPutChainingReturn(state.token); }
             }
         });
+        // Upstream models the transform iterator as a subclass of Arm64Writer,
+        // so the writer members live directly on the iterator.
+        defineWriterMembers(iterator, state, writerSpec.methods, invokeIteratorWriter);
+        Object.defineProperty(iterator, "dispose", {
+            enumerable: true,
+            // The Stalker output writer is owned by Gum and retired when the
+            // transform callback returns; disposing it from a script would break
+            // code generation for the rest of the block.
+            value() {}
+        });
+        relocatorStates.set(iterator, state);
         return { callback, state, iterator };
+    }
+
+    function createRelocator(inputCode, output) {
+        if (output === null || output === undefined)
+            throw new TypeError("Arm64Relocator requires an output writer");
+        const state = relocatorStates.get(output);
+        if (state === undefined)
+            throw new TypeError("Arm64Relocator output must be the current Stalker transform iterator");
+        if (state.token === 0)
+            throw new Error("invalid operation outside a Stalker transform callback");
+
+        const handle = native.relocatorCreate(state.token, inputCode);
+        const relocator = Object.create(null);
+        const relocatorState = { token: state.token, handle, disposed: false };
+        defineWriterMembers(relocator, relocatorState, writerSpec.relocatorMethods, invokeRelocator);
+        Object.defineProperty(relocator, "dispose", {
+            enumerable: true,
+            value() {
+                if (relocatorState.disposed)
+                    return;
+                relocatorState.disposed = true;
+                native.relocatorDestroy(relocatorState.token, relocatorState.handle);
+            }
+        });
+        return relocator;
+    }
+
+    function invokeRelocator(state, opcode, args) {
+        if (state.disposed)
+            throw new Error("Arm64Relocator has already been disposed");
+        return native.relocatorInvoke(state.token, state.handle, opcode, ...args);
     }
 
     function pointerAt(view, offset, stringify) {
@@ -325,6 +517,9 @@
                 return;
             }
             entry.state.token = token;
+            // Label names are scoped to a single callback: the writer they were
+            // resolved against stops being valid once it returns.
+            transformLabels.clear();
             try {
                 entry.callback(entry.iterator);
             } catch (error) {
@@ -332,6 +527,7 @@
                 throw error;
             } finally {
                 entry.state.token = 0;
+                transformLabels.clear();
             }
         }
     });
@@ -534,8 +730,33 @@
         parse: {
             enumerable: true,
             value: parse
+        },
+        // rustFrida extension: makes the queue-full path and the retirement
+        // queues observable instead of silently dropping events.
+        statistics: {
+            enumerable: true,
+            value() {
+                const snapshot = native.statistics();
+                // statistics() consumes the callout retirement queue, so release
+                // the JS roots here rather than waiting for the next prune.
+                for (const id of snapshot.retiredCalloutIds) {
+                    callouts.delete(id);
+                    nativeCalloutRoots.delete(id);
+                }
+                delete snapshot.retiredCalloutIds;
+                snapshot.liveCallouts = callouts.size + nativeCalloutRoots.size;
+                snapshot.liveCallProbes = callProbes.size + nativeCallProbeRoots.size;
+                return snapshot;
+            }
         }
     });
 
     globalThis.Stalker = Stalker;
+
+    function Arm64Relocator(inputCode, output) {
+        if (!new.target)
+            throw new TypeError("use `new Arm64Relocator()` to create a new instance");
+        return createRelocator(inputCode, output);
+    }
+    globalThis.Arm64Relocator = Arm64Relocator;
 })();

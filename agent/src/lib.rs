@@ -34,6 +34,8 @@ mod module_backend;
 mod quickjs_loader;
 #[cfg(feature = "frida-gum")]
 mod stalker;
+#[cfg(feature = "frida-gum")]
+mod stalker_writer;
 
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,

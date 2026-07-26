@@ -3,6 +3,8 @@
 #![cfg(feature = "frida-gum")]
 
 use crate::communication::{log_msg, write_stream};
+use crate::stalker_writer;
+use frida_gum::instruction_writer::InstructionWriter;
 use frida_gum::interceptor::Interceptor;
 use frida_gum::stalker::{
     Event, EventMask, EventSink, NativeCallProbeCallback, NativeEventSinkCallback, Stalker, StalkerIterator,
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use quickjs_hook::{
     StalkerBackend, StalkerCallProbeConfig, StalkerCalloutAccess, StalkerDrainResult, StalkerEventBatch,
-    StalkerFollowConfig, StalkerInstruction, StalkerTransformAccess,
+    StalkerFollowConfig, StalkerInstruction, StalkerStatistics, StalkerTraceStatistics, StalkerTransformAccess,
 };
 
 const EVENT_RECORD_SIZE: usize = 32;
@@ -37,6 +39,11 @@ fn current_thread_id() -> u64 {
 struct EventQueue {
     current: Vec<u8>,
     byte_limit: usize,
+    /// Events discarded because the queue was full. The queue deliberately does
+    /// not grow: a Stalker thread that outruns the drain worker must lose events
+    /// rather than the agent's heap. The counter is monotonic so a script can
+    /// tell a full queue apart from an idle one after a drain.
+    dropped: u64,
 }
 
 impl EventQueue {
@@ -45,12 +52,15 @@ impl EventQueue {
         Self {
             current: Vec::with_capacity(byte_limit),
             byte_limit,
+            dropped: 0,
         }
     }
 
     fn push(&mut self, event: &Event) {
         if self.byte_limit.saturating_sub(self.current.len()) >= EVENT_RECORD_SIZE {
             encode_event(event, &mut self.current);
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -131,6 +141,17 @@ impl TraceBuffer {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
+    /// Snapshot of this trace's queue state for `Stalker.statistics()`.
+    fn statistics(&self) -> StalkerTraceStatistics {
+        let queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        StalkerTraceStatistics {
+            thread_id: self.thread_id,
+            queue_capacity: self.capacity as u64,
+            queued_events: (queue.current.len() / EVENT_RECORD_SIZE) as u64,
+            dropped_events: queue.dropped,
+        }
+    }
+
     fn drain_if_due(&self, now: Instant) -> Vec<StalkerEventBatch> {
         let Some(interval) = self.drain_interval else {
             return Vec::new();
@@ -177,13 +198,29 @@ struct StalkerRuntime {
     pending: HashMap<u64, StalkerFollowConfig>,
     retired: Vec<Arc<TraceBuffer>>,
     call_probes: HashMap<u32, ActiveCallProbe>,
-    call_probe_anchors: HashMap<u64, u32>,
+    call_probe_anchors: HashMap<u64, CallProbeAnchor>,
     retired_call_probes: Vec<Arc<CallProbeState>>,
 }
 
 struct ActiveCallProbe {
     gum_id: u32,
+    target_address: u64,
     state: Option<Arc<CallProbeState>>,
+}
+
+/// Identity of the mapping that owned a probe target when its anchor was
+/// installed. After an unload the same address can be handed to a different
+/// module, and reusing the old anchor would leave Gum holding state for code
+/// that is no longer mapped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AnchorModuleIdentity {
+    base: u64,
+    path: String,
+}
+
+struct CallProbeAnchor {
+    gum_id: u32,
+    module: Option<AnchorModuleIdentity>,
 }
 
 struct CallProbeState {
@@ -690,7 +727,11 @@ fn start_follow(runtime: &mut StalkerRuntime, config: StalkerFollowConfig) -> Re
     let transformer = gum.as_ref().map(|gum| {
         let context = config.context;
         let thread_id = config.thread_id;
-        Transformer::from_callback(gum, move |mut iterator, _output| {
+        Transformer::from_callback(gum, move |mut iterator, output| {
+            // The output writer belongs to Gum and is only valid for the
+            // duration of this callback, so the facade retires everything that
+            // references it before returning.
+            let writer = output.writer();
             let access = StalkerTransformAccess {
                 opaque: &mut iterator as *mut StalkerIterator<'_> as usize,
                 next: transform_iterator_next,
@@ -698,6 +739,11 @@ fn start_follow(runtime: &mut StalkerRuntime, config: StalkerFollowConfig) -> Re
                 get_memory_access: transform_iterator_get_memory_access,
                 put_callout: transform_iterator_put_callout,
                 put_chaining_return: transform_iterator_put_chaining_return,
+                writer: writer.raw_writer() as usize,
+                writer_invoke: stalker_writer::writer_invoke,
+                relocator_create: stalker_writer::relocator_create,
+                relocator_destroy: stalker_writer::relocator_destroy,
+                relocator_invoke: stalker_writer::relocator_invoke,
             };
             quickjs_hook::dispatch_stalker_transform(context, thread_id, access);
         })
@@ -869,6 +915,9 @@ fn backend_unfollow(thread_id: u64) -> Result<Vec<StalkerEventBatch>, String> {
     }
     runtime.stalker.flush();
     runtime.retired.push(buffer);
+    // Unfollowing the last thread is the safe point where anchors left over from
+    // removed probes can finally go.
+    prune_unused_call_probe_anchors(runtime);
     Ok(drain_runtime(runtime))
 }
 
@@ -943,7 +992,7 @@ fn retire_stalker_state_in_range(base: u64, size: usize, retired_hfollow_target:
     let anchors = runtime
         .call_probe_anchors
         .iter()
-        .filter_map(|(&address, &gum_id)| address_is_in_range(address, base, size).then_some((address, gum_id)))
+        .filter_map(|(&address, anchor)| address_is_in_range(address, base, size).then_some((address, anchor.gum_id)))
         .collect::<Vec<_>>();
     if anchors.is_empty() && retired_hfollow_target.is_none() {
         return Ok(0);
@@ -966,9 +1015,34 @@ fn retire_stalker_state_in_range(base: u64, size: usize, retired_hfollow_target:
 
 unsafe extern "C" fn call_probe_anchor_callback(_details: *mut c_void, _data: *mut c_void) {}
 
+/// Which mapping currently owns `address`, or `None` for anonymous, JIT or
+/// hidden mappings that Gum cannot attribute to a module.
+fn module_identity_at(address: u64) -> Option<AnchorModuleIdentity> {
+    let gum = retain_gum().ok()?;
+    let process = frida_gum::Process::obtain(&gum);
+    let module = process.find_module_by_address(address as usize)?;
+    Some(AnchorModuleIdentity {
+        base: module.range().base_address().0 as u64,
+        path: module.path(),
+    })
+}
+
 fn ensure_call_probe_anchor(runtime: &mut StalkerRuntime, target_address: u64) {
-    if runtime.call_probe_anchors.contains_key(&target_address) {
-        return;
+    let identity = module_identity_at(target_address);
+    if let Some(existing) = runtime.call_probe_anchors.get(&target_address) {
+        // An unattributed address cannot prove reuse either way, so keep the
+        // anchor: dropping it would reintroduce the trailing-BRK problem below.
+        if existing.module.is_none() || identity.is_none() || existing.module == identity {
+            return;
+        }
+        log_msg(format!(
+            "[stalker] call probe anchor at 0x{target_address:x} was reused by another module; rebuilding\n"
+        ));
+        let stale = runtime
+            .call_probe_anchors
+            .remove(&target_address)
+            .expect("anchor was just looked up");
+        runtime.stalker.remove_call_probe(stale.gum_id);
     }
 
     // Frida 17.15.5 on ARM64 may execute the trailing BRK of a block when the
@@ -980,7 +1054,41 @@ fn ensure_call_probe_anchor(runtime: &mut StalkerRuntime, target_address: u64) {
             .stalker
             .add_call_probe_native(NativePointer(target_address as *mut c_void), callback, null_mut())
     };
-    runtime.call_probe_anchors.insert(target_address, gum_id);
+    runtime.call_probe_anchors.insert(
+        target_address,
+        CallProbeAnchor {
+            gum_id,
+            module: identity,
+        },
+    );
+}
+
+/// Drop anchors that no user probe needs any more.
+///
+/// Removing the last probe of a block while a thread is being followed can make
+/// that thread execute the block's trailing BRK, so this only runs once no
+/// thread is followed: at that point no compiled block can be re-entered before
+/// Stalker rebuilds it.
+fn prune_unused_call_probe_anchors(runtime: &mut StalkerRuntime) -> usize {
+    if !runtime.active.is_empty() || !runtime.pending.is_empty() || runtime.stalker.is_following_me() {
+        return 0;
+    }
+    let unused = runtime
+        .call_probe_anchors
+        .iter()
+        .filter(|(address, _)| {
+            !runtime
+                .call_probes
+                .values()
+                .any(|probe| probe.target_address == **address)
+        })
+        .map(|(address, anchor)| (*address, anchor.gum_id))
+        .collect::<Vec<_>>();
+    for (address, gum_id) in &unused {
+        runtime.call_probe_anchors.remove(address);
+        runtime.stalker.remove_call_probe(*gum_id);
+    }
+    unused.len()
 }
 
 unsafe extern "C" fn call_probe_get_argument(opaque: usize, index: u32) -> u64 {
@@ -1037,7 +1145,14 @@ fn backend_add_call_probe(config: StalkerCallProbeConfig) -> Result<(), String> 
         (gum_id, Some(state))
     };
     restore_current_execution_state(runtime, current_execution_was_active);
-    runtime.call_probes.insert(config.id, ActiveCallProbe { gum_id, state });
+    runtime.call_probes.insert(
+        config.id,
+        ActiveCallProbe {
+            gum_id,
+            target_address: config.target_address,
+            state,
+        },
+    );
     Ok(())
 }
 
@@ -1050,12 +1165,45 @@ fn backend_remove_call_probe(id: u32) -> Result<(), String> {
     if let Some(probe) = runtime.call_probes.remove(&id) {
         let current_execution_was_active = current_execution_is_active(runtime);
         runtime.stalker.remove_call_probe(probe.gum_id);
+        prune_unused_call_probe_anchors(runtime);
         restore_current_execution_state(runtime, current_execution_was_active);
         if let Some(state) = probe.state {
             runtime.retired_call_probes.push(state);
         }
     }
     Ok(())
+}
+
+/// Snapshot the backend's counters. Retired traces keep contributing their drop
+/// counts so a `%reload` or unfollow cannot make dropped events disappear.
+fn backend_statistics() -> Result<StalkerStatistics, String> {
+    let slot = lock_runtime()?;
+    let Some(runtime) = slot.runtime.as_ref() else {
+        return Ok(StalkerStatistics::default());
+    };
+
+    let mut traces: Vec<StalkerTraceStatistics> = runtime.active.values().map(|buffer| buffer.statistics()).collect();
+    traces.sort_by_key(|trace| trace.thread_id);
+    let retired_dropped: u64 = runtime
+        .retired
+        .iter()
+        .map(|buffer| buffer.statistics().dropped_events)
+        .sum();
+
+    Ok(StalkerStatistics {
+        dropped_events: traces
+            .iter()
+            .map(|trace| trace.dropped_events)
+            .sum::<u64>()
+            .saturating_add(retired_dropped),
+        active_traces: runtime.active.len() as u64,
+        pending_traces: runtime.pending.len() as u64,
+        retired_traces: runtime.retired.len() as u64,
+        active_call_probes: runtime.call_probes.len() as u64,
+        retired_call_probes: runtime.retired_call_probes.len() as u64,
+        call_probe_anchors: runtime.call_probe_anchors.len() as u64,
+        traces,
+    })
 }
 
 fn backend_get_trust_threshold() -> Result<i32, String> {
@@ -1173,6 +1321,8 @@ pub fn install_quickjs_backend() -> Result<(), String> {
         activate_current: backend_activate_current,
         deactivate_current: backend_deactivate_current,
         shutdown: backend_shutdown,
+        writer_enums: stalker_writer::writer_enums,
+        statistics: backend_statistics,
     })
 }
 

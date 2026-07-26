@@ -3,9 +3,11 @@
 use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::callback_util::{
-    acquire_js_engine_for_callback, extract_pointer_address, handle_js_exception, hot_atoms, throw_internal_error,
+    acquire_js_engine_for_callback, extract_pointer_address, handle_js_exception, hot_atoms, set_js_u64_property,
+    throw_internal_error,
 };
 use crate::jsapi::ptr::create_native_pointer;
+use crate::jsapi::stalker_writer;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::runtime::SuspendedRuntime;
 use crate::value::JSValue;
@@ -78,6 +80,16 @@ pub type StalkerTransformGetMemoryAccess = unsafe extern "C" fn(usize) -> u32;
 pub type StalkerTransformPutCallout = unsafe extern "C" fn(usize, usize, u32, u64, u64) -> i32;
 pub type StalkerTransformPutChainingReturn = unsafe extern "C" fn(usize);
 
+/// Dispatch one ARM64 writer or relocator opcode. Arguments are flattened into a
+/// `u64` slice encoded per `stalker_writer`'s spec strings; the result lands in
+/// `out`. Returns 1 on success, 0 when Gum reported failure, and -1 when the
+/// opcode or its encoding is invalid.
+pub type StalkerWriterInvoke = unsafe extern "C" fn(usize, u32, *const u64, u32, *mut u64) -> i32;
+/// Create a relocator reading `input_code` and writing through the transform's
+/// output writer. Returns 0 on failure.
+pub type StalkerRelocatorCreate = unsafe extern "C" fn(usize, u64) -> usize;
+pub type StalkerRelocatorDestroy = unsafe extern "C" fn(usize);
+
 #[derive(Clone, Copy)]
 pub struct StalkerTransformAccess {
     pub opaque: usize,
@@ -86,6 +98,45 @@ pub struct StalkerTransformAccess {
     pub get_memory_access: StalkerTransformGetMemoryAccess,
     pub put_callout: StalkerTransformPutCallout,
     pub put_chaining_return: StalkerTransformPutChainingReturn,
+    /// `GumArm64Writer` of the current `GumStalkerOutput`.
+    pub writer: usize,
+    pub writer_invoke: StalkerWriterInvoke,
+    pub relocator_create: StalkerRelocatorCreate,
+    pub relocator_destroy: StalkerRelocatorDestroy,
+    pub relocator_invoke: StalkerWriterInvoke,
+}
+
+/// Register, condition and index-mode names resolved by the backend so the
+/// JavaScript facade never hardcodes Capstone or Gum enum values.
+#[derive(Clone, Debug, Default)]
+pub struct StalkerWriterEnums {
+    pub registers: Vec<(String, u32)>,
+    pub conditions: Vec<(String, u32)>,
+    pub index_modes: Vec<(String, u32)>,
+}
+
+/// Per-thread queue state reported by `Stalker.statistics()`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StalkerTraceStatistics {
+    pub thread_id: u64,
+    pub queue_capacity: u64,
+    pub queued_events: u64,
+    pub dropped_events: u64,
+}
+
+/// Runtime counters for the Stalker backend. This is a rustFrida extension: it
+/// makes the otherwise silent queue-full path and the retirement queues
+/// observable from a script.
+#[derive(Clone, Debug, Default)]
+pub struct StalkerStatistics {
+    pub dropped_events: u64,
+    pub active_traces: u64,
+    pub pending_traces: u64,
+    pub retired_traces: u64,
+    pub active_call_probes: u64,
+    pub retired_call_probes: u64,
+    pub call_probe_anchors: u64,
+    pub traces: Vec<StalkerTraceStatistics>,
 }
 
 pub type StalkerProbeGetArgument = unsafe extern "C" fn(usize, u32) -> u64;
@@ -122,6 +173,8 @@ pub struct StalkerBackend {
     pub activate_current: fn(u64) -> Result<bool, String>,
     pub deactivate_current: fn() -> Result<(), String>,
     pub shutdown: fn() -> Result<bool, String>,
+    pub writer_enums: fn() -> StalkerWriterEnums,
+    pub statistics: fn() -> Result<StalkerStatistics, String>,
 }
 
 static STALKER_BACKEND: Mutex<Option<StalkerBackend>> = Mutex::new(None);
@@ -143,6 +196,11 @@ struct StalkerTransformFrame {
     access: StalkerTransformAccess,
     has_current_instruction: bool,
     instruction: Option<StalkerInstruction>,
+    /// Relocators created during this callback, keyed by the handle handed to
+    /// JavaScript. They are destroyed when the callback returns so a script
+    /// cannot reach a Gum object whose writer has already been retired.
+    relocators: Vec<(u64, usize)>,
+    next_relocator_handle: u64,
 }
 
 struct StalkerTransformGuard {
@@ -224,6 +282,8 @@ impl StalkerTransformGuard {
                 access,
                 has_current_instruction: false,
                 instruction: None,
+                relocators: Vec::new(),
+                next_relocator_handle: 1,
             });
         Self { owner_thread, token }
     }
@@ -234,11 +294,18 @@ impl Drop for StalkerTransformGuard {
         let mut stack = STALKER_TRANSFORM_STACK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = stack
+        let Some(index) = stack
             .iter()
             .rposition(|frame| frame.owner_thread == self.owner_thread && frame.token == self.token)
-        {
-            stack.remove(index);
+        else {
+            return;
+        };
+        let frame = stack.remove(index);
+        // Release the Gum objects before dropping the lock: the writer they
+        // reference stops being valid as soon as the transform callback returns.
+        drop(stack);
+        for (_, relocator) in frame.relocators {
+            unsafe { (frame.access.relocator_destroy)(relocator) };
         }
     }
 }
@@ -1083,6 +1150,384 @@ fn stalker_instruction_text_len(bytes: &[u8]) -> usize {
     bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len())
 }
 
+unsafe fn js_array_length(ctx: *mut ffi::JSContext, value: JSValue) -> Option<u64> {
+    let length = JSValue(ffi::JS_GetPropertyStr(ctx, value.raw(), c"length".as_ptr()));
+    let count = length.to_u64(ctx);
+    length.free(ctx);
+    count
+}
+
+/// Flatten the JavaScript arguments of a writer/relocator call into the `u64`
+/// encoding the backend expects. `byte_storage` keeps buffers alive for the
+/// duration of the dispatch.
+unsafe fn encode_writer_arguments(
+    ctx: *mut ffi::JSContext,
+    method: &stalker_writer::StalkerWriterMethod,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    first_argument: usize,
+    byte_storage: &mut Vec<Vec<u8>>,
+) -> Result<Vec<u64>, ffi::JSValue> {
+    let expected = method.arg_spec.chars().count();
+    let available = (argc as usize).saturating_sub(first_argument);
+    if available < expected {
+        return Err(throw_internal_error(
+            ctx,
+            format!("{}() expects {expected} argument(s)", method.name),
+        ));
+    }
+
+    let mut encoded = Vec::with_capacity(expected);
+    for (offset, spec) in method.arg_spec.chars().enumerate() {
+        let value = JSValue(*argv.add(first_argument + offset));
+        match spec {
+            'a' => encoded.push(extract_pointer_address(ctx, value, method.name)?),
+            'r' | 'c' | 'm' | 'u' | 'l' => {
+                let Some(raw) = value.to_u64(ctx) else {
+                    return Err(throw_internal_error(
+                        ctx,
+                        format!("{}() argument {offset} must be an integer", method.name),
+                    ));
+                };
+                encoded.push(raw);
+            }
+            's' => {
+                let Some(raw) = value.to_i64(ctx) else {
+                    return Err(throw_internal_error(
+                        ctx,
+                        format!("{}() argument {offset} must be an integer", method.name),
+                    ));
+                };
+                encoded.push(raw as u64);
+            }
+            'b' => {
+                let bytes = crate::jsapi::memory::writest::extract_bytes(ctx, value)?;
+                byte_storage.push(bytes);
+                let bytes = byte_storage.last().expect("just pushed");
+                encoded.push(bytes.as_ptr() as u64);
+                encoded.push(bytes.len() as u64);
+            }
+            'A' => {
+                // Pre-flattened by the facade as [count, kind0, value0, ...].
+                let Some(count) = js_array_length(ctx, value) else {
+                    return Err(throw_internal_error(
+                        ctx,
+                        format!("{}() argument {offset} must be an array", method.name),
+                    ));
+                };
+                for index in 0..count {
+                    let element = JSValue(ffi::JS_GetPropertyUint32(ctx, value.raw(), index as u32));
+                    let raw = element.to_u64(ctx);
+                    element.free(ctx);
+                    let Some(raw) = raw else {
+                        return Err(throw_internal_error(
+                            ctx,
+                            format!("{}() received a malformed argument list", method.name),
+                        ));
+                    };
+                    encoded.push(raw);
+                }
+            }
+            other => {
+                return Err(throw_internal_error(
+                    ctx,
+                    format!("{}() uses unsupported argument spec '{other}'", method.name),
+                ));
+            }
+        }
+    }
+
+    if stalker_writer::validate_arg_encoding(method.arg_spec, &encoded).is_none() {
+        return Err(throw_internal_error(
+            ctx,
+            format!("{}() received a malformed argument list", method.name),
+        ));
+    }
+    Ok(encoded)
+}
+
+unsafe fn writer_result_to_js(
+    ctx: *mut ffi::JSContext,
+    method: &stalker_writer::StalkerWriterMethod,
+    status: i32,
+    out: u64,
+) -> ffi::JSValue {
+    if status < 0 {
+        return throw_internal_error(ctx, format!("{}() was rejected by the ARM64 writer", method.name));
+    }
+    match method.result {
+        stalker_writer::StalkerWriterResult::Void => JSValue::undefined().raw(),
+        stalker_writer::StalkerWriterResult::Bool => JSValue::bool(status != 0).raw(),
+        stalker_writer::StalkerWriterResult::Unsigned => ffi::qjs_new_int64(ctx, out as i64),
+        stalker_writer::StalkerWriterResult::Pointer => create_native_pointer(ctx, out).raw(),
+    }
+}
+
+unsafe extern "C" fn js_stalker_writer_invoke(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let token = match required_stalker_transform_token(ctx, argc, argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let opcode = match required_u64(ctx, argc, argv, 1, "ARM64 writer opcode") {
+        Ok(value) if value <= u32::MAX as u64 => value as u32,
+        Ok(_) => return throw_internal_error(ctx, "ARM64 writer opcode is out of range"),
+        Err(error) => return error,
+    };
+    let Some(method) = stalker_writer::lookup_writer_method(opcode) else {
+        return throw_internal_error(ctx, "unknown ARM64 writer opcode");
+    };
+
+    let mut byte_storage = Vec::new();
+    let encoded = match encode_writer_arguments(ctx, method, argc, argv, 2, &mut byte_storage) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+
+    let mut out = 0u64;
+    let Some(status) = with_stalker_transform_frame_mut(token, |frame| {
+        (frame.access.writer_invoke)(
+            frame.access.writer,
+            opcode,
+            encoded.as_ptr(),
+            encoded.len() as u32,
+            &mut out,
+        )
+    }) else {
+        return throw_internal_error(ctx, "invalid operation outside a Stalker transform callback");
+    };
+
+    writer_result_to_js(ctx, method, status, out)
+}
+
+unsafe extern "C" fn js_stalker_relocator_create(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let token = match required_stalker_transform_token(ctx, argc, argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if argc < 2 {
+        return throw_internal_error(ctx, "Arm64Relocator input code is required");
+    }
+    let input_code = match extract_pointer_address(ctx, JSValue(*argv.add(1)), "Arm64Relocator") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if input_code == 0 {
+        return throw_internal_error(ctx, "Arm64Relocator input code must not be NULL");
+    }
+
+    let Some(handle) = with_stalker_transform_frame_mut(token, |frame| {
+        let relocator = (frame.access.relocator_create)(frame.access.writer, input_code);
+        if relocator == 0 {
+            return 0;
+        }
+        let handle = frame.next_relocator_handle;
+        frame.next_relocator_handle = handle.saturating_add(1);
+        frame.relocators.push((handle, relocator));
+        handle
+    }) else {
+        return throw_internal_error(ctx, "invalid operation outside a Stalker transform callback");
+    };
+    if handle == 0 {
+        return throw_internal_error(ctx, "failed to create Arm64Relocator");
+    }
+    ffi::qjs_new_int64(ctx, handle as i64)
+}
+
+unsafe extern "C" fn js_stalker_relocator_destroy(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let token = match required_stalker_transform_token(ctx, argc, argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let handle = match required_u64(ctx, argc, argv, 1, "Arm64Relocator handle") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+
+    // Dropping a relocator whose frame is already gone is a no-op: the transform
+    // guard destroyed it when the callback returned.
+    let _ = with_stalker_transform_frame_mut(token, |frame| {
+        if let Some(index) = frame.relocators.iter().position(|(id, _)| *id == handle) {
+            let (_, relocator) = frame.relocators.remove(index);
+            (frame.access.relocator_destroy)(relocator);
+        }
+    });
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_stalker_relocator_invoke(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let token = match required_stalker_transform_token(ctx, argc, argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let handle = match required_u64(ctx, argc, argv, 1, "Arm64Relocator handle") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let opcode = match required_u64(ctx, argc, argv, 2, "Arm64Relocator opcode") {
+        Ok(value) if value <= u32::MAX as u64 => value as u32,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Relocator opcode is out of range"),
+        Err(error) => return error,
+    };
+    let Some(method) = stalker_writer::lookup_relocator_method(opcode) else {
+        return throw_internal_error(ctx, "unknown Arm64Relocator opcode");
+    };
+
+    let mut byte_storage = Vec::new();
+    let encoded = match encode_writer_arguments(ctx, method, argc, argv, 3, &mut byte_storage) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+
+    let mut out = 0u64;
+    let Some(status) = with_stalker_transform_frame_mut(token, |frame| {
+        let Some((_, relocator)) = frame.relocators.iter().copied().find(|(id, _)| *id == handle) else {
+            return None;
+        };
+        Some((frame.access.relocator_invoke)(
+            relocator,
+            opcode,
+            encoded.as_ptr(),
+            encoded.len() as u32,
+            &mut out,
+        ))
+    }) else {
+        return throw_internal_error(ctx, "invalid operation outside a Stalker transform callback");
+    };
+    let Some(status) = status else {
+        return throw_internal_error(ctx, "Arm64Relocator has already been disposed");
+    };
+
+    writer_result_to_js(ctx, method, status, out)
+}
+
+unsafe fn set_js_string_property(ctx: *mut ffi::JSContext, object: ffi::JSValue, name: &str, value: &str) {
+    let key = std::ffi::CString::new(name).unwrap_or_default();
+    let text = ffi::JS_NewStringLen(ctx, value.as_ptr() as *const _, value.len());
+    ffi::JS_SetPropertyStr(ctx, object, key.as_ptr(), text);
+}
+
+unsafe fn set_js_object_property(ctx: *mut ffi::JSContext, object: ffi::JSValue, name: &str, value: ffi::JSValue) {
+    let key = std::ffi::CString::new(name).unwrap_or_default();
+    ffi::JS_SetPropertyStr(ctx, object, key.as_ptr(), value);
+}
+
+unsafe fn method_table_to_js(
+    ctx: *mut ffi::JSContext,
+    methods: &[stalker_writer::StalkerWriterMethod],
+) -> ffi::JSValue {
+    let array = ffi::JS_NewArray(ctx);
+    for (index, method) in methods.iter().enumerate() {
+        let entry = ffi::JS_NewObject(ctx);
+        set_js_string_property(ctx, entry, "name", method.name);
+        set_js_u64_property(ctx, entry, "opcode", method.opcode as u64);
+        set_js_string_property(ctx, entry, "argSpec", method.arg_spec);
+        set_js_string_property(ctx, entry, "result", method.result.as_str());
+        set_js_string_property(ctx, entry, "kind", method.kind.as_str());
+        ffi::JS_SetPropertyUint32(ctx, array, index as u32, entry);
+    }
+    array
+}
+
+unsafe fn enum_table_to_js(ctx: *mut ffi::JSContext, entries: &[(String, u32)]) -> ffi::JSValue {
+    let object = ffi::JS_NewObject(ctx);
+    for (name, value) in entries {
+        set_js_u64_property(ctx, object, name, *value as u64);
+    }
+    object
+}
+
+unsafe extern "C" fn js_stalker_statistics(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let Some(backend) = backend() else {
+        return throw_internal_error(ctx, "Stalker backend is not installed");
+    };
+    let statistics = match (backend.statistics)() {
+        Ok(value) => value,
+        Err(error) => return throw_internal_error(ctx, error),
+    };
+
+    let result = ffi::JS_NewObject(ctx);
+    set_js_u64_property(ctx, result, "droppedEvents", statistics.dropped_events);
+    set_js_u64_property(ctx, result, "activeTraces", statistics.active_traces);
+    set_js_u64_property(ctx, result, "pendingTraces", statistics.pending_traces);
+    set_js_u64_property(ctx, result, "retiredTraces", statistics.retired_traces);
+    set_js_u64_property(ctx, result, "activeCallProbes", statistics.active_call_probes);
+    set_js_u64_property(ctx, result, "retiredCallProbes", statistics.retired_call_probes);
+    set_js_u64_property(ctx, result, "callProbeAnchors", statistics.call_probe_anchors);
+
+    let traces = ffi::JS_NewArray(ctx);
+    for (index, trace) in statistics.traces.iter().enumerate() {
+        let entry = ffi::JS_NewObject(ctx);
+        set_js_u64_property(ctx, entry, "threadId", trace.thread_id);
+        set_js_u64_property(ctx, entry, "queueCapacity", trace.queue_capacity);
+        set_js_u64_property(ctx, entry, "queuedEvents", trace.queued_events);
+        set_js_u64_property(ctx, entry, "droppedEvents", trace.dropped_events);
+        ffi::JS_SetPropertyUint32(ctx, traces, index as u32, entry);
+    }
+    set_js_object_property(ctx, result, "traces", traces);
+
+    let retired_callouts = take_retired_stalker_callouts(ctx as usize);
+    set_js_u64_property(ctx, result, "retiredCallouts", retired_callouts.len() as u64);
+    // The retirement queue is consumed here, so hand the ids back to the facade
+    // instead of dropping them: the bootstrap uses them to release JS roots.
+    let callouts = ffi::JS_NewArray(ctx);
+    for (index, id) in retired_callouts.iter().enumerate() {
+        ffi::JS_SetPropertyUint32(ctx, callouts, index as u32, ffi::qjs_new_int64(ctx, *id as i64));
+    }
+    set_js_object_property(ctx, result, "retiredCalloutIds", callouts);
+    result
+}
+
+unsafe extern "C" fn js_stalker_writer_spec(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let enums = backend().map(|backend| (backend.writer_enums)()).unwrap_or_default();
+    let result = ffi::JS_NewObject(ctx);
+    set_js_object_property(
+        ctx,
+        result,
+        "methods",
+        method_table_to_js(ctx, stalker_writer::STALKER_WRITER_METHODS),
+    );
+    set_js_object_property(
+        ctx,
+        result,
+        "relocatorMethods",
+        method_table_to_js(ctx, stalker_writer::STALKER_RELOCATOR_METHODS),
+    );
+    set_js_object_property(ctx, result, "registers", enum_table_to_js(ctx, &enums.registers));
+    set_js_object_property(ctx, result, "conditions", enum_table_to_js(ctx, &enums.conditions));
+    set_js_object_property(ctx, result, "indexModes", enum_table_to_js(ctx, &enums.index_modes));
+    result
+}
+
 unsafe fn required_stalker_transform_token(
     ctx: *mut ffi::JSContext,
     argc: i32,
@@ -1530,6 +1975,36 @@ pub fn register_stalker_api(ctx: &JSContext) {
             "__rf_stalker_callout_set_register",
             js_stalker_callout_set_register,
             2,
+        );
+        add_cfunction_to_object(ctx.as_ptr(), raw, "__rf_stalker_statistics", js_stalker_statistics, 0);
+        add_cfunction_to_object(ctx.as_ptr(), raw, "__rf_stalker_writer_spec", js_stalker_writer_spec, 0);
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_stalker_writer_invoke",
+            js_stalker_writer_invoke,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_stalker_relocator_create",
+            js_stalker_relocator_create,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_stalker_relocator_destroy",
+            js_stalker_relocator_destroy,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_stalker_relocator_invoke",
+            js_stalker_relocator_invoke,
+            3,
         );
         add_cfunction_to_object(
             ctx.as_ptr(),

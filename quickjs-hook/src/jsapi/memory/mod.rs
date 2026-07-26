@@ -7,7 +7,7 @@ mod read;
 mod safe_access;
 mod scan;
 mod write;
-mod writest;
+pub(crate) mod writest;
 
 use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;

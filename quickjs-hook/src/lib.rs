@@ -75,8 +75,10 @@ pub use jsapi::stalker::{
     install_stalker_backend, retire_stalker_callout, shutdown_stalker_backend, wait_for_stalker_call_probe_callbacks,
     wait_for_stalker_callout_callbacks, wait_for_stalker_transform_callbacks, StalkerBackend, StalkerCallProbeConfig,
     StalkerCalloutAccess, StalkerDrainResult, StalkerEventBatch, StalkerFollowConfig, StalkerInstruction,
-    StalkerTransformAccess,
+    StalkerRelocatorCreate, StalkerRelocatorDestroy, StalkerStatistics, StalkerTraceStatistics, StalkerTransformAccess,
+    StalkerWriterEnums, StalkerWriterInvoke,
 };
+pub use jsapi::stalker_writer;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
