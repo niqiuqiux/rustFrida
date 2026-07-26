@@ -1,6 +1,6 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 06 已完成，Goal 07 进行中）
+> 状态：执行中（Goal 00 至 Goal 07 已完成，Worker 除外）
 >
 > 更新日期：2026-07-26
 >
@@ -99,7 +99,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
 1. Java 常用入口仍以 `Java.ready()` 为主，缺少 `Java.perform()/performNow()` 等标准入口和部分对象生命周期工具。
-2. 缺少 `Worker`，且 timer 在 `%reload` 后的生命周期尚未通过验收（见 Goal 07）。
+2. 缺少 `Worker`。
 
 ## 5. 架构与稳定性风险
 
@@ -132,6 +132,7 @@ Stalker、Interceptor、Java worker 都可能从 native 线程同步进入 JS。
 ### 5.6 已知可观测性缺口
 
 - `run_goal01_module_unload.py` 在当前设备的 shutdown 阶段稳定产生 tombstone；见 Goal 05 的既有缺口记录。
+- `pthread_shim` 的线程不带独立 TLS，agent 因此只能有一个后台 JS 线程；见 Goal 07 的 §7.1。
 
 Stalker 队列丢弃计数与 call-probe anchor 生命周期已由 Goal 05 处理；`Memory.alloc()` 的页权限与生命周期漂移已由 Goal 06 校正。
 
@@ -371,21 +372,32 @@ cargo build --offline --release --target aarch64-linux-android
 
 ### Goal 07：标准消息循环与 Script API（P1/P2）
 
-状态：**进行中（2026-07-26）。功能已落地并在单次会话内全部验证通过，但未满足本文件 §8 的 `%reload` 验收门槛，因此不标记完成。**
+状态：**已完成（2026-07-26）**。
 
-已落地：
+落地证据：
 
 - `send(payload, data?)` 与 `recv(type?, callback)` 落地。新增 agent→host 的 `0x88` SEND 帧与 host→agent 的 `0x03` POST 帧，body 均为 `[json_len:u32][json][binary]`；REPL 新增 `post <json>` 命令，纯文本会被包装成 `{"type":"send","payload":...}`。recv 采用上游的一次性回调语义，未被认领的消息留在队列里等待后续 `recv()`。
 - `setTimeout/setInterval/clearTimeout/clearInterval/setImmediate/clearImmediate` 与 `Script.nextTick` 由一个懒启动的 pump 线程驱动；它经既有引擎 guard 进入 JS，并在每次回调后 drain QuickJS job queue——这正是 promise 在顶层脚本返回后仍能 settle 的原因。未调度任何 timer 的脚本不会创建该线程。
 - `Script`（runtime/id/nextTick/pin/unpin/bindWeak/unbindWeak）、`Frida`（version/heapSize）与 `hexdump()` 落地。
-- `Memory.scan()` 现在返回 Promise（Goal 06 遗留项），callbacks 形态保留；扫描线程在回调后同样 drain job queue。
-- 单轮设备验证（PLC110 / Android 16）33 项断言全部通过：nextTick 先于零延迟 timeout、短延迟先于长延迟、clearTimeout 生效、setInterval 自停、promise 由 timer settle、send 携带二进制数据到达 host、recv 的通配与具名一次性回调、`Memory.scan` promise 解析与坏 pattern 同步抛出、hexdump 输出。
+- `Memory.scan()` 现在返回 Promise（Goal 06 遗留项），callbacks 形态保留。
+- `tests/device/run_goal07_messaging.py --device 3B65AU009YA00000` 在 PLC110（Android 16）完成两轮 `%reload` 与最终 shutdown，每轮 33 项断言全部通过；目标进程存活且没有新增 tombstone。覆盖 nextTick 先于零延迟 timeout、短延迟先于长延迟、clearTimeout 生效、setInterval 自停、promise 由 timer settle、send 携带二进制数据到达 host、recv 的通配与具名一次性回调、`Memory.scan` promise 解析与坏 pattern 同步抛出、hexdump 输出。
+- Goal 02/03/04/05/06 设备回归、兼容测试 16 项、API 快照 `--check`、交叉构建、rustfmt 和 diff 检查均通过。
 
-未通过的验收项：
+### 7.1 单后台线程约束（本 Goal 发现并处理）
 
-- `%reload` 后 timer 与 messaging 均恢复正常（各完成两轮），但第二轮的 `Memory.scan` 阶段使目标进程崩溃，因此整体回归仍失败。复现：`python3 tests/device/run_goal07_messaging.py --device <serial>`，第二轮在 `Memory.scan returns a promise` 之后断开。
-- 期间已修掉三类真实缺陷，值得记录以免重复踩：pump 线程用标志表示"已结束"而调用方随即卸载 agent（改为 join）；`cut_timers()` 不释放 callback 导致 `JS_FreeRuntime` 的引用计数断言失败（改为在等待后于安全点释放）；soft cleanup 中 join pump 会与持有引擎的清理线程死锁（改为 soft 只等回调离开 JS、hard 才 join）。剩余崩溃疑似同类的线程/上下文生命周期问题，需要继续排查扫描线程与 reload 后新 context 的交互。
-- Worker 尚未实现，按本 Goal 原定顺序排在最后。
+`agent/src/pthread_shim.rs` 的 `pthread_create` 用 `raw_clone` 建线程，**不带 `CLONE_SETTLS`**（tls 参数为 0）。因此 shim 创建的所有线程共享同一块 TLS，同时只能安全运行一个：两个并发的 `Memory.scan()` 就足以让目标进程崩溃，与 timer 无关。这是既有限制，Goal 06 只用单个 scan 所以未暴露，Goal 07 的常驻 pump 线程让它必然触发。
+
+处理方式是让 agent 只保留一个后台 JS 线程：timer pump 兼作通用后台执行器，`Memory.scan()` 通过 `submit_background_task()` 把工作交给它，不再自建线程。代价是长扫描会延后 timer，收益是所有后台 JS 入口都归一处治理，符合 §5.2。要根治需要给 shim 补 `CLONE_SETTLS` 并正确分配 TCB，属于独立课题。
+
+期间修掉的其它三类生命周期缺陷，同样值得记录以免重复踩：
+
+- pump 线程用标志表示"已结束"而调用方随即卸载 agent——标志只说明循环退出，线程还有代码要跑；改为 join。
+- `cut_timers()` 不释放 callback 导致 `JS_FreeRuntime` 的引用计数断言 abort；改为先等 pump 离开 JS，再在持有引擎的线程上释放。
+- 在 phase1 join pump 会与持有引擎的清理线程死锁；改为 phase1 只等回调离开 JS，join 推迟到 phase4 `cleanup_engine` 之后——那时引擎已销毁，pump 不可能再阻塞于它。
+
+未纳入本 Goal 的部分：
+
+- `Worker` 尚未实现，按本 Goal 原定顺序排在最后，需要独立 runtime 与明确的 terminate/join。
 
 目标：支持依赖 Frida message loop 的通用脚本。
 

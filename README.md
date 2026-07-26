@@ -1574,7 +1574,9 @@ setTimeout(function () { clearInterval(id); }, 5000);
 
 `Script` 提供 `runtime`（`"QJS"`）、`id`、`nextTick()`、`pin()/unpin()`、`bindWeak()/unbindWeak()`；`Frida` 提供 `version`（当前 Gum 的版本）与 `heapSize`。
 
-**已知限制**：`%reload` 后 timer 与消息通道会正常重建，但当前版本在 reload 后的第二轮 `Memory.scan()` 仍会使目标进程崩溃，详见 `doc/frida-upgrade-roadmap.md` 的 Goal 07。若脚本依赖 `%reload`，暂时避免在 reload 后再次调用 `Memory.scan()`。`Worker` 尚未实现。
+agent 只保留一个后台 JS 线程：定时器 pump 同时充当通用执行器，`Memory.scan()` 的扫描也在它上面跑。原因是 agent 自带的 pthread shim 建线程时不分配独立 TLS，多个后台线程会共享同一块 TLS 并使目标进程崩溃（详见 `doc/frida-upgrade-roadmap.md` 的 Goal 07 §7.1）。因此一次长扫描会延后定时器；扫描在分块之间让出，取消仍然及时。
+
+`Worker` 尚未实现。
 
 ## Memory
 

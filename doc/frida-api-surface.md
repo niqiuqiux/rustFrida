@@ -72,7 +72,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 
 | Area | Status | Roadmap goal | Missing upstream surface |
 | --- | --- | --- | --- |
-| Core runtime | partial | Goal 07 | `Worker`, `reload-safe timers` |
+| Core runtime | partial | Goal 07 | `Worker` |
 | Native ABI | compatible | Goal 04 |  |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints` |
 | Module and Process | partial | Goal 03 | `runOnThread`, `exception handler` |

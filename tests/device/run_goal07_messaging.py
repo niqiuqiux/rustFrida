@@ -186,7 +186,9 @@ def main():
             raise RuntimeError("the timer phase did not run once per runtime")
         if output.count("[goal07][RECV-READY]") != 2:
             raise RuntimeError("the messaging phase did not run once per runtime")
-        if "[send] " not in output:
+        # The host colourises the tag, so an ANSI reset sits between "[send]"
+        # and the payload.
+        if "[send]" not in output:
             raise RuntimeError("the host never received a send() message")
         if "(+4 bytes of data)" not in output:
             raise RuntimeError("the host never received the binary payload")

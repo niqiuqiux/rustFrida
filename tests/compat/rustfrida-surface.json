@@ -165,7 +165,7 @@
       "area": "Core runtime",
       "status": "partial",
       "goal": "07",
-      "missing": ["Worker", "reload-safe timers"]
+      "missing": ["Worker"]
     },
     {
       "area": "Native ABI",
