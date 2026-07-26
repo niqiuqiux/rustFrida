@@ -65,8 +65,9 @@ pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use jsapi::memory::{
     cut_memory_monitor, cut_memory_scans, dispatch_memory_access, install_memory_monitor_backend,
-    wait_for_memory_scans, MemoryAccessInfo, MemoryMonitorBackend,
+    wait_for_memory_scan_callbacks, wait_for_memory_scans, MemoryAccessInfo, MemoryMonitorBackend,
 };
+pub use jsapi::messaging::{clear_message_sink, install_message_sink, post_message, MessageSink};
 pub use jsapi::module::find_loaded_function_addresses;
 pub use jsapi::module::{
     cut_process_observers, free_process_observers, install_module_backend, install_process_observer_backend,
@@ -83,6 +84,7 @@ pub use jsapi::stalker::{
     StalkerWriterEnums, StalkerWriterInvoke,
 };
 pub use jsapi::stalker_writer;
+pub use jsapi::timers::{cut_timers, scheduled_timer_count, wait_for_timer_callbacks, wait_for_timers};
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 

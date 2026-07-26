@@ -26,7 +26,7 @@ use pointers::{memory_check_code_pointer, memory_find_pointers};
 use read::*;
 use scan::memory_scan_sync;
 use scan_async::memory_scan;
-pub use scan_async::{cut_memory_scans, wait_for_memory_scans};
+pub use scan_async::{cut_memory_scans, wait_for_memory_scan_callbacks, wait_for_memory_scans};
 pub(crate) fn safe_read_exact(address: u64, output: &mut [u8]) -> Result<(), String> {
     safe_access::read_exact(address, output).map_err(|error| error.to_string())
 }

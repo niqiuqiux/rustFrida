@@ -443,6 +443,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
             ("jseval", "<expr>", "求值 JS 表达式并显示结果"),
             ("jsclean", "", "清理 QuickJS 引擎"),
             ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
+            ("post", "<json>", "向脚本的 recv() 投递一条消息"),
             ("%reload", "[path]", "重载脚本（jsclean+jsinit+loadjs，不退出）"),
             ("help", "", "显示此帮助信息"),
             ("exit", "", "退出程序（quit 同效）"),
@@ -911,4 +912,35 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
         }
     }
     let _ = rl.save_history(".rustfrida_js_history");
+}
+
+/// `post <json>` — deliver a message to the script's `recv()`.
+///
+/// The payload is sent as-is when it parses as JSON, and wrapped as
+/// `{"type":"send","payload":<text>}` otherwise, so plain text is usable
+/// without quoting.
+pub(crate) fn try_post_message(session: &Session, line: &str) -> Result<bool, String> {
+    let Some(rest) = line.strip_prefix("post ").or_else(|| line.strip_prefix("post\t")) else {
+        if line.trim() == "post" {
+            return Err("用法: post <json>".to_string());
+        }
+        return Ok(false);
+    };
+    let body = rest.trim();
+    if body.is_empty() {
+        return Err("用法: post <json>".to_string());
+    }
+
+    // A body that already looks like a JSON document is passed through; plain
+    // text is wrapped so `post hello` works without quoting.
+    let json = if body.starts_with('{') || body.starts_with('[') {
+        body.to_string()
+    } else {
+        format!("{{\"type\":\"send\",\"payload\":{}}}", js_string_literal(body))
+    };
+
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    crate::communication::send_post(sender, &json, None).map_err(|error| format!("投递消息失败: {error}"))?;
+    log_info!("已投递: {}", json);
+    Ok(true)
 }

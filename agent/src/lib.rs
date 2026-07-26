@@ -201,6 +201,9 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                 } else if is_qbdi_helper_frame(kind) {
                     #[cfg(feature = "quickjs")]
                     quickjs_loader::install_qbdi_helper(payload);
+                } else if kind == crate::communication::FRAME_KIND_POST {
+                    #[cfg(feature = "quickjs")]
+                    quickjs_loader::post_script_message(&payload);
                 } else {
                     write_stream(format!("未知 frame kind: {}", kind).as_bytes());
                 }

@@ -9,11 +9,13 @@ pub mod int64;
 pub mod java;
 pub mod jni;
 pub mod memory;
+pub mod messaging;
 pub mod module;
 pub mod ptr;
 pub mod rpc;
 pub mod stalker;
 pub mod stalker_writer;
+pub mod timers;
 pub(crate) mod util;
 
 pub use console::register_console;
@@ -25,10 +27,12 @@ pub use java::deferred_java_init;
 pub use java::register_lazy_java_api;
 pub use jni::register_jni_api;
 pub use memory::register_memory_api;
+pub use messaging::register_messaging_api;
 pub use module::register_module_api;
 pub use ptr::register_ptr;
 pub use rpc::register_rpc;
 pub use stalker::register_stalker_api;
+pub use timers::register_timer_api;
 
 use crate::context::JSContext;
 use crate::ffi;
@@ -62,6 +66,18 @@ pub fn register_all_apis(ctx: &JSContext) {
     register_memory_api(ctx);
     register_module_api(ctx);
     register_stalker_api(ctx);
+    register_timer_api(ctx);
+    register_messaging_api(ctx);
     register_lazy_java_api(ctx);
     register_rpc(ctx);
+    register_runtime_globals(ctx);
+}
+
+/// Assemble the upstream-shaped globals (timers, send/recv, Script, hexdump) on
+/// top of the native entry points registered above.
+fn register_runtime_globals(ctx: &JSContext) {
+    match ctx.eval(include_str!("runtime_boot.js"), "<runtime_boot>") {
+        Ok(value) => value.free(ctx.as_ptr()),
+        Err(error) => console::output_message(&format!("[runtime] bootstrap failed: {error}")),
+    }
 }

@@ -30,6 +30,12 @@ static SCAN_JOBS: Mutex<Vec<std::sync::Arc<ScanJob>>> = Mutex::new(Vec::new());
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static IN_FLIGHT_SCANS: Mutex<usize> = Mutex::new(0);
 static IN_FLIGHT_SCANS_CV: Condvar = Condvar::new();
+/// Handles of scan threads, so teardown can join them.
+///
+/// The in-flight count drops before the thread has finished running its own
+/// code, and the agent is unmapped right after teardown returns — joining is
+/// what makes that safe.
+static SCAN_HANDLES: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 struct InFlightScanGuard;
 
@@ -63,8 +69,11 @@ pub fn cut_memory_scans() {
     }
 }
 
-/// Wait for scan callbacks to finish after [`cut_memory_scans`].
-pub fn wait_for_memory_scans(timeout: std::time::Duration) -> bool {
+/// Wait for scan callbacks to leave JavaScript, without joining the threads.
+///
+/// A script reload only needs the callbacks out of the runtime it is replacing;
+/// joining would deadlock against the engine the caller holds.
+pub fn wait_for_memory_scan_callbacks(timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     let mut count = IN_FLIGHT_SCANS.lock().unwrap_or_else(|error| error.into_inner());
     while *count != 0 {
@@ -79,6 +88,33 @@ pub fn wait_for_memory_scans(timeout: std::time::Duration) -> bool {
         if result.timed_out() && *count != 0 {
             return false;
         }
+    }
+    true
+}
+
+/// Wait for scan threads to finish and join them, for agent teardown.
+pub fn wait_for_memory_scans(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    {
+        let mut count = IN_FLIGHT_SCANS.lock().unwrap_or_else(|error| error.into_inner());
+        while *count != 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, result) = IN_FLIGHT_SCANS_CV
+                .wait_timeout(count, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            count = guard;
+            if result.timed_out() && *count != 0 {
+                return false;
+            }
+        }
+    }
+
+    let handles = std::mem::take(&mut *SCAN_HANDLES.lock().unwrap_or_else(|error| error.into_inner()));
+    for handle in handles {
+        let _ = handle.join();
     }
     true
 }
@@ -156,6 +192,7 @@ fn run_scan(job: std::sync::Arc<ScanJob>, address: u64, size: usize, pattern: Ma
             for argument in arguments {
                 ffi::qjs_free_value(ctx, argument);
             }
+            crate::jsapi::timers::drain_pending_jobs(ctx);
         }
         true
     })
@@ -173,6 +210,9 @@ fn run_scan(job: std::sync::Arc<ScanJob>, address: u64, size: usize, pattern: Ma
                     if let Some(on_complete) = callbacks.on_complete {
                         call_scan_callback(ctx, on_complete, &[]);
                     }
+                    // Settling a promise only queues its reactions; run them
+                    // here so `Memory.scan(...).then(...)` resolves.
+                    crate::jsapi::timers::drain_pending_jobs(ctx);
                 }
             }
         }
@@ -228,6 +268,7 @@ pub(super) unsafe extern "C" fn memory_scan(
         context: ctx as usize,
         cancelled: AtomicBool::new(false),
     });
+    let job_id = job.id;
     SCAN_JOBS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -236,8 +277,18 @@ pub(super) unsafe extern "C" fn memory_scan(
     let spawned = std::thread::Builder::new()
         .name("rf-memory-scan".to_string())
         .spawn(move || run_scan(job, address, size, pattern, callbacks));
-    if let Err(error) = spawned {
-        return throw_internal_error(ctx, format!("Memory.scan() could not start scan thread: {error}"));
+    match spawned {
+        Ok(handle) => {
+            let mut handles = SCAN_HANDLES.lock().unwrap_or_else(|error| error.into_inner());
+            // Reap threads that already finished so a long session does not
+            // accumulate handles.
+            handles.retain(|handle| !handle.is_finished());
+            handles.push(handle);
+        }
+        Err(error) => {
+            unregister_job(job_id);
+            return throw_internal_error(ctx, format!("Memory.scan() could not start scan thread: {error}"));
+        }
     }
     JSValue::undefined().raw()
 }

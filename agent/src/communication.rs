@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 const FRAME_KIND_CMD: u8 = 1;
 const FRAME_KIND_QBDI_HELPER: u8 = 2;
+/// `post` from the host, delivered to `recv()`. Same body layout as SEND.
+pub(crate) const FRAME_KIND_POST: u8 = 3;
 
 const FRAME_KIND_HELLO: u8 = 0x80;
 const FRAME_KIND_LOG: u8 = 0x81;
@@ -20,6 +22,8 @@ const FRAME_KIND_EVAL_ERR: u8 = 0x84;
 const FRAME_KIND_RPC_OK: u8 = 0x85;
 const FRAME_KIND_RPC_ERR: u8 = 0x86;
 const FRAME_KIND_BYE: u8 = 0x87;
+/// `send()` from the script: `[json_len:u32][json][binary data]`.
+const FRAME_KIND_SEND: u8 = 0x88;
 
 /// Write-half of the agent↔host socket, protected by Mutex to serialize messages.
 /// 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 直接走此 stream。
@@ -205,4 +209,38 @@ pub(crate) fn flush_cached_logs() {
             }
         }
     }
+}
+
+/// Deliver a `send()` from the script to the host.
+///
+/// Uses the synchronous path: unlike logs, dropping a message would silently
+/// break a script that is waiting for it on the other end.
+pub(crate) fn send_script_message(json: &str, data: Option<&[u8]>) -> Result<(), String> {
+    let Some(slot) = GLOBAL_STREAM.get() else {
+        return Err("agent socket is not connected".to_string());
+    };
+    let mut payload = Vec::with_capacity(4 + json.len() + data.map_or(0, |bytes| bytes.len()));
+    payload.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    payload.extend_from_slice(json.as_bytes());
+    if let Some(bytes) = data {
+        payload.extend_from_slice(bytes);
+    }
+
+    let mut stream = slot.lock().unwrap_or_else(|error| error.into_inner());
+    write_frame(&mut stream, FRAME_KIND_SEND, &payload).map_err(|error| error.to_string())
+}
+
+/// Split a SEND/POST body back into its JSON and binary halves.
+pub(crate) fn split_message_frame(payload: &[u8]) -> Option<(String, Option<Vec<u8>>)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let json_len = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
+    let json_end = 4usize.checked_add(json_len)?;
+    if json_end > payload.len() {
+        return None;
+    }
+    let json = String::from_utf8_lossy(&payload[4..json_end]).into_owned();
+    let data = (json_end < payload.len()).then(|| payload[json_end..].to_vec());
+    Some((json, data))
 }

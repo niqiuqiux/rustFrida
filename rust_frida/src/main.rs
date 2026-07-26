@@ -573,7 +573,14 @@ fn main() {
                 if is_eval_cmd {
                     session.eval_state.clear();
                 }
-                let handled_by_main_thread = match try_managedcounter_on_main_thread(&session, &line)
+                let handled_by_main_thread = match crate::repl::try_post_message(&session, &line)
+                    .and_then(|handled| {
+                        if handled {
+                            Ok(true)
+                        } else {
+                            try_managedcounter_on_main_thread(&session, &line)
+                        }
+                    })
                     .and_then(|handled| {
                         if handled {
                             Ok(true)

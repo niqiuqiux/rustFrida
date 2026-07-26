@@ -11,12 +11,12 @@ use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 #[cfg(feature = "qbdi")]
 use quickjs_hook::shutdown_qbdi_helper;
 use quickjs_hook::{
-    cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
+    cleanup_engine, cleanup_wxshadow_patches, clear_message_sink, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_memory_monitor, cut_memory_scans, cut_native_hooks,
-    cut_process_observers, detach_current_jni_thread, drain_thunk_in_flight, free_art_controller_state,
+    cut_process_observers, cut_timers, detach_current_jni_thread, drain_thunk_in_flight, free_art_controller_state,
     free_java_hooks, free_native_hooks, get_or_init_engine, init_hook_engine, load_script, load_script_with_filename,
-    set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
-    wait_for_memory_scans,
+    post_message, set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    wait_for_memory_scan_callbacks, wait_for_memory_scans, wait_for_timer_callbacks, wait_for_timers,
 };
 use std::collections::VecDeque;
 use std::ptr;
@@ -32,6 +32,9 @@ const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
 /// A scan only checks for cancellation between chunks, so allow for one chunk
 /// of an unlucky range before declaring the scan stuck.
 const MEMORY_SCAN_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
+/// The timer pump checks for shutdown between callbacks, so this only has to
+/// cover one callback that is already running.
+const TIMER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -260,6 +263,7 @@ pub fn init() -> Result<(), String> {
     crate::module_backend::install_quickjs_backend();
     #[cfg(feature = "frida-gum")]
     crate::memory_monitor::install_quickjs_backend();
+    quickjs_hook::install_message_sink(script_message_sink);
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());
@@ -590,6 +594,13 @@ pub fn cleanup() -> bool {
     }
     cut_memory_monitor();
     stage("phase1 cut_memory_scans", &mut t);
+    clear_message_sink();
+    cut_timers();
+    if !wait_for_timers(TIMER_STOP_TIMEOUT) {
+        log_msg("[quickjs] timer callbacks did not stop; keeping agent resident\n".to_string());
+        return false;
+    }
+    stage("phase1 cut_timers", &mut t);
     if let Err(error) = cut_process_observers() {
         log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
         return false;
@@ -812,6 +823,13 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     }
     cut_memory_monitor();
     stage("phase1 cut_memory_scans", &mut t);
+    clear_message_sink();
+    cut_timers();
+    if !wait_for_timers(TIMER_STOP_TIMEOUT) {
+        log_msg("[quickjs] timer callbacks did not stop; keeping agent resident\n".to_string());
+        return false;
+    }
+    stage("phase1 cut_timers", &mut t);
     if let Err(error) = cut_process_observers() {
         log_msg(format!("[quickjs] process observer shutdown failed: {error}\n"));
         return false;
@@ -950,11 +968,19 @@ pub fn cleanup_soft() -> Result<(), String> {
     cut_native_hooks();
     stage("phase1 cut_native_hooks", &mut t);
     cut_memory_scans();
-    if !wait_for_memory_scans(MEMORY_SCAN_STOP_TIMEOUT) {
+    if !wait_for_memory_scan_callbacks(MEMORY_SCAN_STOP_TIMEOUT) {
         return Err("Memory.scan 回调未停止，软清理已放弃".to_string());
     }
     cut_memory_monitor();
     stage("phase1 cut_memory_scans", &mut t);
+    clear_message_sink();
+    cut_timers();
+    // Soft cleanup keeps the agent mapped, so the pump thread may outlive this
+    // runtime; it only has to be out of the runtime being replaced.
+    if !wait_for_timer_callbacks(TIMER_STOP_TIMEOUT) {
+        return Err("timer 回调未停止，软清理已放弃".to_string());
+    }
+    stage("phase1 cut_timers", &mut t);
     cut_process_observers()?;
     stage("phase1 cut_process_observers", &mut t);
     #[cfg(feature = "frida-gum")]
@@ -997,4 +1023,18 @@ pub fn cleanup_soft() -> Result<(), String> {
         t0.elapsed().as_millis()
     ));
     Ok(())
+}
+
+/// Transport for `send()`: hand the message to the host over the agent socket.
+fn script_message_sink(json: &str, data: Option<&[u8]>) -> Result<(), String> {
+    crate::communication::send_script_message(json, data)
+}
+
+/// Deliver a `post` frame from the host to `recv()`.
+pub fn post_script_message(payload: &[u8]) {
+    let Some((json, data)) = crate::communication::split_message_frame(payload) else {
+        log_msg("[quickjs] malformed post frame\n".to_string());
+        return;
+    };
+    post_message(json, data);
 }

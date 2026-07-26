@@ -17,6 +17,7 @@ use crate::{log_agent, log_error, log_success};
 const FRAME_KIND_CMD: u8 = 1;
 #[cfg(feature = "qbdi")]
 const FRAME_KIND_QBDI_HELPER: u8 = 2;
+pub const FRAME_KIND_POST: u8 = 3;
 
 const FRAME_KIND_HELLO: u8 = 0x80;
 const FRAME_KIND_LOG: u8 = 0x81;
@@ -26,12 +27,16 @@ const FRAME_KIND_EVAL_ERR: u8 = 0x84;
 const FRAME_KIND_RPC_OK: u8 = 0x85;
 const FRAME_KIND_RPC_ERR: u8 = 0x86;
 const FRAME_KIND_BYE: u8 = 0x87;
+const FRAME_KIND_SEND: u8 = 0x88;
 
 #[derive(Clone)]
 pub(crate) enum HostToAgentMessage {
     Command(String),
     #[cfg(feature = "qbdi")]
     QbdiHelper(Vec<u8>),
+    /// A message for the script's `recv()`, already framed as
+    /// `[json_len:u32][json][binary data]`.
+    Post(Vec<u8>),
 }
 
 /// 泛型同步通道：在多线程间传递单次值，支持超时等待。
@@ -112,6 +117,21 @@ pub(crate) fn send_command(
     sender.send(HostToAgentMessage::Command(cmd.into()))
 }
 
+/// Post a message to the script's `recv()`.
+pub(crate) fn send_post(
+    sender: &Sender<HostToAgentMessage>,
+    json: &str,
+    data: Option<&[u8]>,
+) -> Result<(), std::sync::mpsc::SendError<HostToAgentMessage>> {
+    let mut body = Vec::with_capacity(4 + json.len() + data.map_or(0, |bytes| bytes.len()));
+    body.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    body.extend_from_slice(json.as_bytes());
+    if let Some(bytes) = data {
+        body.extend_from_slice(bytes);
+    }
+    sender.send(HostToAgentMessage::Post(body))
+}
+
 #[cfg(feature = "qbdi")]
 pub(crate) fn send_qbdi_helper(
     sender: &Sender<HostToAgentMessage>,
@@ -173,6 +193,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                             while let Ok(msg) = rx.recv() {
                                 let (kind, payload) = match msg {
                                     HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
+                                    HostToAgentMessage::Post(body) => (FRAME_KIND_POST, body),
                                     #[cfg(feature = "qbdi")]
                                     HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
                                 };
@@ -237,6 +258,37 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                             );
                         }
                     }
+                }
+                FRAME_KIND_SEND => {
+                    // `[json_len:u32][json][binary data]`
+                    if payload.len() < 4 {
+                        log_error!("send frame is truncated");
+                        continue;
+                    }
+                    let json_len = u32::from_le_bytes(payload[..4].try_into().unwrap_or_default()) as usize;
+                    let json_end = 4 + json_len;
+                    if json_end > payload.len() {
+                        log_error!("send frame declares {} bytes of JSON but carries fewer", json_len);
+                        continue;
+                    }
+                    let json = String::from_utf8_lossy(&payload[4..json_end]).into_owned();
+                    let extra = payload.len() - json_end;
+                    let suffix = if extra != 0 {
+                        format!(" (+{} bytes of data)", extra)
+                    } else {
+                        String::new()
+                    };
+                    crate::logger::stdout_line(
+                        &format!(
+                            "{}{} [send]{} {}{}",
+                            crate::logger::BOLD,
+                            crate::logger::CYAN,
+                            crate::logger::RESET,
+                            json,
+                            suffix
+                        ),
+                        &format!("[send] {}{}", json, suffix),
+                    );
                 }
                 FRAME_KIND_BYE => {
                     session.disconnected.store(true, Ordering::Release);
