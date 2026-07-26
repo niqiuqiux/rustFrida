@@ -3,6 +3,13 @@
   "baselineRevision": "c7daef081b7965ce7e578e16b134a21a168d7646",
   "documentedGlobals": [
     "console",
+    "Frida",
+    "Script",
+    "send",
+    "recv",
+    "setTimeout",
+    "setInterval",
+    "hexdump",
     "gc",
     "ptr",
     "Int64",
@@ -35,6 +42,17 @@
   ],
   "globals": [
     { "name": "console", "type": "object", "classification": "compatible" },
+    { "name": "Frida", "type": "object", "classification": "partial" },
+    { "name": "Script", "type": "object", "classification": "partial" },
+    { "name": "send", "type": "function", "classification": "compatible" },
+    { "name": "recv", "type": "function", "classification": "compatible" },
+    { "name": "setTimeout", "type": "function", "classification": "compatible" },
+    { "name": "setInterval", "type": "function", "classification": "compatible" },
+    { "name": "clearTimeout", "type": "function", "classification": "compatible" },
+    { "name": "clearInterval", "type": "function", "classification": "compatible" },
+    { "name": "setImmediate", "type": "function", "classification": "compatible" },
+    { "name": "clearImmediate", "type": "function", "classification": "compatible" },
+    { "name": "hexdump", "type": "function", "classification": "compatible" },
     { "name": "gc", "type": "function", "classification": "compatible" },
     { "name": "ptr", "type": "function", "classification": "compatible" },
     { "name": "NULL", "type": "object", "classification": "compatible" },
@@ -136,14 +154,18 @@
     { "path": "Java.choose", "type": "function" },
     { "path": "Java.enumerateClassLoadersSync", "type": "function" },
     { "path": "Jni.addr", "type": "function" },
-    { "path": "rpc.exports", "type": "object" }
+    { "path": "rpc.exports", "type": "object" },
+    { "path": "Script.nextTick", "type": "function" },
+    { "path": "Script.runtime", "type": "string" },
+    { "path": "Frida.version", "type": "string" },
+    { "path": "Memory.scan", "type": "function" }
   ],
   "compatibilityAreas": [
     {
       "area": "Core runtime",
       "status": "partial",
       "goal": "07",
-      "missing": ["Frida", "Script", "send", "recv", "timers", "Worker", "hexdump"]
+      "missing": ["Worker", "reload-safe timers"]
     },
     {
       "area": "Native ABI",
@@ -165,9 +187,9 @@
     },
     {
       "area": "Memory",
-      "status": "partial",
+      "status": "compatible",
       "goal": "06",
-      "missing": ["scan Promise wrapper"]
+      "missing": []
     },
     {
       "area": "Stalker",
