@@ -54,11 +54,8 @@
       {
         "area": "Interceptor",
         "goal": "10",
-        "missing": [
-          "Interceptor.replaceFast",
-          "Interceptor.defaults"
-        ],
-        "status": "partial"
+        "missing": [],
+        "status": "compatible"
       },
       {
         "area": "Memory",
@@ -75,13 +72,8 @@
       {
         "area": "Code writer",
         "goal": "10",
-        "missing": [
-          "standalone Arm64Writer",
-          "standalone Arm64Relocator",
-          "CModule.builtins",
-          "CModule.prototype.dispose"
-        ],
-        "status": "partial"
+        "missing": [],
+        "status": "compatible"
       },
       {
         "area": "Java facade",
@@ -135,6 +127,7 @@
       "ApiResolver",
       "Interceptor",
       "Stalker",
+      "Arm64Writer",
       "Arm64Relocator",
       "CModule",
       "NativeFunction",
@@ -299,6 +292,11 @@
         "classification": "compatible",
         "name": "Stalker",
         "type": "object"
+      },
+      {
+        "classification": "compatible",
+        "name": "Arm64Writer",
+        "type": "function"
       },
       {
         "classification": "compatible",
@@ -569,11 +567,27 @@
         "type": "function"
       },
       {
+        "path": "Interceptor.replaceFast",
+        "type": "function"
+      },
+      {
+        "path": "Interceptor.defaults",
+        "type": "object"
+      },
+      {
         "path": "Interceptor.revert",
         "type": "function"
       },
       {
         "path": "Interceptor.flush",
+        "type": "function"
+      },
+      {
+        "path": "CModule.builtins",
+        "type": "object"
+      },
+      {
+        "path": "CModule.prototype.dispose",
         "type": "function"
       },
       {

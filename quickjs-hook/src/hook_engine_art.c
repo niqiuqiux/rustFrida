@@ -1951,7 +1951,11 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     /* === not_found path: fall through to trampoline === */
     emit_art_router_not_found_path(&w, lbl_not_found, (uint64_t)trampoline_target);
 
-    arm64_writer_flush(&w);
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[art_router] thunk generation failed");
+        arm64_writer_clear(&w);
+        return 0;
+    }
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
@@ -2139,6 +2143,7 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
 
     if (arm64_writer_flush(&w) != 0) {
         hook_log("[managed_direct] label resolution failed");
+        arm64_writer_clear(&w);
         return 0;
     }
     size_t size = arm64_writer_offset(&w);
@@ -2251,6 +2256,7 @@ static size_t generate_count_orig_thunk(void* thunk_mem, size_t thunk_alloc,
 
     if (arm64_writer_flush(&w) != 0) {
         hook_log("[count_orig] label resolution failed");
+        arm64_writer_clear(&w);
         return 0;
     }
     size_t body_size = arm64_writer_offset(&w);
@@ -2379,6 +2385,7 @@ void* hook_create_managed_orig_stub(uint64_t original_method,
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)trampoline);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
     if (arm64_writer_flush(&w) != 0) {
+        arm64_writer_clear(&w);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
@@ -2598,7 +2605,12 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     /* === not_found path: jump to fallback === */
     emit_art_router_not_found_path(&w, lbl_not_found, fallback_target);
 
-    arm64_writer_flush(&w);
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[art_router] standalone stub generation failed");
+        arm64_writer_clear(&w);
+        hook_unlock(&g_engine.lock);
+        return NULL;
+    }
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 

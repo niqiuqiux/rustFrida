@@ -31,7 +31,16 @@
         writerInvoke: globalThis.__rf_stalker_writer_invoke,
         relocatorCreate: globalThis.__rf_stalker_relocator_create,
         relocatorDestroy: globalThis.__rf_stalker_relocator_destroy,
-        relocatorInvoke: globalThis.__rf_stalker_relocator_invoke
+        relocatorReset: globalThis.__rf_stalker_relocator_reset,
+        relocatorInvoke: globalThis.__rf_stalker_relocator_invoke,
+        writerCreate: globalThis.__rf_arm64_writer_create,
+        writerDestroy: globalThis.__rf_arm64_writer_destroy,
+        writerReset: globalThis.__rf_arm64_writer_reset,
+        standaloneWriterInvoke: globalThis.__rf_arm64_writer_invoke,
+        standaloneRelocatorCreate: globalThis.__rf_arm64_relocator_create,
+        standaloneRelocatorDestroy: globalThis.__rf_arm64_relocator_destroy,
+        standaloneRelocatorReset: globalThis.__rf_arm64_relocator_reset,
+        standaloneRelocatorInvoke: globalThis.__rf_arm64_relocator_invoke
     };
 
     const eventTypes = Object.freeze({
@@ -265,9 +274,11 @@
         return converted;
     }
 
-    function defineWriterMembers(target, state, methods, invoke) {
+    function defineWriterMembers(target, state, methods, invoke, skippedMethods) {
         for (const method of methods) {
             const { name, opcode, argSpec } = method;
+            if (skippedMethods !== undefined && skippedMethods.has(name))
+                continue;
             if (method.kind === "property") {
                 Object.defineProperty(target, name, {
                     enumerable: true,
@@ -290,9 +301,21 @@
         return native.writerInvoke(state.token, opcode, ...args);
     }
 
+    function parseWriterOptions(options, methodName) {
+        if (options === undefined)
+            return { hasPc: false, pc: undefined };
+        if (options === null || typeof options !== "object")
+            throw new TypeError(methodName + "(): options must be an object");
+        if (!("pc" in options))
+            return { hasPc: false, pc: undefined };
+        return { hasPc: true, pc: options.pc };
+    }
+
     // Lets `new Arm64Relocator(input, iterator)` find the transform token that
-    // owns the output writer without exposing the token to scripts.
+    // owns the output writer without exposing the token to scripts. Standalone
+    // writers use an opaque native object and therefore a separate WeakSet.
     const relocatorStates = new WeakMap();
+    const standaloneWriters = new WeakSet();
 
     function createTransformEntry(callback) {
         const state = { token: 0 };
@@ -379,19 +402,23 @@
         return { callback, state, iterator };
     }
 
-    function createRelocator(inputCode, output) {
-        if (output === null || output === undefined)
-            throw new TypeError("Arm64Relocator requires an output writer");
-        const state = relocatorStates.get(output);
-        if (state === undefined)
-            throw new TypeError("Arm64Relocator output must be the current Stalker transform iterator");
+    function createTransformRelocator(inputCode, output, state) {
         if (state.token === 0)
             throw new Error("invalid operation outside a Stalker transform callback");
-
         const handle = native.relocatorCreate(state.token, inputCode);
         const relocator = Object.create(null);
         const relocatorState = { token: state.token, handle, disposed: false };
-        defineWriterMembers(relocator, relocatorState, writerSpec.relocatorMethods, invokeRelocator);
+        defineWriterMembers(relocator, relocatorState, writerSpec.relocatorMethods, invokeRelocator, new Set(["reset"]));
+        Object.defineProperty(relocator, "reset", {
+            enumerable: true,
+            value(nextInput, nextOutput) {
+                if (nextOutput !== output)
+                    throw new TypeError("Arm64Relocator output must be the current Stalker transform iterator");
+                if (relocatorState.disposed)
+                    throw new Error("Arm64Relocator has already been disposed");
+                native.relocatorReset(relocatorState.token, relocatorState.handle, nextInput);
+            }
+        });
         Object.defineProperty(relocator, "dispose", {
             enumerable: true,
             value() {
@@ -404,10 +431,59 @@
         return relocator;
     }
 
+    function createStandaloneRelocator(inputCode, output) {
+        const relocator = native.standaloneRelocatorCreate(inputCode, output);
+        const state = { relocator, disposed: false };
+        defineWriterMembers(relocator, state, writerSpec.relocatorMethods, invokeStandaloneRelocator, new Set(["reset"]));
+        Object.defineProperty(relocator, "reset", {
+            enumerable: true,
+            value(nextInput, nextOutput) {
+                if (state.disposed)
+                    throw new Error("Arm64Relocator has already been disposed");
+                if (!standaloneWriters.has(nextOutput))
+                    throw new TypeError("Arm64Relocator output must be an Arm64Writer");
+                native.standaloneRelocatorReset(relocator, nextInput, nextOutput);
+            }
+        });
+        Object.defineProperty(relocator, "dispose", {
+            enumerable: true,
+            value() {
+                if (state.disposed)
+                    return;
+                state.disposed = true;
+                native.standaloneRelocatorDestroy(relocator);
+            }
+        });
+        return relocator;
+    }
+
+    function createRelocator(inputCode, output) {
+        if (output === null || output === undefined)
+            throw new TypeError("Arm64Relocator requires an output writer");
+        const state = relocatorStates.get(output);
+        if (state !== undefined)
+            return createTransformRelocator(inputCode, output, state);
+        if (standaloneWriters.has(output))
+            return createStandaloneRelocator(inputCode, output);
+        throw new TypeError("Arm64Relocator output must be an Arm64Writer or the current Stalker transform iterator");
+    }
+
     function invokeRelocator(state, opcode, args) {
         if (state.disposed)
             throw new Error("Arm64Relocator has already been disposed");
         return native.relocatorInvoke(state.token, state.handle, opcode, ...args);
+    }
+
+    function invokeStandaloneWriter(state, opcode, args) {
+        if (state.disposed)
+            throw new Error("Arm64Writer has already been disposed");
+        return native.standaloneWriterInvoke(state.writer, opcode, ...args);
+    }
+
+    function invokeStandaloneRelocator(state, opcode, args) {
+        if (state.disposed)
+            throw new Error("Arm64Relocator has already been disposed");
+        return native.standaloneRelocatorInvoke(state.relocator, opcode, ...args);
     }
 
     function pointerAt(view, offset, stringify) {
@@ -753,10 +829,48 @@
 
     globalThis.Stalker = Stalker;
 
+    function Arm64Writer(codeAddress, options) {
+        if (!new.target)
+            throw new TypeError("use `new Arm64Writer()` to create a new instance");
+        const parsedOptions = parseWriterOptions(options, "Arm64Writer");
+        const writer = parsedOptions.hasPc
+            ? native.writerCreate(codeAddress, parsedOptions.pc)
+            : native.writerCreate(codeAddress);
+        const state = { writer, disposed: false };
+        defineWriterMembers(writer, state, writerSpec.methods, invokeStandaloneWriter, new Set(["reset"]));
+        Object.defineProperty(writer, "reset", {
+            enumerable: true,
+            value(nextCodeAddress, nextOptions) {
+                if (state.disposed)
+                    throw new Error("Arm64Writer has already been disposed");
+                const parsed = parseWriterOptions(nextOptions, "Arm64Writer.reset");
+                if (parsed.hasPc)
+                    native.writerReset(writer, nextCodeAddress, parsed.pc);
+                else
+                    native.writerReset(writer, nextCodeAddress);
+            }
+        });
+        Object.defineProperty(writer, "dispose", {
+            enumerable: true,
+            value() {
+                if (state.disposed)
+                    return;
+                state.disposed = true;
+                native.writerDestroy(writer);
+            }
+        });
+        standaloneWriters.add(writer);
+        Object.setPrototypeOf(writer, new.target.prototype);
+        return writer;
+    }
+    globalThis.Arm64Writer = Arm64Writer;
+
     function Arm64Relocator(inputCode, output) {
         if (!new.target)
             throw new TypeError("use `new Arm64Relocator()` to create a new instance");
-        return createRelocator(inputCode, output);
+        const relocator = createRelocator(inputCode, output);
+        Object.setPrototypeOf(relocator, new.target.prototype);
+        return relocator;
     }
     globalThis.Arm64Relocator = Arm64Relocator;
 })();

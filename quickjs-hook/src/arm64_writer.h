@@ -150,6 +150,7 @@ typedef struct Arm64Label {
 typedef struct Arm64LabelRef {
     uint64_t label_id;          /* ID of referenced label */
     uint8_t* insn_addr;         /* Address of instruction to patch */
+    uint64_t insn_pc;           /* Logical PC of instruction to patch */
     Arm64LabelRefType type;     /* Type of reference */
     struct Arm64LabelRef* next; /* Next reference in list */
 } Arm64LabelRef;
@@ -165,6 +166,7 @@ typedef struct {
     Arm64LabelRef* label_refs;  /* Pending label references */
 
     uint64_t next_label_id;     /* Next auto-generated label ID */
+    int failed;                 /* An instruction could not be encoded */
 } Arm64Writer;
 
 /* ============================================================================
@@ -258,6 +260,9 @@ uint64_t arm64_writer_new_label_id(Arm64Writer* w);
  */
 int arm64_writer_can_branch_directly_between(uint64_t from, uint64_t to);
 
+/* Check whether ADRP can reach to from at page granularity (±4GB). */
+int arm64_writer_can_adrp_between(uint64_t from, uint64_t to);
+
 /* ============================================================================
  * Raw Writing
  * ============================================================================ */
@@ -339,11 +344,11 @@ void arm64_writer_put_ldr_reg_u64(Arm64Writer* w, Arm64Reg reg, uint64_t val);
 /* LDR Xt, =addr - Load address (same as ldr_reg_u64 but semantic) */
 void arm64_writer_put_ldr_reg_address(Arm64Writer* w, Arm64Reg reg, uint64_t addr);
 
-/* LDR Xt, [Xn, #offset] - Load with signed offset */
-void arm64_writer_put_ldr_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset);
+/* LDR Xt, [Xn, #offset] - Load with scaled unsigned or signed offset */
+int arm64_writer_put_ldr_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset);
 
 /* LDRSW Xt, [Xn, #offset] - Load signed word */
-void arm64_writer_put_ldrsw_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset);
+int arm64_writer_put_ldrsw_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset);
 
 /* LDP Xt1, Xt2, [Xn, #offset] - Load pair */
 void arm64_writer_put_ldp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Reg b,
@@ -357,8 +362,8 @@ void arm64_writer_put_ldr_fp_reg_reg(Arm64Writer* w, uint32_t fp_reg, Arm64Reg b
  * Store Instructions
  * ============================================================================ */
 
-/* STR Xt, [Xn, #offset] - Store with signed offset */
-void arm64_writer_put_str_reg_reg_offset(Arm64Writer* w, Arm64Reg src, Arm64Reg dst, int64_t offset);
+/* STR Xt, [Xn, #offset] - Store with scaled unsigned or signed offset */
+int arm64_writer_put_str_reg_reg_offset(Arm64Writer* w, Arm64Reg src, Arm64Reg dst, int64_t offset);
 
 /* STP Xt1, Xt2, [Xn, #offset] - Store pair */
 void arm64_writer_put_stp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Reg b,

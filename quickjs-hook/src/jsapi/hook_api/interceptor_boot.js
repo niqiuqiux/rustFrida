@@ -22,6 +22,62 @@
 (function() {
     "use strict";
 
+    // The native engine deliberately owns every target itself; defaults only
+    // select its rustFrida stealth mode when a call does not supply one.
+    const nativeAttach = Interceptor.attach;
+    const nativeReplace = Interceptor.replace;
+    const nativeReplaceFast = Interceptor.replaceFast;
+    let defaults = {};
+
+    function defaultMode(explicitMode) {
+        if (explicitMode !== undefined)
+            return explicitMode;
+        if (defaults.mode !== undefined)
+            return defaults.mode;
+        return defaults.stealth;
+    }
+
+    Object.defineProperties(Interceptor, {
+        defaults: {
+            enumerable: true,
+            get() { return defaults; },
+            set(value) {
+                if (value === null || typeof value !== "object")
+                    throw new TypeError("Interceptor.defaults must be an object");
+                if (value.mode !== undefined && value.stealth !== undefined)
+                    throw new TypeError("Interceptor.defaults must specify either mode or stealth");
+                defaults = value;
+            }
+        },
+        attach: {
+            enumerable: true,
+            value(target, callbacks, mode) {
+                const resolvedMode = defaultMode(mode);
+                return resolvedMode === undefined
+                    ? nativeAttach(target, callbacks)
+                    : nativeAttach(target, callbacks, resolvedMode);
+            }
+        },
+        replace: {
+            enumerable: true,
+            value(target, replacement, mode) {
+                const resolvedMode = defaultMode(mode);
+                return resolvedMode === undefined
+                    ? nativeReplace(target, replacement)
+                    : nativeReplace(target, replacement, resolvedMode);
+            }
+        },
+        replaceFast: {
+            enumerable: true,
+            value(target, replacement, mode) {
+                const resolvedMode = defaultMode(mode);
+                return resolvedMode === undefined
+                    ? nativeReplaceFast(target, replacement)
+                    : nativeReplaceFast(target, replacement, resolvedMode);
+            }
+        }
+    });
+
     function _toBigInt(v) {
         if (v === null || v === undefined) return 0n;
         if (typeof v === 'bigint') return v;

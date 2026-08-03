@@ -9,6 +9,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+static void arm64_writer_fail(Arm64Writer* w) {
+    w->failed = 1;
+}
+
 /* ============================================================================
  * Initialization / Cleanup
  * ============================================================================ */
@@ -21,6 +25,7 @@ void arm64_writer_init(Arm64Writer* w, void* code, uint64_t pc, size_t size) {
     w->labels = NULL;
     w->label_refs = NULL;
     w->next_label_id = 1;
+    w->failed = 0;
 }
 
 void arm64_writer_reset(Arm64Writer* w, void* code, uint64_t pc) {
@@ -28,6 +33,7 @@ void arm64_writer_reset(Arm64Writer* w, void* code, uint64_t pc) {
     w->base = (uint8_t*)code;
     w->code = (uint8_t*)code;
     w->pc = pc;
+    w->failed = 0;
 }
 
 void arm64_writer_clear(Arm64Writer* w) {
@@ -56,7 +62,10 @@ void arm64_writer_clear(Arm64Writer* w) {
 
 void arm64_writer_put_label(Arm64Writer* w, uint64_t id) {
     Arm64Label* label = (Arm64Label*)malloc(sizeof(Arm64Label));
-    if (!label) return;
+    if (!label) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     label->id = id;
     label->address = w->pc;
@@ -79,10 +88,14 @@ static Arm64Label* find_label(Arm64Writer* w, uint64_t id) {
 
 static void add_label_ref(Arm64Writer* w, uint64_t label_id, uint8_t* insn_addr, Arm64LabelRefType type) {
     Arm64LabelRef* ref = (Arm64LabelRef*)malloc(sizeof(Arm64LabelRef));
-    if (!ref) return;
+    if (!ref) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     ref->label_id = label_id;
     ref->insn_addr = insn_addr;
+    ref->insn_pc = w->pc;
     ref->type = type;
     ref->next = w->label_refs;
     w->label_refs = ref;
@@ -94,7 +107,16 @@ int arm64_writer_can_branch_directly_between(uint64_t from, uint64_t to) {
     return fits_signed(distance >> 2, 26);
 }
 
+int arm64_writer_can_adrp_between(uint64_t from, uint64_t to) {
+    int64_t from_page = (int64_t)from & ~0xFFFLL;
+    int64_t to_page = (int64_t)to & ~0xFFFLL;
+    int64_t offset_pages = (to_page - from_page) >> 12;
+    return fits_signed(offset_pages, 21);
+}
+
 int arm64_writer_flush(Arm64Writer* w) {
+    if (w->failed) return -1;
+
     Arm64LabelRef* ref = w->label_refs;
 
     while (ref) {
@@ -103,7 +125,7 @@ int arm64_writer_flush(Arm64Writer* w) {
 
         uint32_t* insn_ptr = (uint32_t*)ref->insn_addr;
         uint32_t insn = *insn_ptr;
-        int64_t offset = (int64_t)label->address - (int64_t)(uintptr_t)ref->insn_addr;
+        int64_t offset = (int64_t)label->address - (int64_t)ref->insn_pc;
 
         switch (ref->type) {
             case ARM64_LABEL_REF_B:
@@ -152,7 +174,10 @@ int arm64_writer_flush(Arm64Writer* w) {
  * ============================================================================ */
 
 void arm64_writer_put_insn(Arm64Writer* w, uint32_t insn) {
-    if (!arm64_writer_can_write(w, 4)) abort();
+    if (!arm64_writer_can_write(w, 4)) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     *(uint32_t*)w->code = insn;
     w->code += 4;
@@ -160,7 +185,10 @@ void arm64_writer_put_insn(Arm64Writer* w, uint32_t insn) {
 }
 
 void arm64_writer_put_bytes(Arm64Writer* w, const uint8_t* data, size_t len) {
-    if (!arm64_writer_can_write(w, len)) abort();
+    if (!arm64_writer_can_write(w, len)) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     memcpy(w->code, data, len);
     w->code += len;
@@ -331,7 +359,7 @@ void arm64_writer_put_ldr_reg_address(Arm64Writer* w, Arm64Reg reg, uint64_t add
     arm64_writer_put_ldr_reg_u64(w, reg, addr);
 }
 
-void arm64_writer_put_ldr_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset) {
+int arm64_writer_put_ldr_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset) {
     uint32_t rt = ARM64_REG_NUM(dst);
     uint32_t rn = ARM64_REG_NUM(src);
     uint32_t sf = ARM64_REG_SF(dst);
@@ -345,17 +373,20 @@ void arm64_writer_put_ldr_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg 
         uint32_t size = sf ? 0x3 : 0x2;
         uint32_t insn = (size << 30) | 0x39400000 | ((uint32_t)scaled_offset << 10) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     } else if (fits_signed(offset, 9)) {
         /* LDR (signed offset / unscaled): size 111 0 00 00 imm9 00 Rn Rt */
         uint32_t size = sf ? 0x3 : 0x2;
         uint32_t imm9 = (uint32_t)offset & 0x1FF;
         uint32_t insn = (size << 30) | 0x38400000 | (imm9 << 12) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     }
-    /* TODO: Handle larger offsets with scratch register */
+    arm64_writer_fail(w);
+    return 0;
 }
 
-void arm64_writer_put_ldrsw_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset) {
+int arm64_writer_put_ldrsw_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, int64_t offset) {
     uint32_t rt = ARM64_REG_NUM(dst);
     uint32_t rn = ARM64_REG_NUM(src);
 
@@ -366,12 +397,16 @@ void arm64_writer_put_ldrsw_reg_reg_offset(Arm64Writer* w, Arm64Reg dst, Arm64Re
         /* LDRSW (unsigned offset): 10 111 0 01 10 imm12 Rn Rt */
         uint32_t insn = 0xB9800000 | ((uint32_t)scaled_offset << 10) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     } else if (fits_signed(offset, 9)) {
         /* LDRSW (signed offset / unscaled): 10 111 0 00 10 imm9 00 Rn Rt */
         uint32_t imm9 = (uint32_t)offset & 0x1FF;
         uint32_t insn = 0xB8800000 | (imm9 << 12) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     }
+    arm64_writer_fail(w);
+    return 0;
 }
 
 void arm64_writer_put_ldp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Reg b,
@@ -384,9 +419,16 @@ void arm64_writer_put_ldp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Re
 
     /* Scale offset: 8 bytes for 64-bit, 4 for 32-bit */
     uint32_t scale = sf ? 3 : 2;
+    if ((offset & ((1 << scale) - 1)) != 0) {
+        arm64_writer_fail(w);
+        return;
+    }
     int64_t scaled = offset >> scale;
 
-    if (!fits_signed(scaled, 7)) return;
+    if (!fits_signed(scaled, 7)) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     uint32_t imm7 = (uint32_t)scaled & 0x7F;
     uint32_t opc = sf ? 0x2 : 0x0;
@@ -396,7 +438,9 @@ void arm64_writer_put_ldp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Re
         case ARM64_INDEX_POST_ADJUST: op2 = 0x1; break;  /* opc 10 1 0001 */
         case ARM64_INDEX_SIGNED_OFFSET: op2 = 0x2; break; /* opc 10 1 0010 */
         case ARM64_INDEX_PRE_ADJUST: op2 = 0x3; break;    /* opc 10 1 0011 */
-        default: return;
+        default:
+            arm64_writer_fail(w);
+            return;
     }
 
     /* LDP: opc 10 1 op2 0 L imm7 Rt2 Rn Rt1 (L=1 for load) */
@@ -425,7 +469,8 @@ void arm64_writer_put_ldr_fp_reg_reg(Arm64Writer* w, uint32_t fp_reg, Arm64Reg b
             insn = 0x3DC00000 | (rn << 5) | rt;
             break;
         default:
-            return; /* Invalid size */
+            arm64_writer_fail(w);
+            return;
     }
     arm64_writer_put_insn(w, insn);
 }
@@ -434,7 +479,7 @@ void arm64_writer_put_ldr_fp_reg_reg(Arm64Writer* w, uint32_t fp_reg, Arm64Reg b
  * Store Instructions
  * ============================================================================ */
 
-void arm64_writer_put_str_reg_reg_offset(Arm64Writer* w, Arm64Reg src, Arm64Reg dst, int64_t offset) {
+int arm64_writer_put_str_reg_reg_offset(Arm64Writer* w, Arm64Reg src, Arm64Reg dst, int64_t offset) {
     uint32_t rt = ARM64_REG_NUM(src);
     uint32_t rn = ARM64_REG_NUM(dst);
     uint32_t sf = ARM64_REG_SF(src);
@@ -447,13 +492,17 @@ void arm64_writer_put_str_reg_reg_offset(Arm64Writer* w, Arm64Reg src, Arm64Reg 
         uint32_t size = sf ? 0x3 : 0x2;
         uint32_t insn = (size << 30) | 0x39000000 | ((uint32_t)scaled_offset << 10) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     } else if (fits_signed(offset, 9)) {
         /* STR (signed offset / unscaled): size 111 0 00 00 imm9 00 Rn Rt */
         uint32_t size = sf ? 0x3 : 0x2;
         uint32_t imm9 = (uint32_t)offset & 0x1FF;
         uint32_t insn = (size << 30) | 0x38000000 | (imm9 << 12) | (rn << 5) | rt;
         arm64_writer_put_insn(w, insn);
+        return 1;
     }
+    arm64_writer_fail(w);
+    return 0;
 }
 
 void arm64_writer_put_stp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Reg b,
@@ -465,9 +514,16 @@ void arm64_writer_put_stp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Re
     uint32_t sf = ARM64_REG_SF(a);
 
     uint32_t scale = sf ? 3 : 2;
+    if ((offset & ((1 << scale) - 1)) != 0) {
+        arm64_writer_fail(w);
+        return;
+    }
     int64_t scaled = offset >> scale;
 
-    if (!fits_signed(scaled, 7)) return;
+    if (!fits_signed(scaled, 7)) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     uint32_t imm7 = (uint32_t)scaled & 0x7F;
     uint32_t opc = sf ? 0x2 : 0x0;
@@ -477,7 +533,9 @@ void arm64_writer_put_stp_reg_reg_reg_offset(Arm64Writer* w, Arm64Reg a, Arm64Re
         case ARM64_INDEX_POST_ADJUST: op2 = 0x1; break;
         case ARM64_INDEX_SIGNED_OFFSET: op2 = 0x2; break;
         case ARM64_INDEX_PRE_ADJUST: op2 = 0x3; break;
-        default: return;
+        default:
+            arm64_writer_fail(w);
+            return;
     }
 
     /* STP: opc 10 1 op2 0 L imm7 Rt2 Rn Rt1 (L=0 for store) */
@@ -512,8 +570,9 @@ static void arm64_writer_put_addsub_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Ar
         uint32_t insn2 = (sf << 31) | op_base  | (lo12 << 10) | (rd << 5) | rd;
         arm64_writer_put_insn(w, insn1);
         arm64_writer_put_insn(w, insn2);
+    } else {
+        arm64_writer_fail(w);
     }
-    /* Immediates > 24 bits are not handled; callers must use register form. */
 }
 
 void arm64_writer_put_add_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src, uint64_t imm) {
@@ -690,7 +749,10 @@ void arm64_writer_put_adrp_reg_address(Arm64Writer* w, Arm64Reg reg, uint64_t ad
     int64_t target_page = (int64_t)addr & ~0xFFFLL;
     int64_t offset_pages = (target_page - pc_page) >> 12;
 
-    if (!fits_signed(offset_pages, 21)) return;
+    if (!arm64_writer_can_adrp_between(w->pc, addr)) {
+        arm64_writer_fail(w);
+        return;
+    }
 
     uint32_t u = (uint32_t)offset_pages;
     uint32_t immlo = u & 0x3;
@@ -804,10 +866,13 @@ void arm64_writer_put_branch_address(Arm64Writer* w, uint64_t target) {
 /* ADRP+ADD+BR: 12 字节 PC-relative 跳转（纯 ALU，wxshadow 安全）。
  * 要求 target 在 PC ±4GB 范围内。 */
 void arm64_writer_put_adrp_add_br(Arm64Writer* w, Arm64Reg scratch, uint64_t target) {
-    uint64_t pc = w->pc + arm64_writer_offset(w);
-    uint64_t pc_page = pc & ~0xFFFULL;
-    uint64_t target_page = target & ~0xFFFULL;
-    int64_t page_delta = (int64_t)(target_page - pc_page);
+    int64_t pc_page = (int64_t)w->pc & ~0xFFFLL;
+    int64_t target_page = (int64_t)target & ~0xFFFLL;
+    int64_t page_delta = target_page - pc_page;
+    if (!arm64_writer_can_adrp_between(w->pc, target)) {
+        arm64_writer_fail(w);
+        return;
+    }
     int32_t immhi = (int32_t)(page_delta >> 14) & 0x7FFFF; /* bits [32:14] */
     int32_t immlo = (int32_t)(page_delta >> 12) & 0x3;     /* bits [13:12] */
     uint32_t rd = scratch - ARM64_REG_X0;
@@ -839,8 +904,19 @@ void arm64_writer_put_call_address(Arm64Writer* w, uint64_t target) {
  * Encoding: opc=01 V=1 L=0 imm7 Rt2 Rn Rt1
  * opc=01 → 64-bit (D registers), V=1 → SIMD/FP
  * imm7 is offset / 8 (scale factor for 64-bit) */
+static int arm64_writer_can_put_fp_pair(uint32_t dt1, uint32_t dt2,
+                                        Arm64Reg base, int32_t offset) {
+    if (dt1 > 31 || dt2 > 31 || !ARM64_REG_IS_X(base) || (offset & 7) != 0)
+        return 0;
+    return fits_signed(offset >> 3, 7);
+}
+
 void arm64_writer_put_fp_stp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
                                      Arm64Reg base, int32_t offset) {
+    if (!arm64_writer_can_put_fp_pair(dt1, dt2, base, offset)) {
+        arm64_writer_fail(w);
+        return;
+    }
     int32_t imm7 = offset / 8;
     uint32_t insn = (0x6D << 24)   /* opc=01 1 01 (STP, signed offset, V=1) */
                   | ((imm7 & 0x7F) << 15)
@@ -853,6 +929,10 @@ void arm64_writer_put_fp_stp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
 /* STP Dt1, Dt2, [Xn, #offset]! — pre-index mode */
 void arm64_writer_put_fp_stp_pre(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
                                   Arm64Reg base, int32_t offset) {
+    if (!arm64_writer_can_put_fp_pair(dt1, dt2, base, offset)) {
+        arm64_writer_fail(w);
+        return;
+    }
     int32_t imm7 = offset / 8;
     uint32_t insn = 0x6D800000
                   | ((imm7 & 0x7F) << 15)
@@ -865,6 +945,10 @@ void arm64_writer_put_fp_stp_pre(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
 /* LDP Dt1, Dt2, [Xn, #offset] — signed offset mode */
 void arm64_writer_put_fp_ldp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
                                      Arm64Reg base, int32_t offset) {
+    if (!arm64_writer_can_put_fp_pair(dt1, dt2, base, offset)) {
+        arm64_writer_fail(w);
+        return;
+    }
     int32_t imm7 = offset / 8;
     uint32_t insn = (0x6D << 24)   /* opc=01 1 01 (signed offset, V=1) */
                   | (1u << 22)     /* L=1 → load */
@@ -878,6 +962,10 @@ void arm64_writer_put_fp_ldp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
 /* LDP Dt1, Dt2, [Xn], #offset — post-index mode */
 void arm64_writer_put_fp_ldp_post(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
                                    Arm64Reg base, int32_t offset) {
+    if (!arm64_writer_can_put_fp_pair(dt1, dt2, base, offset)) {
+        arm64_writer_fail(w);
+        return;
+    }
     int32_t imm7 = offset / 8;
     uint32_t insn = 0x6CC00000     /* post-index LDP FP: 0110 1100 1 1 */
                   | ((imm7 & 0x7F) << 15)

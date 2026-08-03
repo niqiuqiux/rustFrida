@@ -20,6 +20,16 @@ function assertNear(name, actual, expected) {
     pass(name, actual);
 }
 
+function assertThrows(name, fn) {
+    try {
+        fn();
+    } catch (error) {
+        pass(name, "threw: " + error.message);
+        return;
+    }
+    throw new Error(name + ": expected an exception");
+}
+
 function requireExport(name) {
     var address = Module.findExportByName("librf_goal04_native_abi.so", name);
     if (address === null)
@@ -52,6 +62,23 @@ var boolNot = new NativeFunction(requireExport("rf_goal04_bool_not"), "bool", ["
 
 assertTrue("NativeFunction is NativePointer", callBinary instanceof NativePointer);
 assertTrue("NativeFunction instance shape", callBinary instanceof NativeFunction);
+
+var cmodule = new CModule(`
+int rf_goal04_cmodule_add(int left, int right) {
+    return left + right;
+}
+`);
+var cmoduleAdd = new NativeFunction(cmodule.rf_goal04_cmodule_add, "int", ["int", "int"]);
+assertEqual("CModule emits executable RX code", cmoduleAdd(5, 7), 12);
+assertEqual("CModule code protection is RX", Memory.queryProtection(cmodule.base), "r-x");
+assertTrue("CModule finds symbol", cmodule.findSymbolByName("rf_goal04_cmodule_add") !== null);
+assertThrows("CModule rejects NUL symbol names", function() {
+    cmodule.findSymbolByName("rf_goal04_cmodule_add\u0000suffix");
+});
+cmodule.dispose();
+assertThrows("CModule rejects lookups after dispose", function() {
+    cmodule.findSymbolByName("rf_goal04_cmodule_add");
+});
 
 var replacementAddress = requireExport("rf_goal04_replace_target");
 var probeTarget = requireExport("rf_goal04_probe_target");
@@ -196,6 +223,17 @@ Interceptor.replace(replaceTarget, replacement);
 assertEqual("Interceptor NativeCallback replacement", callReplaceTarget(7), 107);
 Interceptor.revert(replaceTarget);
 assertEqual("Interceptor replacement revert", callReplaceTarget(7), 8);
+
+assertEqual("Interceptor defaults initial shape", typeof Interceptor.defaults, "object");
+Interceptor.defaults = { mode: Hook.NORMAL };
+assertEqual("Interceptor defaults round trip", Interceptor.defaults.mode, Hook.NORMAL);
+var originalFast = Interceptor.replaceFast(replaceTarget, replacement);
+var callOriginalFast = new NativeFunction(originalFast, "int", ["int"]);
+assertEqual("Interceptor replaceFast replacement", callReplaceTarget(7), 107);
+assertEqual("Interceptor replaceFast original", callOriginalFast(7), 8);
+Interceptor.revert(replaceTarget);
+Interceptor.defaults = {};
+assertEqual("Interceptor replaceFast revert", callReplaceTarget(7), 8);
 
 var saved = new NativeCallback(function(value) {
     return value + 9;

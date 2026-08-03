@@ -50,8 +50,58 @@ var computeEnd = computeStart.add(computeSize());
 
 // ---------------------------------------------------------------- surface ---
 
+assertEqual("Arm64Writer is a constructor", typeof Arm64Writer, "function");
 assertEqual("Arm64Relocator is a constructor", typeof Arm64Relocator, "function");
 assertEqual("Stalker.statistics is a function", typeof Stalker.statistics, "function");
+
+var pageSize = Process.pageSize;
+var generatedCode = Memory.alloc(pageSize, { protection: "rwx" });
+var standaloneWriter = new Arm64Writer(generatedCode, { pc: generatedCode });
+assertTrue("standalone writer exposes code", standaloneWriter.code instanceof NativePointer);
+standaloneWriter.putLdrRegU64("x0", 42);
+standaloneWriter.putRet();
+assertEqual("standalone writer flushes", standaloneWriter.flush(), true);
+var generatedFunction = new NativeFunction(generatedCode, "uint64", []);
+assertEqual("standalone writer emits executable code", generatedFunction(), 42);
+
+var labelCode = Memory.alloc(pageSize, { protection: "rwx" });
+var logicalPcWriter = new Arm64Writer(labelCode, { pc: labelCode.add(0x4000) });
+logicalPcWriter.putBLabel("rf-goal05-logical-pc-done");
+logicalPcWriter.putLdrRegU64("x0", 0);
+logicalPcWriter.putRet();
+logicalPcWriter.putLabel("rf-goal05-logical-pc-done");
+logicalPcWriter.putLdrRegU64("x0", 42);
+logicalPcWriter.putRet();
+assertEqual("standalone writer flushes labels with independent pc", logicalPcWriter.flush(), true);
+var logicalPcFunction = new NativeFunction(labelCode, "uint64", []);
+assertEqual("standalone writer labels use logical pc", logicalPcFunction(), 42);
+logicalPcWriter.dispose();
+
+var unresolvedCode = Memory.alloc(pageSize, { protection: "rwx" });
+var resetCode = Memory.alloc(pageSize, { protection: "rwx" });
+var unresolvedWriter = new Arm64Writer(unresolvedCode);
+unresolvedWriter.putBLabel("rf-goal05-unresolved");
+assertThrows("standalone writer reset rejects unresolved labels", function () {
+    unresolvedWriter.reset(resetCode);
+});
+unresolvedWriter.dispose();
+
+var relocatedCode = Memory.alloc(pageSize, { protection: "rwx" });
+var relocatedWriter = new Arm64Writer(relocatedCode);
+var standaloneRelocator = new Arm64Relocator(generatedCode, relocatedWriter);
+while (!standaloneRelocator.eoi)
+    standaloneRelocator.readOne();
+standaloneRelocator.writeAll();
+standaloneRelocator.dispose();
+relocatedWriter.flush();
+var relocatedFunction = new NativeFunction(relocatedCode, "uint64", []);
+assertEqual("standalone relocator emits executable code", relocatedFunction(), 42);
+standaloneWriter.dispose();
+standaloneWriter.dispose();
+assertThrows("standalone writer rejects use after dispose", function () {
+    standaloneWriter.putNop();
+});
+relocatedWriter.dispose();
 
 var baseline = Stalker.statistics();
 assertEqual("statistics reports no active traces", baseline.activeTraces, 0);

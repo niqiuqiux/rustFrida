@@ -205,13 +205,77 @@ impl Operands<'_> {
     }
 }
 
+/// Create an independently owned `GumArm64Writer` for the JavaScript
+/// `Arm64Writer` facade.
+///
+/// The Stalker transform writer is owned by `GumStalkerOutput`, whereas this
+/// one is explicitly owned by a QuickJS object. Upstream disables implicit
+/// flush-on-destroy for the latter, so unresolved labels never cause an
+/// unexpected write during GC or reload.
+///
+/// # Safety
+///
+/// `code_address` must point at writable memory large enough for the emitted
+/// code. The caller owns that memory; this function owns only the Gum writer.
+pub unsafe extern "C" fn standalone_writer_create(code_address: u64, pc: u64, pc_specified: u32) -> usize {
+    if code_address == 0 {
+        return 0;
+    }
+    let writer = gum_sys::gum_arm64_writer_new(code_address as *mut c_void);
+    if writer.is_null() {
+        return 0;
+    }
+    (*writer).flush_on_destroy = 0;
+    if pc_specified != 0 {
+        (*writer).pc = pc;
+    }
+    writer as usize
+}
+
+/// Release the owner reference created by [`standalone_writer_create`].
+/// `GumArm64Relocator` retains its own reference, so a relocator can safely
+/// finish after its source writer has been disposed from JavaScript.
+///
+/// # Safety
+///
+/// `writer` must be either zero or a pointer returned by
+/// [`standalone_writer_create`] that has not already been released.
+pub unsafe extern "C" fn standalone_writer_destroy(writer: usize) {
+    if writer != 0 {
+        gum_sys::gum_arm64_writer_unref(writer as *mut gum_sys::GumArm64Writer);
+    }
+}
+
+/// Apply the standalone `Arm64Writer.reset()` semantics. Gum's reset does not
+/// flush pending labels, while GumJS explicitly flushes before replacing the
+/// output buffer, so preserve that ordering here.
+///
+/// # Safety
+///
+/// `writer` must be a live standalone writer and `code_address` must name a
+/// writable output buffer.
+pub unsafe extern "C" fn standalone_writer_reset(writer: usize, code_address: u64, pc: u64, pc_specified: u32) -> i32 {
+    if writer == 0 || code_address == 0 {
+        return -1;
+    }
+    let writer = writer as *mut gum_sys::GumArm64Writer;
+    if gum_sys::gum_arm64_writer_flush(writer) == 0 {
+        return -1;
+    }
+    gum_sys::gum_arm64_writer_reset(writer, code_address as *mut c_void);
+    if pc_specified != 0 {
+        (*writer).pc = pc;
+    }
+    1
+}
+
 /// Dispatch one ARM64 writer opcode against `writer`.
 ///
 /// # Safety
 ///
-/// `writer` must be the `GumArm64Writer` of a Stalker output that is still
-/// inside its transform callback, and `args` must point to `argc` readable
-/// `u64` values.
+/// `writer` must be a live `GumArm64Writer` owned either by a Stalker output
+/// during its transform callback or by a standalone `Arm64Writer` object.
+/// `args` must point to `argc` readable `u64` values.
 pub unsafe extern "C" fn writer_invoke(writer: usize, opcode: u32, args: *const u64, argc: u32, out: *mut u64) -> i32 {
     let Some(method) = spec::lookup_writer_method(opcode) else {
         return -1;

@@ -11,4 +11,9 @@ int rf_cmodule_add(int left, int right) {
 `);
 var add = new NativeFunction(module.rf_cmodule_add, "int", ["int", "int"]);
 assertEqual("native call", add(5, 7), 12);
+assertEqual("builtins exposed", typeof CModule.builtins.headers["rfhook.h"], "string");
+assertEqual("dispose prototype", typeof CModule.prototype.dispose, "function");
+module.dropMetadata();
+module.dispose();
+module.dispose();
 console.log("[cmodule-lifecycle][READY] CModule lifecycle verified");

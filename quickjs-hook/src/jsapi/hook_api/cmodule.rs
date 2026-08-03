@@ -110,13 +110,20 @@ unsafe extern "C" fn cmodule_finalizer(_rt: *mut ffi::JSRuntime, val: ffi::JSVal
     if opaque.is_null() {
         return;
     }
-    let data = Box::from_raw(opaque as *mut CModuleData);
+    let mut data = Box::from_raw(opaque as *mut CModuleData);
+    dispose_cmodule_data(&mut data);
+}
+
+unsafe fn dispose_cmodule_data(data: &mut CModuleData) {
     if !data.state.is_null() {
         tcc_delete(data.state);
+        data.state = ptr::null_mut();
     }
     if !data.code.is_null() && data.map_size != 0 {
         unregister_cmodule_code_range(data.code, data.map_size);
         let _ = raw_munmap(data.code, data.map_size);
+        data.code = ptr::null_mut();
+        data.map_size = 0;
     }
 }
 
@@ -145,6 +152,10 @@ unsafe fn raw_mmap(len: usize, prot: i32, flags: i32) -> *mut c_void {
 
 unsafe fn raw_munmap(addr: *mut c_void, len: usize) -> i32 {
     libc::syscall(libc::SYS_munmap as libc::c_long, addr, len) as i32
+}
+
+unsafe fn raw_mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32 {
+    libc::syscall(libc::SYS_mprotect as libc::c_long, addr, len, prot) as i32
 }
 
 fn get_or_init_class_id(ctx: *mut ffi::JSContext) -> u32 {
@@ -451,11 +462,22 @@ unsafe extern "C" fn cmodule_find_symbol(
     if data.is_null() {
         return ffi::JS_ThrowTypeError(ctx, b"Not a CModule\0".as_ptr() as *const _);
     }
+    if (*data).code.is_null() {
+        return throw_internal_error(ctx, "CModule has already been disposed");
+    }
+    if (*data).state.is_null() {
+        return throw_internal_error(ctx, "CModule metadata has already been dropped");
+    }
     let name = match JSValue(*argv).to_string(ctx) {
         Some(v) => v,
         None => return ffi::JS_ThrowTypeError(ctx, b"symbol name must be a string\0".as_ptr() as *const _),
     };
-    let cname = CString::new(name).unwrap();
+    let cname = match CString::new(name) {
+        Ok(value) => value,
+        Err(_) => {
+            return ffi::JS_ThrowTypeError(ctx, b"symbol name must not contain a NUL byte\0".as_ptr() as *const _)
+        }
+    };
     let addr = tcc_get_symbol((*data).state, cname.as_ptr());
     if addr.is_null() {
         JSValue::null().raw()
@@ -480,6 +502,69 @@ unsafe extern "C" fn cmodule_drop_metadata(
         (*data).state = ptr::null_mut();
     }
     JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn cmodule_dispose(
+    ctx: *mut ffi::JSContext,
+    this_val: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let class_id = CMODULE_CLASS_ID.load(Ordering::Relaxed);
+    let data = ffi::JS_GetOpaque(this_val, class_id) as *mut CModuleData;
+    if data.is_null() {
+        return ffi::JS_ThrowTypeError(ctx, b"Not a CModule\0".as_ptr() as *const _);
+    }
+    dispose_cmodule_data(&mut *data);
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn cmodule_get_builtins(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let result = ffi::JS_NewObject(ctx);
+    if ffi::qjs_is_exception(result) != 0 {
+        return result;
+    }
+    let headers = ffi::JS_NewObject(ctx);
+    if ffi::qjs_is_exception(headers) != 0 {
+        ffi::qjs_free_value(ctx, result);
+        return headers;
+    }
+    for (name, contents) in [
+        ("stdint.h", STDINT_H),
+        ("stddef.h", STDDEF_H),
+        ("stdbool.h", STDBOOL_H),
+        ("string.h", STRING_H),
+        ("rfhook.h", RFHOOK_H),
+    ] {
+        JSValue(headers).set_property(
+            ctx,
+            name,
+            JSValue::string(ctx, std::str::from_utf8(contents).unwrap_or_default()),
+        );
+    }
+
+    let defines = ffi::JS_NewObject(ctx);
+    if ffi::qjs_is_exception(defines) != 0 {
+        ffi::qjs_free_value(ctx, headers);
+        ffi::qjs_free_value(ctx, result);
+        return defines;
+    }
+    for (name, value) in [
+        ("__ANDROID__", "1"),
+        ("__LP64__", "1"),
+        ("__aarch64__", "1"),
+        ("TCC_TARGET_ARM64", "1"),
+    ] {
+        JSValue(defines).set_property(ctx, name, JSValue::string(ctx, value));
+    }
+    JSValue(result).set_property(ctx, "defines", JSValue(defines));
+    JSValue(result).set_property(ctx, "headers", JSValue(headers));
+    result
 }
 
 unsafe extern "C" fn js_cmodule(
@@ -564,12 +649,12 @@ unsafe extern "C" fn js_cmodule(
     };
     let code = raw_mmap(
         map_size,
-        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
     );
     if code == libc::MAP_FAILED {
         tcc_delete(state);
-        return throw_internal_error(ctx, "CModule mmap(RWX) failed");
+        return throw_internal_error(ctx, "CModule mmap(RW) failed");
     }
     mark_cmodule_code_vma(code, map_size);
 
@@ -586,6 +671,12 @@ unsafe extern "C" fn js_cmodule(
         return throw_internal_error(ctx, format!("CModule link failed: {}", err));
     }
     ffi::qjs_clear_cache(code as *mut c_void, (code as usize + code_size) as *mut c_void);
+    if raw_mprotect(code, map_size, libc::PROT_READ | libc::PROT_EXEC) != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = raw_munmap(code, map_size);
+        tcc_delete(state);
+        return throw_internal_error(ctx, format!("CModule mprotect(RX) failed: {error}"));
+    }
     register_cmodule_code_range(code, map_size);
 
     let class_id = get_or_init_class_id(ctx);
@@ -625,8 +716,12 @@ unsafe extern "C" fn js_cmodule(
 }
 
 pub(crate) fn register_cmodule_api(ctx: *mut ffi::JSContext, global: ffi::JSValue) {
-    get_or_init_class_id(ctx);
+    let class_id = get_or_init_class_id(ctx);
     unsafe {
+        let prototype = ffi::JS_NewObject(ctx);
+        add_cfunction_to_object(ctx, prototype, "dispose", cmodule_dispose, 0);
+        ffi::JS_SetClassProto(ctx, class_id, prototype);
+
         let cname = CString::new("CModule").unwrap();
         let ctor = ffi::JS_NewCFunction2(
             ctx,
@@ -636,6 +731,27 @@ pub(crate) fn register_cmodule_api(ctx: *mut ffi::JSContext, global: ffi::JSValu
             ffi::JSCFunctionEnum_JS_CFUNC_constructor_or_func,
             0,
         );
+        let prototype = ffi::JS_GetClassProto(ctx, class_id);
+        ffi::JS_SetConstructor(ctx, ctor, prototype);
+        ffi::qjs_free_value(ctx, prototype);
+        let builtins_getter = ffi::JS_NewCFunction2(
+            ctx,
+            Some(cmodule_get_builtins),
+            b"builtins\0".as_ptr() as *const _,
+            0,
+            ffi::JSCFunctionEnum_JS_CFUNC_getter,
+            0,
+        );
+        let atom = ffi::JS_NewAtom(ctx, b"builtins\0".as_ptr() as *const _);
+        let _ = ffi::JS_DefinePropertyGetSet(
+            ctx,
+            ctor,
+            atom,
+            builtins_getter,
+            JSValue::undefined().raw(),
+            (ffi::JS_PROP_CONFIGURABLE | ffi::JS_PROP_ENUMERABLE) as i32,
+        );
+        ffi::JS_FreeAtom(ctx, atom);
         let atom = ffi::JS_NewAtom(ctx, cname.as_ptr());
         ffi::qjs_set_property(ctx, global, atom, ctor);
         ffi::JS_FreeAtom(ctx, atom);

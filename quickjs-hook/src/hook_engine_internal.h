@@ -110,8 +110,8 @@ int wxshadow_release(void* addr);
  * emit_dec_before_jump=1: 在 mov 前插入 emit_thunk_inflight_dec，
  * 用于 art_router 的 not_found 路径（thunk 已 tail-BR 到 trampoline, 需要
  * 在真正离开 pool 前才 dec counter）。其他 caller 传 0 保持原有语义。 */
-int write_jump_back(void* dst, void* target, uint32_t written_regs,
-                    int emit_dec_before_jump);
+int write_jump_back(void* dst, size_t dst_size, void* target,
+                    uint32_t written_regs, int emit_dec_before_jump);
 int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target);
 void* hook_alloc_near_range(size_t size, void* target, int64_t max_range);
 

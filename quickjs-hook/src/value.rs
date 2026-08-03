@@ -1,7 +1,7 @@
 //! JSValue wrapper
 
 use crate::ffi;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 /// Wrapper around QuickJS JSValue
 #[derive(Clone, Copy)]
@@ -122,12 +122,14 @@ impl JSValue {
     /// Get as string (returns owned String)
     pub fn to_string(&self, ctx: *mut ffi::JSContext) -> Option<String> {
         unsafe {
-            let cstr = ffi::qjs_to_cstring(ctx, self.0);
+            let mut len = 0usize;
+            let cstr = ffi::JS_ToCStringLen2(ctx, &mut len, self.0, 0);
             if cstr.is_null() {
                 return None;
             }
-            let result = CStr::from_ptr(cstr).to_string_lossy().into_owned();
-            ffi::qjs_free_cstring(ctx, cstr);
+            let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+            let result = String::from_utf8_lossy(bytes).into_owned();
+            ffi::JS_FreeCString(ctx, cstr);
             Some(result)
         }
     }

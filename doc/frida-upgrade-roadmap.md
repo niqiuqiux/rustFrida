@@ -1,9 +1,8 @@
 # Frida 17.15.5 差异与升级路线
 
-> 状态：执行中（Goal 00 至 Goal 08b 已完成；八项设备回归全部通过。Goal 09、Goal 10 待做，
-> 其中 Goal 10 来自 §4.2 的成员级实测）
+> 状态：执行中（Goal 00 至 Goal 08b 和 Goal 10 已完成；既有八项及 Goal 10 的设备回归均通过。Goal 09 待做）
 >
-> 更新日期：2026-07-26
+> 更新日期：2026-08-03
 >
 > 目标平台：Android ARM64
 >
@@ -76,9 +75,9 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 | Module | 实例 API、ModuleMap、sections/dependencies/ensureInitialized/findSymbol；保留旧式静态入口 | 最新实例 API；旧式静态入口已由上游移除 | 已有/扩展 | P1 |
 | Process | 基本属性、模块/范围/线程枚举和目录查询、module/thread observer | 另有 findThread、runOnThread、exception handler、system/function ranges | 部分 | P1 |
 | Thread/符号诊断 | `Thread.backtrace()`、Backtracer、DebugSymbol、ApiResolver(module)、Instruction | 另有非 module resolver、硬件断点/观察点、CFG | 部分 | P0/P1 |
-| Interceptor | 自研 engine 的 attach/replace/revert/detachAll；`flush` 是兼容 no-op；支持 stealth | Gum Interceptor defaults/options、replaceFast、事务 flush、完整 invocation context | 部分/扩展 | P1 |
-| Stalker | follow/unfollow、事件、parse、transform 遍历、callout、probe、native sink、reload cleanup、iterator 上的 Arm64Writer/Arm64Relocator、statistics | transform iterator 同时暴露架构 writer，和 Instruction/Writer/Relocator 深度集成 | 已有/扩展 | P0/P1 |
-| CModule | TinyCC、symbol 注入、导出指针、metadata 回收 | 官方 CModule builtins、dispose 和完整 ownership 语义 | 部分/扩展 | P2 |
+| Interceptor | 自研 engine 的 attach/replace/replaceFast/revert/detachAll；`defaults` 提供默认 `mode`/`stealth`，`flush` 是兼容 no-op | Gum 的完整 defaults/options、事务 flush、完整 invocation context | 部分/扩展 | P1 |
+| Stalker | follow/unfollow、事件、parse、transform 遍历、callout、probe、native sink、reload cleanup、iterator writer/relocator、独立 Arm64Writer/Arm64Relocator、statistics | transform iterator 同时暴露架构 writer，和 Instruction/Writer/Relocator 深度集成 | 已有/扩展 | P0/P1 |
+| CModule | TinyCC、symbol 注入、导出指针、metadata 回收、`builtins`、幂等 `dispose()` | 官方 CModule 的完整 toolchain 和 ownership 语义 | 部分/扩展 | P2 |
 | File | 同步 File 构造、读写、seek、静态 read/write helpers | GumJS File 行为及异步 I/O 生态 | 部分 | P2 |
 | Stream/Socket | 无 | IOStream、InputStream、OutputStream、Socket | 缺失 | P2 |
 | 工具模块 | 无 | Checksum、SQLite、Cloak、Sampler、Profiler、Kernel | 缺失 | P2/P3 |
@@ -95,7 +94,7 @@ frida-core 标签后的变化主要涉及 spawn gating、control service、跨�
 - Int64/UInt64、DebugSymbol、Thread.backtrace、Backtracer、Instruction 和 module ApiResolver。
 - Interceptor 双阶段回调、CModule native callback 和自研 stealth 模式。
 - Android Java hook 的常用 `use/overload/implementation/choose` 路径，以及项目特有的 managed DSL。
-- Stalker 的事件队列、JS/native callback、call probe、callout、reload/shutdown 生命周期。
+- Stalker 的事件队列、JS/native callback、call probe、callout、reload/shutdown 生命周期，以及独立 ARM64 代码生成与重定位。
 
 ### 4.2 影响常见 Frida 脚本迁移的缺口
 
@@ -107,22 +106,20 @@ rustFrida 是带同名字段的普通对象，脚本读得到；`Interceptor.att
 剩下的是真缺口：
 
 1. 缺少 `Worker`、`Java.ClassFactory` 与 `Java.registerClass`。
-2. `Arm64Writer` 没有独立全局，`Arm64Relocator` 只接受 Stalker transform iterator 作为
-   output。也就是说「`Memory.alloc()` + `new Arm64Writer(ptr)` 自己生成一段代码」这种
-   上游常见写法在 rustFrida 上跑不了；ARM64 writer 的能力目前只在 transform 回调内可达。
-3. `Interceptor` 少 `replaceFast` 与 `defaults`。
-4. `Script` 的弱引用三件套只有两件：有 `bindWeak`/`unbindWeak`，没有 `derefWeak`；
+2. `Script` 的弱引用三件套只有两件：有 `bindWeak`/`unbindWeak`，没有 `derefWeak`；
    另外少 `load`、`evaluate`、`registerSourceMap`、`findSourceMap`、`setGlobalAccessHandler`，
    `SourceMap` 类也没有。
-5. `Process` 少 `runOnThread`、`setExceptionHandler`、`findThreadById`、
+3. `Process` 少 `runOnThread`、`setExceptionHandler`、`findThreadById`、
    `enumerateSystemRanges`、`findFunctionRange`。
-6. `NativePointer` 少 `sign`/`blend`（ARM64 PAC），`ArrayBuffer` 少 `wrap`/`unwrap`。
-7. `Thread` 少 `sleep`；`ModuleMap` 实例少 `handle`（rustFrida 的 ModuleMap 是 JS facade，
+4. `NativePointer` 少 `sign`/`blend`（ARM64 PAC），`ArrayBuffer` 少 `wrap`/`unwrap`。
+5. `Thread` 少 `sleep`；`ModuleMap` 实例少 `handle`（rustFrida 的 ModuleMap 是 JS facade，
    没有底层 Gum 句柄）。
 
 已核实**不是**缺口的：`recv(...).wait()` 存在（上游靠内部 `_waitForEvent` 实现，
 rustFrida 自己实现了同样的同步等待）；`NativeFunction` 接受 `exceptions`/`scheduling`
-选项；`ptr().toMatchPattern()` 存在。
+选项；`ptr().toMatchPattern()` 存在；`Arm64Writer` 和 `Arm64Relocator` 均可独立构造，
+`Interceptor.replaceFast()` 与 `Interceptor.defaults` 均已实现。后者只设置 rustFrida
+native hook engine 的默认 `mode`/`stealth`，不宣称实现 Gum 全量 defaults 语义。
 
 ## 5. 架构与稳定性风险
 
@@ -528,36 +525,35 @@ cargo build --offline --release --target aarch64-linux-android
 
 ### Goal 10：独立代码生成与 Interceptor 补齐（P1/P2）
 
-状态：**未开始**。由 2026-07-26 的成员级实测发现（见 §4.2），此前不属于任何 Goal。
+状态：**已完成（2026-08-03）**。由 2026-07-26 的成员级实测发现（见 §4.2），此前不属于任何 Goal。
 
-目标：让 ARM64 代码生成脱离 Stalker transform 回调，并补上 Interceptor 的两个上游入口。
+落地证据：
 
-范围：
+- `Arm64Writer` 现在独立持有 `GumArm64Writer`，可对调用方持有的可写代码页发射指令；`flush()` 后可直接交给 `NativeFunction` 执行。独立对象的 `dispose()` 幂等，释放后所有操作稳定报错；transform iterator 继续使用 Gum 所有的 writer，`dispose()` 仍为 no-op。
+- `Arm64Relocator` 可将指令重定位到独立 writer 或 transform iterator；独立对象拥有明确的释放状态，transform 内创建的 relocator 仍在回调结束时自动清理。
+- `Interceptor.replaceFast()` 复用自研 native hook engine 并返回原函数 trampoline，确保单一 target owner；`Interceptor.defaults` 仅为 `attach()`、`replace()` 和 `replaceFast()` 提供默认 `mode`/`stealth`，不冒充 Gum 的完整 instrumentation defaults。
+- `CModule.builtins` 返回当前内置工具链的 `defines`/`headers` 快照，头文件以 `"stdint.h"`、`"rfhook.h"` 等文件名为键；`CModule.prototype.dispose()` 可重复调用，并能在 `dropMetadata()` 后安全释放代码映射。
+- `tests/device/run_goal04_native_abi.py --device 3B65AU009YA00000` 和 `tests/device/run_goal05_stalker_writer.py --device 3B65AU009YA00000` 在 PLC110（Android 16）均完成两轮 `%reload` 与最终 shutdown；前者覆盖 `defaults`、`replaceFast` 及 trampoline，后者覆盖独立 writer/relocator 执行、dispose 与 transform 兼容。`tests/device/rfhook_cmodule_lifecycle.js` 在同一设备完成 CModule builtin、metadata/drop/dispose 生命周期验证，目标进程存活且没有新增 tombstone。
 
-- 独立 `Arm64Writer`：能对任意可写内存（典型是 `Memory.alloc()` 的返回值）构造。当前
-  writer 的方法只挂在 transform iterator 上，opcode 表（`quickjs-hook/src/jsapi/stalker_writer.rs`）
-  已经齐备，缺的是一个不依赖 transform token 的 writer 宿主。
-- 独立 `Arm64Relocator`：`output` 参数接受上面的 writer，而不是只认 transform iterator。
-- `Interceptor.replaceFast`、`Interceptor.defaults`。
-- 顺带评估 `CModule.builtins` 与 `CModule.prototype.dispose`，它们和代码生成的
-  ownership 模型是同一类问题。
+完成范围：
 
-约束与风险：
+- `Memory.alloc()` 的可写代码页可传给独立 `Arm64Writer`；它复用 Goal 05 的 opcode 表，`flush()` 后由调用方通过 `NativeFunction` 执行。writer 仅拥有 Gum writer 状态，不拥有调用方的代码页。
+- `Arm64Relocator(input, writer)` 同时接受独立 writer 和 transform iterator；两种对象的状态与销毁路径相互隔离。
+- `Interceptor.replaceFast()` 和 `Interceptor.defaults` 已注册为公开入口；`CModule.builtins` 和 `CModule.prototype.dispose()` 一并完成。
 
-- 独立 writer 的生命周期不再由 Gum 的 transform 输出托管，`dispose` 必须真的做事，
-  而 transform iterator 上的 `dispose` 必须继续保持 no-op（写出的代码归 Gum 所有）。
-  这两条语义不能共用同一个实现。
-- `flush()` 与 I-cache 刷新的责任要写清楚：独立 writer 写完后由谁刷，重复 flush 是否幂等。
-- `replaceFast` 走的是 Gum Interceptor 的快速路径，而 rustFrida 的 native hook 走自研
-  engine。落地前必须先明确这个 target 的 owner 是谁，不能让两套 Interceptor 同时管
-  （见 §5.1）。
+关键设计决策：
 
-验收：
+- 独立 writer/relocator 的 `dispose()` 真正释放其 Gum 状态且可重复调用；Stalker iterator 的 writer 继续由 `GumStalkerOutput` 所有，因此其 `dispose()` 保持 no-op。两者不共用生命周期实现。
+- writer 的 `flush()` 由 Gum 完成待定 label 的提交和指令缓存同步；独立 writer 销毁时关闭隐式 flush，避免 GC 或 reload 在错误时机写入调用方的代码页。
+- `replaceFast()` 沿用 rustFrida 自研 native hook engine，返回该 engine 的 trampoline；同一 target 不交给 Gum Interceptor，从而保持单一 owner。`defaults` 只选取未显式传入的 stealth `mode`，不是 Gum instrumentation defaults 的全量替代。
+- CModule 显式释放会先删除 TinyCC metadata，再解除代码映射；`dropMetadata()` 后仍可安全 `dispose()`，重复释放为空操作。调用方必须先移除引用其导出指针的 hook、probe 或 callback。
 
-- `Memory.alloc()` + `new Arm64Writer()` 生成一段可调用的函数并通过 `NativeFunction` 执行。
-- 独立 relocator 把一段已有代码搬到新位置后仍可执行。
-- Stalker transform 内的 writer 行为不变，Goal 05 的设备回归继续通过。
-- `%reload` 与 shutdown 后不残留可执行映射或未 dispose 的 writer。
+验收结果：
+
+- `Memory.alloc()` + `new Arm64Writer()` 已在真机生成返回 `42` 的 ARM64 函数；独立 relocator 复制该代码后仍可执行。
+- Goal 05 同时验证了 transform 内 writer/relocator 的既有行为没有回归，以及独立对象在 `dispose()` 后稳定拒绝访问。
+- Goal 04 验证了 `replaceFast()` 的 replacement、trampoline 与 `revert()`；`defaults` 的读写及默认 mode 路径均可用。
+- 两轮 `%reload` 和最终 shutdown 后，Goal 04/05 的目标进程存活且没有新增 tombstone；CModule lifecycle 脚本另外验证 builtin、`dropMetadata()` 与幂等 `dispose()`。
 
 ## 7. 推荐执行顺序
 
@@ -568,7 +564,7 @@ cargo build --offline --release --target aarch64-linux-android
 | C | 04 -> 05 | 先解决 callback ABI，再扩展 Stalker writer 和 native callback 组合 |
 | D | 06、07 | Memory 可相对独立；消息循环需要已有 callback/owner 模型 |
 | E | 08 | Java 差异大，应在通用 runtime 生命周期稳定后推进 |
-| F | 10 | 独立 writer 复用 Goal 05 已建好的 opcode 表；`replaceFast` 需要 §5.1 的 owner 结论已经稳定 |
+| F | 10（已完成） | 独立 writer 复用 Goal 05 已建好的 opcode 表；`replaceFast` 采用 §5.1 的单一 target owner 结论 |
 | G | 09 | 按实际使用需求选择，不作为“完整 Frida”阻塞项 |
 
 ## 8. 所有 Goal 的统一验收门槛

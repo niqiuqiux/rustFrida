@@ -1288,6 +1288,57 @@ pub(crate) unsafe extern "C" fn js_interceptor_replace(
     JSValue::undefined().raw()
 }
 
+/// Interceptor.replaceFast(target, replacement, mode?) — replace 的原生快速路径。
+///
+/// This intentionally stays on rustFrida's hook engine instead of handing the
+/// same target to Gum's interceptor. The returned trampoline is the callable
+/// original required by Frida's `replaceFast()` contract.
+pub(crate) unsafe extern "C" fn js_interceptor_replace_fast(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.replaceFast requires target and replacement\0".as_ptr() as *const _,
+        );
+    }
+
+    let target = match extract_pointer_address(ctx, JSValue(*argv), "Interceptor.replaceFast") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !is_executable_hook_target(target) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.replaceFast: target address is not executable\0".as_ptr() as *const _,
+        );
+    }
+
+    let replacement = match extract_pointer_address(ctx, JSValue(*argv.add(1)), "Interceptor.replaceFast replacement") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !is_executable_hook_target(replacement) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"Interceptor.replaceFast: replacement address is not executable\0".as_ptr() as *const _,
+        );
+    }
+
+    let mode = if argc >= 3 {
+        parse_stealth_mode(ctx, JSValue(*argv.add(2)))
+    } else {
+        StealthMode::Normal
+    };
+    match install_native_replacement(ctx, target, replacement, mode) {
+        Ok(trampoline) => create_native_pointer(ctx, trampoline).raw(),
+        Err(error) => error,
+    }
+}
+
 /// Interceptor.revert(target) — 还原 replace 安装的替换；不存在时静默返回。
 pub(crate) unsafe extern "C" fn js_interceptor_revert(
     ctx: *mut ffi::JSContext,

@@ -263,6 +263,7 @@ int arm64_relocator_read_one(Arm64Relocator* r) {
         r->current_info.type == ARM64_INSN_BR ||
         r->current_info.type == ARM64_INSN_RET) {
         r->eob = 1;
+        r->eoi = 1;
     }
 
     return 4;
@@ -586,9 +587,12 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
                         return ARM64_RELOC_OK;
                     break;
                 case ARM64_INSN_ADRP:
-                    arm64_writer_put_adrp_reg_address(r->output,
-                                                       r->current_info.dst_reg, new_tgt);
-                    return ARM64_RELOC_OK;
+                    if (arm64_writer_can_adrp_between(arm64_writer_pc(r->output), new_tgt)) {
+                        arm64_writer_put_adrp_reg_address(r->output,
+                                                           r->current_info.dst_reg, new_tgt);
+                        return ARM64_RELOC_OK;
+                    }
+                    break;
                 default:
                     /* CBZ/TBZ/ADR/LDR-literal: fall through to default path below
                      * (direct reloc works when target-dst_pc fits imm19/imm14/imm21).
@@ -734,6 +738,7 @@ void arm64_relocator_write_all(Arm64Relocator* r) {
 void arm64_relocator_skip_one(Arm64Relocator* r) {
     /* Just advance without writing */
     /* The instruction has already been read */
+    (void)r;
 }
 
 /* ============================================================================

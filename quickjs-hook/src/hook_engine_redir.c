@@ -151,7 +151,11 @@ static void* generate_redirect_thunk(void* original_entry,
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)original_entry);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
 
-    arm64_writer_flush(&w);
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[hook] redirect thunk generation failed");
+        arm64_writer_clear(&w);
+        return NULL;
+    }
 
     *thunk_size_out = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
@@ -306,7 +310,11 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, NATIVE_TOTAL_FRAME_SIZE);
     arm64_writer_put_ret(&w);
 
-    arm64_writer_flush(&w);
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[hook] native redirect thunk generation failed");
+        arm64_writer_clear(&w);
+        return NULL;
+    }
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 

@@ -280,8 +280,12 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
 
-    /* Flush any pending labels */
-    arm64_writer_flush(&w);
+    /* Flush any pending labels before publishing the thunk. */
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[hook] attach thunk generation failed");
+        arm64_writer_clear(&w);
+        return NULL;
+    }
 
     *thunk_size_out = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
@@ -375,8 +379,12 @@ static void* generate_replace_thunk(HookEntry* entry, HookCallback on_enter,
     /* Restore x0 + LR, deallocate stack, RET */
     emit_replace_epilogue(&w);
 
-    /* Flush any pending labels */
-    arm64_writer_flush(&w);
+    /* Flush any pending labels before publishing the thunk. */
+    if (arm64_writer_flush(&w) != 0) {
+        hook_log("[hook] replace thunk generation failed");
+        arm64_writer_clear(&w);
+        return NULL;
+    }
 
     *thunk_size_out = arm64_writer_offset(&w);
     arm64_writer_clear(&w);

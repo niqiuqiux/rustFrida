@@ -25,6 +25,7 @@ extern "C" {
 #define HOOK_ERROR_NOT_FOUND        -6
 #define HOOK_ERROR_BUFFER_TOO_SMALL -7
 #define HOOK_ERROR_WXSHADOW_FAILED  -8
+#define HOOK_ERROR_RELOCATION_FAILED -9
 
 /* Hook context - contains all ARM64 registers */
 typedef struct {
@@ -258,15 +259,17 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range);
  *            /proc/self/mem to bypass XOM pages)
  * src_pc   - original PC of the first instruction (used for PC-relative fixups)
  * dst      - destination address in the executable pool
+ * dst_size - capacity of dst in bytes
  * min_bytes - number of bytes to relocate
  * out_written_regs - if non-NULL, receives bitmask of GPRs written by
  *                    relocated instructions (bit N = XN written)
  *
- * Returns number of bytes written to dst.
+ * Returns HOOK_OK on success and stores the number of bytes written in
+ * out_size. Returns a negative hook error without publishing a partial result.
  */
-size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc,
-                                   void* dst, size_t min_bytes,
-                                   uint32_t* out_written_regs);
+int hook_relocate_instructions(const void* src_buf, uint64_t src_pc,
+                               void* dst, size_t dst_size, size_t min_bytes,
+                               uint32_t* out_written_regs, size_t* out_size);
 
 /*
  * Generate an absolute jump (MOVZ/MOVK + BR, up to 20 bytes)

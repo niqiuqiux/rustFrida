@@ -516,7 +516,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `Frida`, `Script`, `send()`, `recv()`, `setTimeout()`, `setInterval()`, `hexdump()`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `MemoryAccessMonitor`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `Frida`, `Script`, `send()`, `recv()`, `setTimeout()`, `setInterval()`, `hexdump()`, `gc()`, `ptr()`, `Int64`, `UInt64`, `Memory`, `MemoryAccessMonitor`, `File`, `Process`, `Module`, `DebugSymbol`, `Thread`, `Backtracer`, `Instruction`, `ApiResolver`, `Interceptor`, `Stalker`, `Arm64Writer`, `Arm64Relocator`, `CModule`, `NativeFunction`, `NativeCallback`, `SystemFunction`, `hook()`, `hookNative()`, `attachNative()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -693,7 +693,7 @@ callback 可从任意 native 线程同步进入 JS，并允许在 callback 内�
 
 ### CModule 和 native C callback
 
-`CModule` 用内置 TinyCC 在目标进程里动态编译 C 代码，适合把高频 native hook 的热路径从 JS callback 下沉到 C callback。CModule 对象持有编译后的代码内存；只要 hook 还在使用其中的函数指针，就必须保留 JS 引用，避免 GC 释放代码。
+`CModule` 用内置 TinyCC 在目标进程里动态编译 C 代码，适合把高频 native hook 的热路径从 JS callback 下沉到 C callback。CModule 对象持有编译后的代码内存；只要 hook 还在使用其中的函数指针，就必须保留 JS 引用，避免 GC 释放代码。`dispose()` 会立刻解除代码映射，因此必须先移除所有使用其导出函数的 hook、probe 或 callback。
 
 ```js
 var cm = new CModule(`
@@ -802,7 +802,10 @@ new NativeFunction(cm.say_hi, "void", [])();
 console.log(cm.base, cm.size);
 console.log(cm.findSymbolByName("on_enter"));
 cm.dropMetadata();     // 可选：释放 TinyCC 元数据；函数代码仍保留到 CModule 被 GC
+cm.dispose();          // 所有导出指针不再使用后，显式释放代码映射；可重复调用
 ```
+
+`CModule.builtins` 提供当前内置工具链的 `defines` 与 `headers` 快照；头文件以文件名作为键，例如 `CModule.builtins.headers["rfhook.h"]`，还包括 `stdint.h`、`stddef.h`、`stdbool.h` 和 `string.h`。
 
 ### Interceptor（Frida 兼容双阶段）
 
@@ -834,6 +837,13 @@ Interceptor.attach(target, {
 Interceptor.replace(Module.findExportByName("libc.so", "getpid"), function() {
     return 1234;
 });
+
+// 仅原生指针 replacement：返回可直接调用的原函数 trampoline
+var original = Interceptor.replaceFast(target, nativeReplacement);
+Interceptor.revert(target);
+
+// 未显式传 mode 时使用默认 stealth 模式
+Interceptor.defaults = { mode: Hook.WXSHADOW };
 
 // 清理：单个 / 全部
 listener.detach();
@@ -891,9 +901,13 @@ cd /home/qiu/Android/kernel_hook/wxshadow
 | `unhook(target)` | `AddressLike` | `boolean` |
 | `Interceptor.attach(target, {onEnter?, onLeave?}, stealth?)` | `AddressLike, Object, number?` | `InvocationListener` |
 | `Interceptor.replace(target, replacement, stealth?)` | `AddressLike, Function, number?` | `boolean` |
+| `Interceptor.replaceFast(target, replacement, stealth?)` | `AddressLike, NativePointer, number?` | 原函数 `NativePointer` trampoline |
+| `Interceptor.defaults` | `{ mode?: number, stealth?: number }` | 未显式 mode 时的默认 stealth 配置 |
 | `Interceptor.detachAll()` | — | `undefined` |
 | `listener.detach()` | — | `boolean` |
 | `CModule(source, symbols?)` | `string, Object?` | `CModule` |
+| `CModule.builtins` | — | `{ defines, headers }` 快照 |
+| `cm.dispose()` | — | `undefined`，立即释放 CModule 代码映射 |
 | `hookNative(target, callbackPtr, data?, stealth?)` | `AddressLike, NativePointer, AddressLike?, number?` | `NativePointer` trampoline |
 | `attachNative(target, callbackPtr, data?, stealth?)` | `AddressLike, NativePointer, AddressLike?, number?` | `boolean` |
 | `attachNative(target, {onEnter?, onLeave?, data?, mode?})` | `AddressLike, Object` | `boolean` |
@@ -1977,9 +1991,9 @@ Stalker.removeCallProbe(probeId);
 
 `transform(iterator)` 提供 `iterator.next()`、`iterator.keep()`、`iterator.memoryAccess`、`iterator.putCallout(callback, data?)` 和 `iterator.putChainingReturn()`。`next()` 返回的指令快照包含 `id/address/next/size/mnemonic/opStr/bytes` 与 `toString()`；iterator 只在当前 transform 回调内有效。
 
-与上游一致，iterator 同时就是当前输出块的 `Arm64Writer`，可直接发射指令：属性 `pc/code/base/offset`，方法 `flush()`、`reset()`、`skip()`、`sign()`、`canBranchDirectlyBetween()`、`putLabel()` 以及全部 `putXxx()` 系列。寄存器接受 `"x0"`…`"x30"`、`"w0"`…`"w30"`、`"sp"`、`"lr"`、`"fp"`、`"wsp"`、`"wzr"`、`"xzr"`、`"nzcv"`、`"ip0"`、`"ip1"`、`"s0"`…`"s31"`、`"d0"`…`"d31"`、`"q0"`…`"q31"`；条件码接受 `"eq"`…`"nv"`；index mode 接受 `"post-adjust"`、`"signed-offset"`、`"pre-adjust"`。label 用字符串命名，作用域是单次 transform 回调。
+`new Arm64Writer(codeAddress, { pc? })` 可在任意可写代码页（典型为 `Memory.alloc(Process.pageSize, { protection: "rwx" })`）生成 ARM64 指令；完成后调用 `flush()` 再交给 `NativeFunction`。`dispose()` 可重复调用，之后所有 writer 方法都会报错。与上游一致，Stalker 的 iterator 同时也是当前输出块的 `Arm64Writer`，可直接发射指令：属性 `pc/code/base/offset`，方法 `flush()`、`reset()`、`skip()`、`sign()`、`canBranchDirectlyBetween()`、`putLabel()` 以及全部 `putXxx()` 系列。寄存器接受 `"x0"`…`"x30"`、`"w0"`…`"w30"`、`"sp"`、`"lr"`、`"fp"`、`"wsp"`、`"wzr"`、`"xzr"`、`"nzcv"`、`"ip0"`、`"ip1"`、`"s0"`…`"s31"`、`"d0"`…`"d31"`、`"q0"`…`"q31"`；条件码接受 `"eq"`…`"nv"`；index mode 接受 `"post-adjust"`、`"signed-offset"`、`"pre-adjust"`。label 用字符串命名，作用域是单次 transform 回调。
 
-`new Arm64Relocator(inputCode, iterator)` 把一段原始指令重定位到该 writer，提供 `readOne()`、`writeOne()`、`writeAll()`、`skipOne()`、`peekNextWriteInsn()`、`peekNextWriteSource()`、`reset()`、`dispose()` 和属性 `input/eob/eoi`。它只能在 transform 回调内构造，回调返回时自动销毁；`dispose()` 可重复调用。
+`new Arm64Relocator(inputCode, writer)` 把一段原始指令重定位到独立 writer 或当前 transform iterator，提供 `readOne()`、`writeOne()`、`writeAll()`、`skipOne()`、`peekNextWriteInsn()`、`peekNextWriteSource()`、`reset()`、`dispose()` 和属性 `input/eob/eoi`。独立 relocator 的 `dispose()` 可重复调用；transform 内的 relocator 仍在回调返回时自动销毁。
 
 ```js
 Stalker.follow(tid, {

@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
 use functions::{
     js_attach_native, js_call_native, js_diag_alloc_near, js_hook, js_hook_native, js_interceptor_attach,
-    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_interceptor_revert, js_native_call,
-    js_recomp_hook, js_unhook,
+    js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_interceptor_replace_fast,
+    js_interceptor_revert, js_native_call, js_recomp_hook, js_unhook,
 };
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
@@ -64,6 +64,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         let interceptor = ffi::JS_NewObject(ctx.as_ptr());
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "attach", js_interceptor_attach, 2);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "replace", js_interceptor_replace, 2);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "replaceFast", js_interceptor_replace_fast, 2);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "revert", js_interceptor_revert, 1);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "detachAll", js_interceptor_detach_all, 0);
         add_cfunction_to_object(ctx.as_ptr(), interceptor, "flush", js_interceptor_flush, 0);

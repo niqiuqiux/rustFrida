@@ -579,7 +579,12 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
             }
         }
 
-        arm64_writer_flush(&w);
+        if (arm64_writer_flush(&w) != 0) {
+            arm64_writer_clear(&w);
+            hook_log("[stealth_ldr_reloc] trampoline generation failed for LDR at %#lx",
+                     (unsigned long)pc);
+            continue;
+        }
         arm64_writer_clear(&w);
 
         /* 构造 B 指令跳到 trampoline */
@@ -610,16 +615,6 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
 
 /* --- Jump writing and allocation --- */
 
-/* BRK 填充 + 清理 writer，返回写入字节数 */
-static int finalize_jump_writer(Arm64Writer* w) {
-    while (arm64_writer_offset(w) < MIN_HOOK_SIZE && arm64_writer_can_write(w, 4)) {
-        arm64_writer_put_brk_imm(w, 0xFFFF);
-    }
-    int bytes_written = (int)arm64_writer_offset(w);
-    arm64_writer_clear(w);
-    return bytes_written;
-}
-
 /*
  * Write a trampoline jump-back using a dynamically chosen scratch register.
  *
@@ -630,9 +625,9 @@ static int finalize_jump_writer(Arm64Writer* w) {
  *   - Fall back to X16 (IP0) if X17 is written
  *   - If both are written, still use X17 (extremely rare edge case)
  */
-int write_jump_back(void* dst, void* target, uint32_t written_regs,
-                    int emit_dec_before_jump) {
-    if (!dst || !target) {
+int write_jump_back(void* dst, size_t dst_size, void* target,
+                    uint32_t written_regs, int emit_dec_before_jump) {
+    if (!dst || !target || dst_size == 0) {
         return HOOK_ERROR_INVALID_PARAM;
     }
 
@@ -656,16 +651,18 @@ int write_jump_back(void* dst, void* target, uint32_t written_regs,
     (void)emit_dec_before_jump;
 
     Arm64Writer w;
-    arm64_writer_init(&w, dst, (uint64_t)dst, MIN_HOOK_SIZE);
+    arm64_writer_init(&w, dst, (uint64_t)dst, dst_size);
     arm64_writer_put_mov_reg_imm(&w, scratch, (uint64_t)target);
     arm64_writer_put_br_reg(&w, scratch);
 
-    if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
+    if (arm64_writer_flush(&w) != 0) {
         arm64_writer_clear(&w);
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
 
-    return finalize_jump_writer(&w);
+    int bytes_written = (int)arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+    return bytes_written;
 }
 
 /* Write a jump to target at the given execution PC.
@@ -699,7 +696,7 @@ int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target) {
         arm64_writer_put_branch_address(&w, (uint64_t)target);
     }
 
-    if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
+    if (arm64_writer_offset(&w) > MIN_HOOK_SIZE || arm64_writer_flush(&w) != 0) {
         arm64_writer_clear(&w);
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
@@ -981,15 +978,22 @@ static int ptr_in_range(void* ptr, void* target, int64_t range) {
 int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
                             const void* orig_bytes, uint64_t orig_pc,
                             void* jump_back_target) {
-    if (!trampoline || !orig_bytes || !jump_back_target) return -1;
+    if (!trampoline || !orig_bytes || !jump_back_target || trampoline_size == 0)
+        return HOOK_ERROR_INVALID_PARAM;
 
     uint32_t written_regs = 0;
-    size_t relocated_size = hook_relocate_instructions(
-        orig_bytes, orig_pc, trampoline, 4, &written_regs);
+    size_t relocated_size = 0;
+    int relocate_result = hook_relocate_instructions(
+        orig_bytes, orig_pc, trampoline, trampoline_size, INSN_SIZE,
+        &written_regs, &relocated_size);
+    if (relocate_result != HOOK_OK)
+        return relocate_result;
+    if (relocated_size >= trampoline_size)
+        return HOOK_ERROR_BUFFER_TOO_SMALL;
 
     /* rebuild_trampoline 用于 stealth2 slot 模式，不参与 art_router 路径，保持无 dec */
     int jump_len = write_jump_back(
-        (uint8_t*)trampoline + relocated_size,
+        (uint8_t*)trampoline + relocated_size, trampoline_size - relocated_size,
         jump_back_target, written_regs, 0);
     if (jump_len < 0) return jump_len;
 
@@ -1190,11 +1194,18 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
  * writer PC.  This allows arm64_relocator_write_one() to emit label-based
  * branches (rather than absolute branches to the now-overwritten original code)
  * for any PC-relative branch whose target lies inside [src_pc, src_pc+min_bytes). */
-size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* dst, size_t min_bytes, uint32_t* out_written_regs) {
+int hook_relocate_instructions(const void* src_buf, uint64_t src_pc,
+                               void* dst, size_t dst_size, size_t min_bytes,
+                               uint32_t* out_written_regs, size_t* out_size) {
+    if (!src_buf || !dst || !out_size || min_bytes == 0 ||
+        (min_bytes & (INSN_SIZE - 1)) != 0 || dst_size == 0) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
     Arm64Writer w;
     Arm64Relocator r;
 
-    arm64_writer_init(&w, dst, (uint64_t)dst, 256);
+    arm64_writer_init(&w, dst, (uint64_t)dst, dst_size);
     arm64_relocator_init(&r, src_buf, src_pc, &w);
     if (min_bytes == INSN_SIZE) {
         r.preserve_call_return_to_original = 1;
@@ -1220,8 +1231,20 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
         if (insn_idx < n)
             arm64_writer_put_label(&w, r.region_labels[insn_idx].label_id);
 
-        if (arm64_relocator_read_one(&r) == 0) break;
-        arm64_relocator_write_one(&r);
+        /* A hook region has an explicit byte length. Continue after an
+         * unconditional transfer so internal branch targets in the overwritten
+         * region are still relocated; write_all() keeps the public EOI stop. */
+        r.eoi = 0;
+        if (arm64_relocator_read_one(&r) == 0) {
+            arm64_writer_clear(&w);
+            arm64_relocator_clear(&r);
+            return HOOK_ERROR_RELOCATION_FAILED;
+        }
+        if (arm64_relocator_write_one(&r) != ARM64_RELOC_OK || w.failed) {
+            arm64_writer_clear(&w);
+            arm64_relocator_clear(&r);
+            return HOOK_ERROR_RELOCATION_FAILED;
+        }
         src_offset += INSN_SIZE;
         insn_idx++;
     }
@@ -1233,17 +1256,22 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
         arm64_writer_put_label(&w, r.region_labels[i].label_id);
 
     /* Flush pending label references (CBZ forward refs etc.) */
-    arm64_writer_flush(&w);
+    if (arm64_writer_flush(&w) != 0) {
+        arm64_writer_clear(&w);
+        arm64_relocator_clear(&r);
+        return HOOK_ERROR_RELOCATION_FAILED;
+    }
 
     size_t written = arm64_writer_offset(&w);
 
     if (out_written_regs)
         *out_written_regs = r.written_regs;
+    *out_size = written;
 
     arm64_writer_clear(&w);
     arm64_relocator_clear(&r);
 
-    return written;
+    return HOOK_OK;
 }
 
 /* --- Hook installation helpers --- */
@@ -1291,14 +1319,20 @@ int build_trampoline(HookEntry* entry, int emit_dec_before_jumpback) {
      * 用 original_size（= 实际 patch 大小，ADRP=12 或 MOVZ=16），不用 MIN_HOOK_SIZE。 */
     uint32_t written_regs = 0;
     size_t overwrite = entry->original_size;
-    size_t relocated_size = hook_relocate_instructions(
-        entry->original_bytes, (uint64_t)entry->target,
-        entry->trampoline, overwrite, &written_regs);
+    size_t relocated_size = 0;
+    int relocate_result = hook_relocate_instructions(
+        entry->original_bytes, (uint64_t)entry->target, entry->trampoline,
+        entry->trampoline_alloc, overwrite, &written_regs, &relocated_size);
+    if (relocate_result != HOOK_OK)
+        return relocate_result;
+    if (relocated_size >= entry->trampoline_alloc)
+        return HOOK_ERROR_BUFFER_TOO_SMALL;
 
     /* Write jump back to original code after the relocated instructions */
     void* jump_back_target = (uint8_t*)entry->target + overwrite;
     int jump_result = write_jump_back(
         (uint8_t*)entry->trampoline + relocated_size,
+        entry->trampoline_alloc - relocated_size,
         jump_back_target, written_regs, emit_dec_before_jumpback);
 
     return jump_result;

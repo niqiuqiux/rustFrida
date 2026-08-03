@@ -137,6 +137,7 @@ Object.defineProperties(globalThis, {
         areas_by_name = {entry["area"]: entry for entry in spec["compatibilityAreas"]}
         globals_by_name = {entry["name"]: entry for entry in spec["globals"]}
 
+        self.assertEqual(globals_by_name["Arm64Writer"]["type"], "function")
         self.assertEqual(globals_by_name["Arm64Relocator"]["type"], "function")
         self.assertEqual(globals_by_name["Stalker"]["classification"], "compatible")
         self.assertEqual(probes_by_path["Stalker.statistics"]["type"], "function")
@@ -144,7 +145,7 @@ Object.defineProperties(globalThis, {
         self.assertEqual(areas_by_name["Stalker"]["status"], "compatible")
         self.assertEqual(areas_by_name["Stalker"]["missing"], [])
 
-    def test_interceptor_and_code_writer_areas_are_pinned(self):
+    def test_goal10_interceptor_and_code_writer_areas_are_pinned(self):
         """Both areas came out of a device sweep against the upstream member tables.
 
         Stalker itself is complete, but the ARM64 writer only exists as members on
@@ -154,22 +155,11 @@ Object.defineProperties(globalThis, {
         spec = frida_surface.load_json(frida_surface.SPEC_PATH)
         areas_by_name = {entry["area"]: entry for entry in spec["compatibilityAreas"]}
 
-        self.assertEqual(areas_by_name["Interceptor"]["status"], "partial")
-        self.assertEqual(
-            areas_by_name["Interceptor"]["missing"],
-            ["Interceptor.replaceFast", "Interceptor.defaults"],
-        )
+        self.assertEqual(areas_by_name["Interceptor"]["status"], "compatible")
+        self.assertEqual(areas_by_name["Interceptor"]["missing"], [])
 
-        self.assertEqual(areas_by_name["Code writer"]["status"], "partial")
-        self.assertEqual(
-            areas_by_name["Code writer"]["missing"],
-            [
-                "standalone Arm64Writer",
-                "standalone Arm64Relocator",
-                "CModule.builtins",
-                "CModule.prototype.dispose",
-            ],
-        )
+        self.assertEqual(areas_by_name["Code writer"]["status"], "compatible")
+        self.assertEqual(areas_by_name["Code writer"]["missing"], [])
 
     def test_writer_opcode_table_is_well_formed(self):
         tables = frida_surface.read_writer_tables()

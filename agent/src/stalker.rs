@@ -1336,6 +1336,13 @@ pub fn install_quickjs_backend() -> Result<(), String> {
         deactivate_current: backend_deactivate_current,
         shutdown: backend_shutdown,
         writer_enums: stalker_writer::writer_enums,
+        standalone_writer_create: stalker_writer::standalone_writer_create,
+        standalone_writer_destroy: stalker_writer::standalone_writer_destroy,
+        standalone_writer_reset: stalker_writer::standalone_writer_reset,
+        standalone_writer_invoke: stalker_writer::writer_invoke,
+        standalone_relocator_create: stalker_writer::relocator_create,
+        standalone_relocator_destroy: stalker_writer::relocator_destroy,
+        standalone_relocator_invoke: stalker_writer::relocator_invoke,
         statistics: backend_statistics,
     })
 }

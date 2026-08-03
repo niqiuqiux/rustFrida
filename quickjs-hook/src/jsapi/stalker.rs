@@ -11,7 +11,8 @@ use crate::jsapi::stalker_writer;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::runtime::SuspendedRuntime;
 use crate::value::JSValue;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,15 @@ pub type StalkerTransformPutChainingReturn = unsafe extern "C" fn(usize);
 /// `out`. Returns 1 on success, 0 when Gum reported failure, and -1 when the
 /// opcode or its encoding is invalid.
 pub type StalkerWriterInvoke = unsafe extern "C" fn(usize, u32, *const u64, u32, *mut u64) -> i32;
+/// Construct an ARM64 writer that is owned by a JavaScript `Arm64Writer`
+/// object. `pc_specified` is zero or one; a separate flag preserves the
+/// upstream distinction between an omitted `pc` and `pc: 0`.
+pub type StalkerStandaloneWriterCreate = unsafe extern "C" fn(u64, u64, u32) -> usize;
+/// Drop the owner reference returned by [`StalkerStandaloneWriterCreate`].
+/// Any live `Arm64Relocator` keeps its own Gum reference to the writer.
+pub type StalkerStandaloneWriterDestroy = unsafe extern "C" fn(usize);
+/// Flush then reset a standalone writer, optionally overriding its logical PC.
+pub type StalkerStandaloneWriterReset = unsafe extern "C" fn(usize, u64, u64, u32) -> i32;
 /// Create a relocator reading `input_code` and writing through the transform's
 /// output writer. Returns 0 on failure.
 pub type StalkerRelocatorCreate = unsafe extern "C" fn(usize, u64) -> usize;
@@ -174,10 +184,21 @@ pub struct StalkerBackend {
     pub deactivate_current: fn() -> Result<(), String>,
     pub shutdown: fn() -> Result<bool, String>,
     pub writer_enums: fn() -> StalkerWriterEnums,
+    pub standalone_writer_create: StalkerStandaloneWriterCreate,
+    pub standalone_writer_destroy: StalkerStandaloneWriterDestroy,
+    pub standalone_writer_reset: StalkerStandaloneWriterReset,
+    pub standalone_writer_invoke: StalkerWriterInvoke,
+    pub standalone_relocator_create: StalkerRelocatorCreate,
+    pub standalone_relocator_destroy: StalkerRelocatorDestroy,
+    pub standalone_relocator_invoke: StalkerWriterInvoke,
     pub statistics: fn() -> Result<StalkerStatistics, String>,
 }
 
 static STALKER_BACKEND: Mutex<Option<StalkerBackend>> = Mutex::new(None);
+static ARM64_WRITER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+static ARM64_RELOCATOR_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+const ARM64_WRITER_CLASS_NAME: &[u8] = b"Arm64Writer\0";
+const ARM64_RELOCATOR_CLASS_NAME: &[u8] = b"Arm64Relocator\0";
 static CALL_PROBE_ARGUMENT_STACK: Mutex<Vec<CallProbeArgumentAccess>> = Mutex::new(Vec::new());
 static IN_FLIGHT_CALL_PROBES: Mutex<usize> = Mutex::new(0);
 static IN_FLIGHT_CALL_PROBES_CV: Condvar = Condvar::new();
@@ -1263,6 +1284,427 @@ unsafe fn writer_result_to_js(
     }
 }
 
+/// Native state of an independently owned `Arm64Writer` object. The function
+/// pointers are copied from the backend at construction time so QuickJS
+/// finalizers can release the Gum object without depending on JavaScript state.
+struct StandaloneArm64Writer {
+    handle: usize,
+    destroy: StalkerStandaloneWriterDestroy,
+    reset: StalkerStandaloneWriterReset,
+    invoke: StalkerWriterInvoke,
+}
+
+/// Native state of an independently owned `Arm64Relocator` object. Gum's
+/// relocator takes its own reference to the output writer, so this does not
+/// need to keep a QuickJS reference to the writer object alive.
+struct StandaloneArm64Relocator {
+    handle: usize,
+    destroy: StalkerRelocatorDestroy,
+    invoke: StalkerWriterInvoke,
+}
+
+unsafe fn dispose_standalone_writer(data: &mut StandaloneArm64Writer) {
+    if data.handle != 0 {
+        (data.destroy)(data.handle);
+        data.handle = 0;
+    }
+}
+
+unsafe fn dispose_standalone_relocator(data: &mut StandaloneArm64Relocator) {
+    if data.handle != 0 {
+        (data.destroy)(data.handle);
+        data.handle = 0;
+    }
+}
+
+unsafe extern "C" fn standalone_writer_finalizer(_runtime: *mut ffi::JSRuntime, value: ffi::JSValue) {
+    let class_id = ARM64_WRITER_CLASS_ID.load(Ordering::Relaxed);
+    if class_id == 0 {
+        return;
+    }
+    let opaque = ffi::JS_GetOpaque(value, class_id);
+    if !opaque.is_null() {
+        let mut data = Box::from_raw(opaque as *mut StandaloneArm64Writer);
+        dispose_standalone_writer(&mut data);
+    }
+}
+
+unsafe extern "C" fn standalone_relocator_finalizer(_runtime: *mut ffi::JSRuntime, value: ffi::JSValue) {
+    let class_id = ARM64_RELOCATOR_CLASS_ID.load(Ordering::Relaxed);
+    if class_id == 0 {
+        return;
+    }
+    let opaque = ffi::JS_GetOpaque(value, class_id);
+    if !opaque.is_null() {
+        let mut data = Box::from_raw(opaque as *mut StandaloneArm64Relocator);
+        dispose_standalone_relocator(&mut data);
+    }
+}
+
+fn get_or_init_standalone_writer_class_id(ctx: *mut ffi::JSContext) -> u32 {
+    let mut class_id = ARM64_WRITER_CLASS_ID.load(Ordering::Relaxed);
+    if class_id == 0 {
+        let mut allocated = 0u32;
+        allocated = unsafe { ffi::JS_NewClassID(&mut allocated) };
+        match ARM64_WRITER_CLASS_ID.compare_exchange(0, allocated, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => class_id = allocated,
+            Err(existing) => class_id = existing,
+        }
+    }
+    unsafe {
+        let definition = ffi::JSClassDef {
+            class_name: ARM64_WRITER_CLASS_NAME.as_ptr() as *const _,
+            finalizer: Some(standalone_writer_finalizer),
+            gc_mark: None,
+            call: None,
+            exotic: std::ptr::null_mut(),
+        };
+        let _ = ffi::JS_NewClass(ffi::JS_GetRuntime(ctx), class_id, &definition);
+    }
+    class_id
+}
+
+fn get_or_init_standalone_relocator_class_id(ctx: *mut ffi::JSContext) -> u32 {
+    let mut class_id = ARM64_RELOCATOR_CLASS_ID.load(Ordering::Relaxed);
+    if class_id == 0 {
+        let mut allocated = 0u32;
+        allocated = unsafe { ffi::JS_NewClassID(&mut allocated) };
+        match ARM64_RELOCATOR_CLASS_ID.compare_exchange(0, allocated, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => class_id = allocated,
+            Err(existing) => class_id = existing,
+        }
+    }
+    unsafe {
+        let definition = ffi::JSClassDef {
+            class_name: ARM64_RELOCATOR_CLASS_NAME.as_ptr() as *const _,
+            finalizer: Some(standalone_relocator_finalizer),
+            gc_mark: None,
+            call: None,
+            exotic: std::ptr::null_mut(),
+        };
+        let _ = ffi::JS_NewClass(ffi::JS_GetRuntime(ctx), class_id, &definition);
+    }
+    class_id
+}
+
+unsafe fn unwrap_standalone_writer(
+    ctx: *mut ffi::JSContext,
+    value: ffi::JSValue,
+) -> Result<&'static mut StandaloneArm64Writer, ffi::JSValue> {
+    let class_id = get_or_init_standalone_writer_class_id(ctx);
+    let opaque = ffi::JS_GetOpaque(value, class_id);
+    if opaque.is_null() {
+        return Err(ffi::JS_ThrowTypeError(
+            ctx,
+            b"expected an Arm64Writer\0".as_ptr() as *const _,
+        ));
+    }
+    Ok(&mut *(opaque as *mut StandaloneArm64Writer))
+}
+
+unsafe fn unwrap_standalone_relocator(
+    ctx: *mut ffi::JSContext,
+    value: ffi::JSValue,
+) -> Result<&'static mut StandaloneArm64Relocator, ffi::JSValue> {
+    let class_id = get_or_init_standalone_relocator_class_id(ctx);
+    let opaque = ffi::JS_GetOpaque(value, class_id);
+    if opaque.is_null() {
+        return Err(ffi::JS_ThrowTypeError(
+            ctx,
+            b"expected an Arm64Relocator\0".as_ptr() as *const _,
+        ));
+    }
+    Ok(&mut *(opaque as *mut StandaloneArm64Relocator))
+}
+
+unsafe fn require_live_standalone_writer(
+    ctx: *mut ffi::JSContext,
+    value: ffi::JSValue,
+) -> Result<&'static mut StandaloneArm64Writer, ffi::JSValue> {
+    let data = unwrap_standalone_writer(ctx, value)?;
+    if data.handle == 0 {
+        return Err(throw_internal_error(ctx, "Arm64Writer has already been disposed"));
+    }
+    Ok(data)
+}
+
+unsafe fn require_live_standalone_relocator(
+    ctx: *mut ffi::JSContext,
+    value: ffi::JSValue,
+) -> Result<&'static mut StandaloneArm64Relocator, ffi::JSValue> {
+    let data = unwrap_standalone_relocator(ctx, value)?;
+    if data.handle == 0 {
+        return Err(throw_internal_error(ctx, "Arm64Relocator has already been disposed"));
+    }
+    Ok(data)
+}
+
+unsafe fn optional_writer_pc(
+    ctx: *mut ffi::JSContext,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+    index: usize,
+) -> Result<(u64, u32), ffi::JSValue> {
+    if argc <= index as i32 {
+        return Ok((0, 0));
+    }
+    let pc = extract_pointer_address(ctx, JSValue(*argv.add(index)), "Arm64Writer pc")?;
+    Ok((pc, 1))
+}
+
+unsafe extern "C" fn js_standalone_writer_create(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let backend = match backend_or_throw(ctx) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if argc < 1 {
+        return throw_internal_error(ctx, "Arm64Writer code address is required");
+    }
+    let address = match extract_pointer_address(ctx, JSValue(*argv), "Arm64Writer code address") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Writer code address must not be NULL"),
+        Err(error) => return error,
+    };
+    let (pc, pc_specified) = match optional_writer_pc(ctx, argc, argv, 1) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let handle = (backend.standalone_writer_create)(address, pc, pc_specified);
+    if handle == 0 {
+        return throw_internal_error(ctx, "failed to create Arm64Writer");
+    }
+
+    let object = ffi::JS_NewObjectClass(ctx, get_or_init_standalone_writer_class_id(ctx) as i32);
+    if ffi::qjs_is_exception(object) != 0 {
+        (backend.standalone_writer_destroy)(handle);
+        return object;
+    }
+    let data = Box::new(StandaloneArm64Writer {
+        handle,
+        destroy: backend.standalone_writer_destroy,
+        reset: backend.standalone_writer_reset,
+        invoke: backend.standalone_writer_invoke,
+    });
+    ffi::JS_SetOpaque(object, Box::into_raw(data) as *mut c_void);
+    object
+}
+
+unsafe extern "C" fn js_standalone_writer_destroy(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(ctx, b"Arm64Writer.dispose requires a receiver\0".as_ptr() as *const _);
+    }
+    let data = match unwrap_standalone_writer(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    dispose_standalone_writer(data);
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_standalone_writer_reset(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return throw_internal_error(ctx, "Arm64Writer.reset requires a code address");
+    }
+    let data = match require_live_standalone_writer(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let address = match extract_pointer_address(ctx, JSValue(*argv.add(1)), "Arm64Writer.reset code address") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Writer.reset code address must not be NULL"),
+        Err(error) => return error,
+    };
+    let (pc, pc_specified) = match optional_writer_pc(ctx, argc, argv, 2) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if (data.reset)(data.handle, address, pc, pc_specified) < 0 {
+        return throw_internal_error(ctx, "Arm64Writer.reset() was rejected by the ARM64 writer");
+    }
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_standalone_writer_invoke(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return throw_internal_error(ctx, "Arm64Writer opcode is required");
+    }
+    let data = match require_live_standalone_writer(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let opcode = match required_u64(ctx, argc, argv, 1, "ARM64 writer opcode") {
+        Ok(value) if value <= u32::MAX as u64 => value as u32,
+        Ok(_) => return throw_internal_error(ctx, "ARM64 writer opcode is out of range"),
+        Err(error) => return error,
+    };
+    let Some(method) = stalker_writer::lookup_writer_method(opcode) else {
+        return throw_internal_error(ctx, "unknown ARM64 writer opcode");
+    };
+    if opcode == stalker_writer::OP_RESET {
+        return throw_internal_error(ctx, "Arm64Writer.reset must be called through its public method");
+    }
+
+    let mut byte_storage = Vec::new();
+    let encoded = match encode_writer_arguments(ctx, method, argc, argv, 2, &mut byte_storage) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mut out = 0u64;
+    let status = (data.invoke)(data.handle, opcode, encoded.as_ptr(), encoded.len() as u32, &mut out);
+    writer_result_to_js(ctx, method, status, out)
+}
+
+unsafe extern "C" fn js_standalone_relocator_create(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let backend = match backend_or_throw(ctx) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if argc < 2 {
+        return throw_internal_error(ctx, "Arm64Relocator requires an input code address and output writer");
+    }
+    let input = match extract_pointer_address(ctx, JSValue(*argv), "Arm64Relocator input code") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Relocator input code must not be NULL"),
+        Err(error) => return error,
+    };
+    let writer = match require_live_standalone_writer(ctx, *argv.add(1)) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let handle = (backend.standalone_relocator_create)(writer.handle, input);
+    if handle == 0 {
+        return throw_internal_error(ctx, "failed to create Arm64Relocator");
+    }
+    let object = ffi::JS_NewObjectClass(ctx, get_or_init_standalone_relocator_class_id(ctx) as i32);
+    if ffi::qjs_is_exception(object) != 0 {
+        (backend.standalone_relocator_destroy)(handle);
+        return object;
+    }
+    let data = Box::new(StandaloneArm64Relocator {
+        handle,
+        destroy: backend.standalone_relocator_destroy,
+        invoke: backend.standalone_relocator_invoke,
+    });
+    ffi::JS_SetOpaque(object, Box::into_raw(data) as *mut c_void);
+    object
+}
+
+unsafe extern "C" fn js_standalone_relocator_destroy(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Arm64Relocator.dispose requires a receiver\0".as_ptr() as *const _,
+        );
+    }
+    let data = match unwrap_standalone_relocator(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    dispose_standalone_relocator(data);
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_standalone_relocator_reset(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 3 {
+        return throw_internal_error(ctx, "Arm64Relocator.reset requires input code and output writer");
+    }
+    let relocator = match require_live_standalone_relocator(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let input = match extract_pointer_address(ctx, JSValue(*argv.add(1)), "Arm64Relocator.reset input code") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Relocator.reset input code must not be NULL"),
+        Err(error) => return error,
+    };
+    let writer = match require_live_standalone_writer(ctx, *argv.add(2)) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let args = [input, writer.handle as u64];
+    let mut out = 0u64;
+    let status = (relocator.invoke)(
+        relocator.handle,
+        stalker_writer::RELOC_OP_RESET,
+        args.as_ptr(),
+        args.len() as u32,
+        &mut out,
+    );
+    if status < 0 {
+        return throw_internal_error(ctx, "Arm64Relocator.reset() was rejected by the ARM64 relocator");
+    }
+    JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_standalone_relocator_invoke(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return throw_internal_error(ctx, "Arm64Relocator opcode is required");
+    }
+    let data = match require_live_standalone_relocator(ctx, *argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let opcode = match required_u64(ctx, argc, argv, 1, "Arm64Relocator opcode") {
+        Ok(value) if value <= u32::MAX as u64 => value as u32,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Relocator opcode is out of range"),
+        Err(error) => return error,
+    };
+    let Some(method) = stalker_writer::lookup_relocator_method(opcode) else {
+        return throw_internal_error(ctx, "unknown Arm64Relocator opcode");
+    };
+    if opcode == stalker_writer::RELOC_OP_RESET {
+        return throw_internal_error(ctx, "Arm64Relocator.reset must be called through its public method");
+    }
+    let mut byte_storage = Vec::new();
+    let encoded = match encode_writer_arguments(ctx, method, argc, argv, 2, &mut byte_storage) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mut out = 0u64;
+    let status = (data.invoke)(data.handle, opcode, encoded.as_ptr(), encoded.len() as u32, &mut out);
+    writer_result_to_js(ctx, method, status, out)
+}
+
 unsafe extern "C" fn js_stalker_writer_invoke(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -1367,6 +1809,51 @@ unsafe extern "C" fn js_stalker_relocator_destroy(
         }
     });
     JSValue::undefined().raw()
+}
+
+unsafe extern "C" fn js_stalker_relocator_reset(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let token = match required_stalker_transform_token(ctx, argc, argv) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let handle = match required_u64(ctx, argc, argv, 1, "Arm64Relocator handle") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if argc < 3 {
+        return throw_internal_error(ctx, "Arm64Relocator reset input code is required");
+    }
+    let input = match extract_pointer_address(ctx, JSValue(*argv.add(2)), "Arm64Relocator reset input code") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => return throw_internal_error(ctx, "Arm64Relocator reset input code must not be NULL"),
+        Err(error) => return error,
+    };
+
+    let Some(status) = with_stalker_transform_frame_mut(token, |frame| {
+        let Some((_, relocator)) = frame.relocators.iter().copied().find(|(id, _)| *id == handle) else {
+            return None;
+        };
+        let args = [input, frame.access.writer as u64];
+        Some((frame.access.relocator_invoke)(
+            relocator,
+            stalker_writer::RELOC_OP_RESET,
+            args.as_ptr(),
+            args.len() as u32,
+            std::ptr::null_mut(),
+        ))
+    }) else {
+        return throw_internal_error(ctx, "invalid operation outside a Stalker transform callback");
+    };
+    match status {
+        Some(status) if status >= 0 => JSValue::undefined().raw(),
+        Some(_) => throw_internal_error(ctx, "Arm64Relocator.reset() was rejected by the ARM64 relocator"),
+        None => throw_internal_error(ctx, "Arm64Relocator has already been disposed"),
+    }
 }
 
 unsafe extern "C" fn js_stalker_relocator_invoke(
@@ -1981,6 +2468,62 @@ pub fn register_stalker_api(ctx: &JSContext) {
         add_cfunction_to_object(
             ctx.as_ptr(),
             raw,
+            "__rf_arm64_writer_create",
+            js_standalone_writer_create,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_writer_destroy",
+            js_standalone_writer_destroy,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_writer_reset",
+            js_standalone_writer_reset,
+            3,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_writer_invoke",
+            js_standalone_writer_invoke,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_relocator_create",
+            js_standalone_relocator_create,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_relocator_destroy",
+            js_standalone_relocator_destroy,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_relocator_reset",
+            js_standalone_relocator_reset,
+            3,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_arm64_relocator_invoke",
+            js_standalone_relocator_invoke,
+            2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
             "__rf_stalker_writer_invoke",
             js_stalker_writer_invoke,
             2,
@@ -1998,6 +2541,13 @@ pub fn register_stalker_api(ctx: &JSContext) {
             "__rf_stalker_relocator_destroy",
             js_stalker_relocator_destroy,
             2,
+        );
+        add_cfunction_to_object(
+            ctx.as_ptr(),
+            raw,
+            "__rf_stalker_relocator_reset",
+            js_stalker_relocator_reset,
+            3,
         );
         add_cfunction_to_object(
             ctx.as_ptr(),

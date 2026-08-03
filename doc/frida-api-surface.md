@@ -52,6 +52,7 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | `Hook` | `object` | extension |
 | `Interceptor` | `object` | partial |
 | `Stalker` | `object` | compatible |
+| `Arm64Writer` | `function` | compatible |
 | `Arm64Relocator` | `function` | compatible |
 | `CModule` | `function` | partial |
 | `NativeFunction` | `function` | compatible |
@@ -76,10 +77,10 @@ Runtime globals from upstream `runtime/core.js`: `rpc`, `recv`, `send`, `setTime
 | Native ABI | compatible | Goal 04 |  |
 | Diagnostics | partial | Goal 02 | `non-module ApiResolver types`, `Thread hardware breakpoints/watchpoints`, `Thread.sleep` |
 | Module and Process | partial | Goal 03 | `Process.runOnThread`, `Process.setExceptionHandler`, `Process.findThreadById`, `Process.enumerateSystemRanges`, `Process.findFunctionRange`, `ModuleMap.prototype.handle` |
-| Interceptor | partial | Goal 10 | `Interceptor.replaceFast`, `Interceptor.defaults` |
+| Interceptor | compatible | Goal 10 |  |
 | Memory | compatible | Goal 06 |  |
 | Stalker | compatible | Goal 05 |  |
-| Code writer | partial | Goal 10 | `standalone Arm64Writer`, `standalone Arm64Relocator`, `CModule.builtins`, `CModule.prototype.dispose` |
+| Code writer | compatible | Goal 10 |  |
 | Java facade | partial | Goal 08 | `ClassFactory`, `registerClass`, `openClassFile`, `enumerateMethods`, `backtrace` |
 | Optional modules | missing | Goal 09 | `Cloak`, `Checksum`, `Socket`, `Stream`, `SQLite`, `Sampler`, `Profiler` |
 
