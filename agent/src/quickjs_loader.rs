@@ -640,7 +640,15 @@ pub fn cleanup() -> bool {
     cut_art_controller_walkstack_guards();
     stage("phase3 cut_art_controller_walkstack_guards", &mut t);
     quickjs_hook::recomp::set_cleanup_release_only(true);
-    crate::recompiler::release_all();
+    if !crate::recompiler::release_all() {
+        log_msg(
+            "[quickjs] recomp release failed: keep executable resources mapped; destructive cleanup skipped\n"
+                .to_string(),
+        );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
     stage("phase3 release_all_recomp", &mut t);
 
     let mut protected_ranges = hook_engine_exec_ranges();
@@ -861,7 +869,15 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     cut_art_controller_walkstack_guards();
     stage("phase3 cut_art_controller_walkstack_guards", &mut t);
     quickjs_hook::recomp::set_cleanup_release_only(true);
-    crate::recompiler::release_all();
+    if !crate::recompiler::release_all() {
+        log_msg(
+            "[quickjs] managed-safe recomp release failed; skip unload to keep executable resources mapped\n"
+                .to_string(),
+        );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
     stage("phase3 release_all_recomp", &mut t);
 
     let retained_recomp_ranges = crate::recompiler::get_retained_ranges();

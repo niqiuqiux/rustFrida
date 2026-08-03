@@ -27,7 +27,6 @@ type Result<T> = std::result::Result<T, String>;
 const PR_RECOMPILE_REGISTER: i32 = 0x52430001;
 const PR_RECOMPILE_RELEASE: i32 = 0x52430002;
 
-const PAGE_SIZE: usize = 4096;
 const MAX_TRAMPOLINE_PAGES: usize = 16; // 远距 recomp 时需要更多跳板空间
 const TRAMPOLINE_PAGE_CANDIDATES: &[usize] = &[1, 2, 4, 8, MAX_TRAMPOLINE_PAGES];
 const MIN_HOOK_SLOT_BYTES: usize = 32;
@@ -35,6 +34,21 @@ const RECOMP_NEAR_RANGE: i64 = 112 * 1024 * 1024; // Keep original-page fallback
 
 static VMA_RECOMP_CODE: &[u8] = b"wwb_recomp_code\0";
 static VMA_RECOMP_TRAMP: &[u8] = b"wwb_recomp_tramp\0";
+static RECOMP_PAGE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) };
+    assert!(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
+    let page_size = page_size as usize;
+    assert!(
+        page_size.is_power_of_two() && page_size % 4 == 0,
+        "unsupported system page size: {}",
+        page_size
+    );
+    page_size
+});
+
+pub fn page_size() -> usize {
+    *RECOMP_PAGE_SIZE
+}
 
 // C FFI
 extern "C" {
@@ -43,6 +57,7 @@ extern "C" {
         orig_base: u64,
         recomp_buf: *mut u8,
         recomp_base: u64,
+        page_size: usize,
         tramp_buf: *mut u8,
         tramp_base: u64,
         tramp_cap: usize,
@@ -270,7 +285,7 @@ fn ensure_init() {
 
 fn log_recomp_range(prefix: &str, orig_base: usize, page: &RecompiledPage) {
     let base = page.recomp_ptr as usize;
-    let code_end = base.saturating_add(PAGE_SIZE);
+    let code_end = base.saturating_add(page_size());
     let tramp_end = code_end.saturating_add(page.tramp_capacity);
     log_msg(format!(
         "[recompiler-range] {} orig=0x{:x} code=0x{:x}-0x{:x} tramp=0x{:x}-0x{:x} used={} total={}",
@@ -279,7 +294,7 @@ fn log_recomp_range(prefix: &str, orig_base: usize, page: &RecompiledPage) {
 }
 
 fn ensure_slot_in_range(page: &RecompiledPage, slot_addr: usize, slot_size: usize, context: &str) -> Result<()> {
-    let tramp_start = page.recomp_ptr as usize + PAGE_SIZE;
+    let tramp_start = page.recomp_ptr as usize + page_size();
     let tramp_end = tramp_start.saturating_add(page.tramp_capacity);
     let slot_end = slot_addr.saturating_add(slot_size);
     if slot_addr < tramp_start || slot_end > tramp_end || slot_end < slot_addr {
@@ -479,14 +494,14 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
     let _ = pid;
     ensure_init();
 
-    let orig_base = addr & !(PAGE_SIZE - 1);
+    let orig_base = addr & !(page_size() - 1);
 
     if recompiled_page_exists(orig_base) {
         return Err(format!("页 0x{:x} 已重编译", orig_base));
     }
 
     let _in_progress = RecompileInProgressGuard::enter(orig_base)?;
-    let mut orig_code = vec![0u8; PAGE_SIZE];
+    let mut orig_code = vec![0u8; page_size()];
     read_code_page(orig_base, &mut orig_code)?;
 
     let (pending, tramp_used, stats_c) = reserve_and_compile_page(orig_base, &orig_code)?;
@@ -494,12 +509,12 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
     let stats = RecompileStats::from(&stats_c);
     let recomp_base = pending.recomp_ptr as u64;
 
-    let tramp_ptr = unsafe { pending.recomp_ptr.add(PAGE_SIZE) };
-    let _ = set_anon_vma_name_raw(pending.recomp_ptr, PAGE_SIZE, VMA_RECOMP_CODE);
+    let tramp_ptr = unsafe { pending.recomp_ptr.add(page_size()) };
+    let _ = set_anon_vma_name_raw(pending.recomp_ptr, page_size(), VMA_RECOMP_CODE);
     let _ = set_anon_vma_name_raw(tramp_ptr, pending.tramp_capacity, VMA_RECOMP_TRAMP);
 
     unsafe {
-        hook_flush_cache(pending.recomp_ptr as *mut _, PAGE_SIZE + tramp_used);
+        hook_flush_cache(pending.recomp_ptr as *mut _, page_size() + tramp_used);
     }
 
     log_msg(format!(
@@ -537,44 +552,51 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
 pub fn release(addr: usize) -> Result<()> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
-    let orig_base = addr & !(page_size - 1);
+    let orig_base = addr & !(page_size() - 1);
 
     let mut guard = RECOMP_PAGES.lock().unwrap();
     let pages = guard.as_mut().unwrap();
 
     let page = pages
-        .remove(&orig_base)
+        .get_mut(&orig_base)
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
 
     // 从内核注销（pid=0 表示当前进程）
     if page.registered {
-        unsafe {
-            libc::prctl(PR_RECOMPILE_RELEASE, 0u64, orig_base as u64, 0u64, 0u64);
+        let rc = unsafe { libc::prctl(PR_RECOMPILE_RELEASE, 0u64, orig_base as u64, 0u64, 0u64) };
+        if rc != 0 {
+            return Err(format!(
+                "recomp prctl 注销失败，保留映射 0x{:x}: {}",
+                orig_base,
+                Error::last_os_error()
+            ));
         }
+        page.registered = false;
     }
 
     if !page.arena_backed {
-        unsafe {
-            munmap(page.recomp_ptr as *mut _, page.recomp_total_size);
+        let range = (page.recomp_ptr as u64, page.recomp_total_size as u64);
+        let mut retained = RETAINED_RANGES.lock().unwrap();
+        if !retained.contains(&range) {
+            retained.push(range);
         }
     }
 
-    log_msg(format!("[recompiler] 释放 0x{:x}", orig_base));
+    log_msg(format!("[recompiler] 注销 0x{:x}，等待 safepoint 回收", orig_base));
     Ok(())
 }
 
-/// 释放所有重编译页（agent cleanup 时调用）
+/// 释放所有重编译页（agent cleanup 时调用）。
 ///
-/// 注销所有 prctl 注册 + munmap。释放后内核不再重定向执行到 recomp 页，
-/// 原始页恢复 X 权限，代码从原始位置正常执行。
-pub fn release_all() {
+/// 只有内核成功注销的页才会被交给 safepoint 后的 munmap；注销失败时必须保留
+/// 映射和记录，因为内核仍可能将原始页的执行重定向到该匿名页。
+pub fn release_all() -> bool {
     ensure_init();
 
     let mut guard = RECOMP_PAGES.lock().unwrap();
     let pages = match guard.as_mut() {
         Some(p) => p,
-        None => return,
+        None => return true,
     };
 
     let mut snapshot = Vec::with_capacity(pages.len());
@@ -589,7 +611,7 @@ pub fn release_all() {
             } else {
                 release_fail += 1;
                 log_msg(format!(
-                    "[recompiler] release_all: PR_RECOMPILE_RELEASE failed base=0x{:x} errno={}\n",
+                    "[recompiler] release_all: PR_RECOMPILE_RELEASE failed base=0x{:x} errno={} (mapping retained)\n",
                     *orig_base,
                     std::io::Error::last_os_error()
                 ));
@@ -597,7 +619,7 @@ pub fn release_all() {
         }
         // arena-backed recomp 页不能单独 munmap。保留映射表，直到 safepoint
         // 后统一释放 arena；WalkStack guard 在等待期间仍可反向翻译 PC。
-        if !page.arena_backed {
+        if !page.registered && !page.arena_backed {
             snapshot.push((page.recomp_ptr as u64, page.recomp_total_size as u64));
         }
     }
@@ -610,6 +632,7 @@ pub fn release_all() {
         release_ok,
         release_fail
     ));
+    release_fail == 0
 }
 
 /// 全局保留：release_all 快照的 recomp 页区间 (base, size)。
@@ -631,6 +654,7 @@ pub fn clear_retained_ranges() {
 pub unsafe fn munmap_retained_ranges() -> (usize, usize, u64) {
     let ranges: Vec<(u64, u64)> = RETAINED_RANGES.lock().unwrap().drain(..).collect();
     let mut unmapped = Vec::with_capacity(ranges.len());
+    let mut failed = Vec::new();
     let mut ok = 0usize;
     let mut fail = 0usize;
     let mut bytes = 0u64;
@@ -641,6 +665,7 @@ pub unsafe fn munmap_retained_ranges() -> (usize, usize, u64) {
             unmapped.push((base, size));
         } else {
             fail += 1;
+            failed.push((base, size));
         }
     }
     if ok > 0 {
@@ -655,6 +680,9 @@ pub unsafe fn munmap_retained_ranges() -> (usize, usize, u64) {
             });
         }
     }
+    if !failed.is_empty() {
+        RETAINED_RANGES.lock().unwrap().extend(failed);
+    }
     (ok, fail, bytes)
 }
 
@@ -664,8 +692,7 @@ pub unsafe fn munmap_retained_ranges() -> (usize, usize, u64) {
 pub fn get_recomp_ptr(addr: usize) -> Result<*mut u8> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
-    let orig_base = addr & !(page_size - 1);
+    let orig_base = addr & !(page_size() - 1);
 
     let guard = RECOMP_PAGES.lock().unwrap();
     let pages = guard.as_ref().unwrap();
@@ -682,7 +709,7 @@ pub fn get_recomp_ptr(addr: usize) -> Result<*mut u8> {
 pub fn ensure_and_translate(addr: usize) -> Result<usize> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = addr & !(page_size - 1);
 
     // 如果还没重编译，先重编译
@@ -702,7 +729,7 @@ pub fn ensure_and_translate(addr: usize) -> Result<usize> {
 pub fn translate_addr(addr: usize) -> Result<usize> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = addr & !(page_size - 1);
     let offset = addr - orig_base;
 
@@ -725,7 +752,7 @@ pub fn translate_recomp_to_orig(addr: usize) -> Option<usize> {
 
     for page in pages.values() {
         let base = page.recomp_ptr as usize;
-        let end = base.saturating_add(PAGE_SIZE);
+        let end = base.saturating_add(page_size());
         if addr >= base && addr < end {
             return Some(page.orig_base + (addr - base));
         }
@@ -744,7 +771,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
 
     ensure_init();
 
-    let orig_base = orig_addr & !(PAGE_SIZE - 1);
+    let orig_base = orig_addr & !(page_size() - 1);
     let mut guard = RECOMP_PAGES.lock().unwrap();
     let pages = guard
         .as_mut()
@@ -753,12 +780,12 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
         .get_mut(&orig_base)
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
 
-    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_base = unsafe { page.recomp_ptr.add(page_size()) };
     let tramp_cap = page.tramp_capacity;
     let mut patched = 0usize;
     ensure_recomp_region_writable(page, "patch_suspend_polls")?;
 
-    for offset in (0..PAGE_SIZE).step_by(4) {
+    for offset in (0..page_size()).step_by(4) {
         let orig_insn = unsafe { ptr::read_unaligned((orig_base + offset) as *const u32) };
         if orig_insn != 0xf940_02b5 {
             continue;
@@ -833,7 +860,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
 pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = addr & !(page_size - 1);
     let offset = addr - orig_base;
 
@@ -845,7 +872,7 @@ pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
 
     let patch_size = insns.len() * 4;
-    if offset + patch_size > PAGE_SIZE {
+    if offset + patch_size > page_size {
         return Err("patch 超出页边界".into());
     }
     ensure_recomp_region_writable(page, "patch_insns")?;
@@ -872,7 +899,7 @@ pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
 pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
     let offset = orig_addr - orig_base;
 
@@ -885,7 +912,7 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
     ensure_recomp_region_writable(page, "patch_with_trampoline")?;
 
     // 跳板区在 recomp 页之后 (recomp_ptr + PAGE_SIZE)
-    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_base = unsafe { page.recomp_ptr.add(page_size) };
     let tramp_cap = page.tramp_capacity;
     let slot_size = 20usize; // ADRP+ADD+BR (12) 或 MOVZ+MOVK+BR (16)，留 20 足够
     if page.tramp_used + slot_size > tramp_cap {
@@ -928,7 +955,7 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
 pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
     let offset = orig_addr - orig_base;
 
@@ -940,7 +967,7 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
 
     // 跳板区在 recomp 页之后
-    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_base = unsafe { page.recomp_ptr.add(page_size) };
     let slot_size = 32usize; // 预留足够空间给 hook engine 写 full jump + trampoline
 
     // 优先复用 unhook 归还的 slot；否则 bump tramp_used。
@@ -1011,7 +1038,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
         return Err("patch must be non-empty and 4-byte multiple".into());
     }
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
     let offset = orig_addr - orig_base;
 
@@ -1032,7 +1059,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
     let slot_size_raw = user_bytes.len().saturating_mul(5).saturating_add(32);
     let slot_size = (slot_size_raw + 15) & !15;
 
-    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_base = unsafe { page.recomp_ptr.add(page_size) };
     if page.tramp_used + slot_size > page.tramp_capacity {
         return Err(format!(
             "recomp 跳板区已满 (need {} bytes, avail {})",
@@ -1073,7 +1100,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
             fall_through_target,
             orig_base as u64,
             recomp_page_base_addr,
-            PAGE_SIZE,
+            page_size,
             err_buf.as_mut_ptr(),
             err_buf.len(),
         )
@@ -1117,7 +1144,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
 pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
 
     let guard = RECOMP_PAGES.lock().unwrap();
@@ -1157,7 +1184,7 @@ pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
 /// 供 js_unhook 判断"是否真的 revert 了 writest/hook"。
 pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
     ensure_init();
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
     let mut guard = RECOMP_PAGES.lock().unwrap();
     let pages = match guard.as_mut() {
@@ -1232,7 +1259,7 @@ pub fn try_revert_slot_patch_by_slot(slot_addr: usize) -> bool {
 pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
 
     let mut guard = RECOMP_PAGES.lock().unwrap();
@@ -1270,7 +1297,7 @@ pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
 pub fn fixup_slot_trampoline(trampoline: *mut u8, orig_addr: usize) -> Result<()> {
     ensure_init();
 
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = orig_addr & !(page_size - 1);
 
     let guard = RECOMP_PAGES.lock().unwrap();
@@ -1304,8 +1331,8 @@ pub fn fixup_slot_trampoline(trampoline: *mut u8, orig_addr: usize) -> Result<()
 }
 
 fn alloc_recomp_region(orig_base: usize, tramp_pages: usize) -> Result<(*mut u8, usize, usize)> {
-    let total_size = PAGE_SIZE + tramp_pages * PAGE_SIZE;
-    let tramp_cap = tramp_pages * PAGE_SIZE;
+    let total_size = page_size() + tramp_pages * page_size();
+    let tramp_cap = tramp_pages * page_size();
 
     let recomp_ptr = unsafe { hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, RECOMP_NEAR_RANGE) };
     if recomp_ptr == libc::MAP_FAILED || recomp_ptr.is_null() {
@@ -1320,8 +1347,8 @@ fn alloc_recomp_region(orig_base: usize, tramp_pages: usize) -> Result<(*mut u8,
 }
 
 fn try_compile_temp(orig_base: usize, orig_code: &[u8], tramp_pages: usize) -> Result<TempRecomp> {
-    let total_size = PAGE_SIZE + tramp_pages * PAGE_SIZE;
-    let tramp_cap = tramp_pages * PAGE_SIZE;
+    let total_size = page_size() + tramp_pages * page_size();
+    let tramp_cap = tramp_pages * page_size();
     let recomp_ptr = unsafe { hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, RECOMP_NEAR_RANGE) };
     if recomp_ptr == libc::MAP_FAILED || recomp_ptr.is_null() {
         return Err(format!("mmap near recomp region: {}", Error::last_os_error()));
@@ -1329,8 +1356,8 @@ fn try_compile_temp(orig_base: usize, orig_code: &[u8], tramp_pages: usize) -> R
 
     let recomp_ptr = recomp_ptr as *mut u8;
     let recomp_base = recomp_ptr as u64;
-    let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };
-    let tramp_base = recomp_base + PAGE_SIZE as u64;
+    let tramp_ptr = unsafe { recomp_ptr.add(page_size()) };
+    let tramp_base = recomp_base + page_size() as u64;
 
     let mut tramp_used: usize = 0;
     let mut stats = RecompileStatsC::new();
@@ -1341,6 +1368,7 @@ fn try_compile_temp(orig_base: usize, orig_code: &[u8], tramp_pages: usize) -> R
             orig_base as u64,
             recomp_ptr,
             recomp_base,
+            page_size(),
             tramp_ptr,
             tramp_base,
             tramp_cap,
@@ -1386,8 +1414,8 @@ fn compile_reserved_page(
     tramp_cap: usize,
 ) -> Result<(usize, RecompileStatsC)> {
     let recomp_base = recomp_ptr as u64;
-    let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };
-    let tramp_base = recomp_base + PAGE_SIZE as u64;
+    let tramp_ptr = unsafe { recomp_ptr.add(page_size()) };
+    let tramp_base = recomp_base + page_size() as u64;
 
     let mut tramp_used: usize = 0;
     let mut stats = RecompileStatsC::new();
@@ -1398,6 +1426,7 @@ fn compile_reserved_page(
             orig_base as u64,
             recomp_ptr,
             recomp_base,
+            page_size(),
             tramp_ptr,
             tramp_base,
             tramp_cap,
@@ -1435,7 +1464,7 @@ impl Drop for TempRecomp {
 }
 
 fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
-    let mut orig_code = vec![0u8; PAGE_SIZE];
+    let mut orig_code = vec![0u8; page_size()];
     read_code_page(orig_base, &mut orig_code)?;
 
     // dry-run 也使用 near-range 分配，覆盖真实 stealth2 的 B-only 跳转约束。
@@ -1463,7 +1492,7 @@ fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
 
 /// Dry-run：只重编译不注册 prctl，对比原始 vs 重编译指令
 pub fn dry_run(addr: usize) -> Result<String> {
-    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let page_size = page_size();
     let orig_base = addr & !(page_size - 1);
 
     let t = do_recompile_temp(orig_base)?;
@@ -1481,11 +1510,12 @@ pub fn dry_run(addr: usize) -> Result<String> {
         t.tramp_used
     );
 
-    let orig_insns = unsafe { std::slice::from_raw_parts(t.orig_code.as_ptr() as *const u32, 1024) };
-    let recomp_insns = unsafe { std::slice::from_raw_parts(t.recomp_ptr as *const u32, 1024) };
+    let insn_count = page_size / 4;
+    let orig_insns = unsafe { std::slice::from_raw_parts(t.orig_code.as_ptr() as *const u32, insn_count) };
+    let recomp_insns = unsafe { std::slice::from_raw_parts(t.recomp_ptr as *const u32, insn_count) };
 
     let mut changed = 0;
-    for i in 0..1024 {
+    for i in 0..insn_count {
         if orig_insns[i] != recomp_insns[i] {
             let off = i * 4;
             let recomp = recomp_insns[i];
@@ -1508,7 +1538,7 @@ pub fn dry_run(addr: usize) -> Result<String> {
             changed += 1;
         }
     }
-    output.push_str(&format!("changed: {}/1024\n", changed));
+    output.push_str(&format!("changed: {}/{}\n", changed, insn_count));
     Ok(output)
     // TempRecomp Drop 自动 munmap
 }

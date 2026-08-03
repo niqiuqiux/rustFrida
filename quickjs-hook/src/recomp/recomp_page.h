@@ -21,9 +21,6 @@
 extern "C" {
 #endif
 
-#define RECOMP_PAGE_SIZE  4096
-#define RECOMP_INSN_COUNT (RECOMP_PAGE_SIZE / 4)
-
 /* 重编译统计 */
 typedef struct {
     int num_copied;         /* 非 PC 相对指令，直接复制 */
@@ -39,10 +36,11 @@ typedef uint64_t (*RecompTranslateExistingFn)(uint64_t orig_addr, void* user_dat
 /*
  * 重编译一页 ARM64 代码
  *
- * @param orig_code     原始页数据的可读副本（RECOMP_PAGE_SIZE 字节）
+ * @param orig_code     原始页数据的可读副本（page_size 字节）
  * @param orig_base     原始页在目标进程的虚拟地址（页对齐）
- * @param recomp_buf    输出：重编译代码缓冲区（RECOMP_PAGE_SIZE 字节，可写）
+ * @param recomp_buf    输出：重编译代码缓冲区（page_size 字节，可写）
  * @param recomp_base   重编译页将被映射到的虚拟地址（页对齐）
+ * @param page_size     运行时系统页大小（非零、4 字节倍数）
  * @param tramp_buf     输出：跳板代码缓冲区（可写）
  * @param tramp_base    跳板缓冲区的虚拟地址
  * @param tramp_cap     跳板缓冲区容量（字节）
@@ -55,6 +53,7 @@ int recompile_page(
     uint64_t orig_base,
     void* recomp_buf,
     uint64_t recomp_base,
+    size_t page_size,
     void* tramp_buf,
     uint64_t tramp_base,
     size_t tramp_cap,

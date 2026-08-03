@@ -67,15 +67,24 @@ unsafe extern "C" fn recomp_reverse_translate_for_c(recomp_addr: usize) -> usize
 
 const MAX_SIGNAL_RECOMP_RANGES: usize = 128;
 static SIGNAL_RECOMP_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SIGNAL_RECOMP_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static SIGNAL_RECOMP_ORIG_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
     [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
 static SIGNAL_RECOMP_BASES: [AtomicUsize; MAX_SIGNAL_RECOMP_RANGES] =
     [const { AtomicUsize::new(0) }; MAX_SIGNAL_RECOMP_RANGES];
 
 fn register_recomp_signal_range(orig_addr: usize, recomp_addr: usize) {
-    const PAGE_SIZE: usize = 0x1000;
-    let orig_base = orig_addr & !(PAGE_SIZE - 1);
-    let recomp_base = recomp_addr & !(PAGE_SIZE - 1);
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return;
+    }
+    let page_size = page_size as usize;
+    if !page_size.is_power_of_two() || page_size % 4 != 0 {
+        return;
+    }
+    SIGNAL_RECOMP_PAGE_SIZE.store(page_size, Ordering::Release);
+    let orig_base = orig_addr & !(page_size - 1);
+    let recomp_base = recomp_addr & !(page_size - 1);
     let count = SIGNAL_RECOMP_RANGE_COUNT.load(Ordering::Acquire);
     let limit = count.min(MAX_SIGNAL_RECOMP_RANGES);
     for i in 0..limit {
@@ -98,7 +107,10 @@ fn register_recomp_signal_range(orig_addr: usize, recomp_addr: usize) {
 }
 
 fn translate_recomp_to_orig_signal_safe(addr: usize) -> Option<usize> {
-    const PAGE_SIZE: usize = 0x1000;
+    let page_size = SIGNAL_RECOMP_PAGE_SIZE.load(Ordering::Acquire);
+    if page_size == 0 {
+        return None;
+    }
     let count = SIGNAL_RECOMP_RANGE_COUNT.load(Ordering::Acquire);
     let limit = count.min(MAX_SIGNAL_RECOMP_RANGES);
     for i in 0..limit {
@@ -106,7 +118,7 @@ fn translate_recomp_to_orig_signal_safe(addr: usize) -> Option<usize> {
         if recomp_base == 0 {
             continue;
         }
-        if addr.wrapping_sub(recomp_base) < PAGE_SIZE {
+        if addr.wrapping_sub(recomp_base) < page_size {
             let orig_base = SIGNAL_RECOMP_ORIG_BASES[i].load(Ordering::Acquire);
             if orig_base != 0 {
                 return Some(orig_base + (addr - recomp_base));

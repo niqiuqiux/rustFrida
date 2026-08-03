@@ -436,6 +436,105 @@ static void emit_oat_exec_inflight_dec_preserve(Arm64Writer* w) {
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
 }
 
+static int relocate_oat_instruction(Arm64Relocator* reloc, const char* name) {
+    if (arm64_relocator_read_one(reloc) != 4) {
+        hook_log("[oat_patch] failed to read %s", name);
+        return -1;
+    }
+    if (arm64_relocator_write_one(reloc) != ARM64_RELOC_OK || reloc->output->failed) {
+        hook_log("[oat_patch] failed to relocate %s", name);
+        return -1;
+    }
+    return 0;
+}
+
+static int oat_patch_page_range(uintptr_t address, size_t length, size_t page_size,
+                                uintptr_t* page_start_out, size_t* span_out) {
+    if (address == 0 || length == 0 || page_size == 0 ||
+        (page_size & (page_size - 1)) != 0) {
+        return -1;
+    }
+
+    uintptr_t end = address + length;
+    if (end < address || end > UINTPTR_MAX - (page_size - 1)) {
+        return -1;
+    }
+
+    uintptr_t page_start = address & ~(uintptr_t)(page_size - 1);
+    uintptr_t page_end = (end + page_size - 1) & ~(uintptr_t)(page_size - 1);
+    if (page_end <= page_start) {
+        return -1;
+    }
+
+    *page_start_out = page_start;
+    *span_out = page_end - page_start;
+    return 0;
+}
+
+static int oat_write_patch_with_rollback(void* patch_addr, const void* patch_bytes,
+                                         const void* original_bytes, size_t patch_size,
+                                         size_t page_size, const char* context) {
+    uintptr_t page_start;
+    size_t mprotect_size;
+    if (oat_patch_page_range((uintptr_t)patch_addr, patch_size, page_size,
+                             &page_start, &mprotect_size) != 0) {
+        hook_log("[oat_patch] invalid %s range at %#lx (%zu bytes, page=%zu)",
+                 context, (unsigned long)(uintptr_t)patch_addr, patch_size, page_size);
+        return -1;
+    }
+
+    if (mprotect((void*)page_start, mprotect_size,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        hook_log("[oat_patch] %s mprotect(RWX) failed at %#lx+%zu: %s",
+                 context, (unsigned long)page_start, mprotect_size, strerror(errno));
+        return -1;
+    }
+
+    memcpy(patch_addr, patch_bytes, patch_size);
+    if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC) == 0) {
+        hook_flush_cache(patch_addr, patch_size);
+        return 0;
+    }
+
+    hook_log("[oat_patch] %s mprotect(RX) failed at %#lx+%zu: %s; rolling back",
+             context, (unsigned long)page_start, mprotect_size, strerror(errno));
+    memcpy(patch_addr, original_bytes, patch_size);
+    hook_flush_cache(patch_addr, patch_size);
+    if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC) != 0) {
+        hook_log("[oat_patch] %s rollback left RWX at %#lx+%zu: %s",
+                 context, (unsigned long)page_start, mprotect_size, strerror(errno));
+    }
+    return -1;
+}
+
+static int oat_restore_patch(void* patch_addr, const void* original_bytes,
+                             size_t patch_size, size_t page_size) {
+    uintptr_t page_start;
+    size_t mprotect_size;
+    if (oat_patch_page_range((uintptr_t)patch_addr, patch_size, page_size,
+                             &page_start, &mprotect_size) != 0) {
+        hook_log("[oat_patch] invalid restore range at %#lx (%zu bytes, page=%zu)",
+                 (unsigned long)(uintptr_t)patch_addr, patch_size, page_size);
+        return -1;
+    }
+
+    if (mprotect((void*)page_start, mprotect_size,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        hook_log("[oat_patch] restore mprotect(RWX) failed at %#lx+%zu: %s",
+                 (unsigned long)page_start, mprotect_size, strerror(errno));
+        return -1;
+    }
+
+    memcpy(patch_addr, original_bytes, patch_size);
+    hook_flush_cache(patch_addr, patch_size);
+    if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC) != 0) {
+        hook_log("[oat_patch] restore mprotect(RX) failed at %#lx+%zu: %s",
+                 (unsigned long)page_start, mprotect_size, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* ============================================================================
  * Trampoline generation
  *
@@ -498,14 +597,17 @@ static void* generate_oat_inline_thunk(
      */
     Arm64Relocator reloc;
     arm64_relocator_init(&reloc, original_bytes, patch_addr, &w);
-    arm64_relocator_read_one(&reloc);  /* LDR */
-    arm64_relocator_write_one(&reloc);
-    arm64_relocator_read_one(&reloc);  /* CMN */
-    arm64_relocator_write_one(&reloc);
+    if (relocate_oat_instruction(&reloc, "selector LDR") != 0 ||
+        relocate_oat_instruction(&reloc, "selector CMN") != 0) {
+        goto fail;
+    }
 
     /* --- Step 2: B.EQ → runtime_or_replacement (data_ == -1) --- */
     /* Skip original B.cond, replace with our own */
-    arm64_relocator_read_one(&reloc);
+    if (arm64_relocator_read_one(&reloc) != 4) {
+        hook_log("[oat_patch] failed to read selector branch");
+        goto fail;
+    }
     arm64_relocator_skip_one(&reloc);
 
     arm64_writer_put_b_cond_label(&w, ARM64_COND_EQ, lbl_runtime_or_replacement);
@@ -616,8 +718,9 @@ static void* generate_oat_inline_thunk(
     if (match->branch_is_eq) {
         /* regular_method: relocate insn3, continue original code */
         arm64_writer_put_label(&w, lbl_regular_method);
-        arm64_relocator_read_one(&reloc);  /* insn3 */
-        arm64_relocator_write_one(&reloc);
+        if (relocate_oat_instruction(&reloc, "regular tail") != 0) {
+            goto fail;
+        }
         emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, patch_addr + 16);
 
@@ -633,8 +736,9 @@ static void* generate_oat_inline_thunk(
 
         /* runtime_or_replacement: relocate insn3, continue as runtime */
         arm64_writer_put_label(&w, lbl_runtime_or_replacement);
-        arm64_relocator_read_one(&reloc);  /* insn3 */
-        arm64_relocator_write_one(&reloc);
+        if (relocate_oat_instruction(&reloc, "runtime tail") != 0) {
+            goto fail;
+        }
         emit_oat_exec_inflight_dec_preserve(&w);
         arm64_writer_put_branch_address(&w, patch_addr + 16);
     }
@@ -655,6 +759,11 @@ static void* generate_oat_inline_thunk(
     hook_log("[oat_patch] oat_thunk at %p, size=%zu, method_reg=x%d",
              oat_thunk, code_size, match->method_reg);
     return oat_thunk;
+
+fail:
+    arm64_writer_clear(&w);
+    arm64_relocator_clear(&reloc);
+    return NULL;
 }
 
 /* ============================================================================
@@ -673,17 +782,14 @@ static int apply_oat_inline_patch(
     uint8_t* saved_original,
     int* patch_size_out)
 {
-    int scratch = match->scratch_reg;
-    /* Use Xscratch (64-bit version of the W scratch register) for the jump.
-     * Since the original code only uses Wscratch (which is clobbered by the
-     * LDR that was relocated to the oat_thunk), using Xscratch is safe. */
-    Arm64Reg scratch_reg = (Arm64Reg)(ARM64_REG_X0 + scratch);
-
     /* 确定 exec_pc：stealth2 (recomp) 代码在 recomp 页执行，ADRP 偏移必须基于 recomp 地址。
      * stealth0/1 代码在 patch_addr 执行。
      * aligned(32) 保持 stealth1 跳转 buffer 的历史布局。 */
     size_t page_size = g_engine.exec_mem_page_size;
-    uintptr_t page_start = patch_addr & ~(page_size - 1);
+    if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
+        hook_log("[oat_patch] invalid hook-engine page size: %zu", page_size);
+        return -1;
+    }
 
     uint64_t exec_pc = patch_addr;
     uintptr_t recomp_addr = 0;
@@ -718,20 +824,22 @@ static int apply_oat_inline_patch(
 
     int overwrite = jump_len;
 
-    /* Save original bytes (always from original address) */
-    read_target_safe((void*)patch_addr, saved_original, overwrite);
-    *patch_size_out = overwrite;
+    void* patch_write_addr = recomp_addr ? (void*)recomp_addr : (void*)patch_addr;
+    if (read_target_safe(patch_write_addr, saved_original, overwrite) != 0) {
+        hook_log("[oat_patch] failed to save original bytes at %#lx",
+                 (unsigned long)(uintptr_t)patch_write_addr);
+        return -1;
+    }
 
     /* Apply patch */
     hook_log("[oat_patch] apply: addr=%#lx overwrite=%d stealth_mode=%d",
              (unsigned long)patch_addr, overwrite, g_stealth_mode);
     if (recomp_addr) {
         /* Recomp 模式 — exec_pc 已正确设为 recomp_addr */
-        uintptr_t recomp_page = recomp_addr & ~(page_size - 1);
-        mprotect((void*)recomp_page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-        memcpy((void*)recomp_addr, redirect, overwrite);
-        mprotect((void*)recomp_page, page_size * 2, PROT_READ | PROT_EXEC);
-        hook_flush_cache((void*)recomp_addr, overwrite);
+        if (oat_write_patch_with_rollback((void*)recomp_addr, redirect, saved_original,
+                                          (size_t)overwrite, page_size, "recomp patch") != 0) {
+            return -1;
+        }
         hook_log("[oat_patch] applied via recomp at %#lx → %#lx",
                  (unsigned long)patch_addr, (unsigned long)recomp_addr);
     } else if (g_stealth_mode == 1) {
@@ -744,18 +852,12 @@ static int apply_oat_inline_patch(
         hook_flush_cache((void*)patch_addr, overwrite);
     } else {
         /* Normal 模式 (stealth=0): 直接 mprotect */
-        uintptr_t patch_end = patch_addr + overwrite;
-        uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
-        size_t mprotect_size = page_end - page_start;
-        if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            hook_log("[oat_patch] mprotect RWX failed at %#lx: %s",
-                     (unsigned long)page_start, strerror(errno));
+        if (oat_write_patch_with_rollback((void*)patch_addr, redirect, saved_original,
+                                          (size_t)overwrite, page_size, "normal patch") != 0) {
             return -1;
         }
-        memcpy((void*)patch_addr, redirect, overwrite);
-        mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
-        hook_flush_cache((void*)patch_addr, overwrite);
     }
+    *patch_size_out = overwrite;
     return 0;
 }
 
@@ -897,12 +999,15 @@ int hook_patch_inlined_oat_header_checks(uint64_t exclude_addr) {
 
 int hook_restore_inlined_oat_header_patches(void) {
     int restored = 0;
+    int remaining = 0;
     for (int i = 0; i < g_oat_patch_count; i++) {
         OatInlinePatchEntry* entry = &g_oat_patches[i];
-        if (entry->original_addr == 0) continue;
+        if (entry->original_addr == 0) {
+            continue;
+        }
 
         size_t page_size = g_engine.exec_mem_page_size;
-        uintptr_t page_start = entry->original_addr & ~(page_size - 1);
+        int entry_restored = 0;
 
         /* Restore with the mode used at install time. Java.setStealth() can be
          * called after spawn artinit; using the current global mode here can
@@ -913,6 +1018,7 @@ int hook_restore_inlined_oat_header_patches(void) {
              * the entire recomp mapping after safepoint verification. There is
              * no original text to restore and writing the RX mirror during
              * cleanup can fault, so just discard the patch record. */
+            entry_restored = 1;
         } else if (entry->stealth_mode == 1) {
             if (wxshadow_release((void*)entry->original_addr) != 0) {
                 /* stealth1: kernel_hook restore 失败不降级 mprotect。 */
@@ -920,25 +1026,31 @@ int hook_restore_inlined_oat_header_patches(void) {
                          (unsigned long)entry->original_addr);
             } else {
                 hook_flush_cache((void*)entry->original_addr, entry->patch_size);
+                entry_restored = 1;
             }
         } else {
-            uintptr_t patch_end = entry->original_addr + entry->patch_size;
-            uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
-            size_t mprotect_size = page_end - page_start;
-            if (mprotect((void*)page_start, mprotect_size,
-                         PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                memcpy((void*)entry->original_addr, entry->original_bytes, entry->patch_size);
-                mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
-            }
-            hook_flush_cache((void*)entry->original_addr, entry->patch_size);
+            entry_restored = oat_restore_patch((void*)entry->original_addr,
+                                               entry->original_bytes,
+                                               (size_t)entry->patch_size,
+                                               page_size) == 0;
         }
-        entry->original_addr = 0;
-        entry->patched_addr = 0;
-        entry->stealth_mode = 0;
-        restored++;
+
+        if (entry_restored) {
+            memset(entry, 0, sizeof(*entry));
+            restored++;
+        } else {
+            if (remaining != i) {
+                g_oat_patches[remaining] = *entry;
+            }
+            remaining++;
+        }
     }
 
-    g_oat_patch_count = 0;
-    hook_log("[oat_patch] restored %d patches", restored);
+    for (int i = remaining; i < g_oat_patch_count; i++) {
+        memset(&g_oat_patches[i], 0, sizeof(g_oat_patches[i]));
+    }
+    g_oat_patch_count = remaining;
+    hook_log("[oat_patch] restored %d patches, retained %d failed patch(es)",
+             restored, remaining);
     return restored;
 }

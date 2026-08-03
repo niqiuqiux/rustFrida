@@ -374,7 +374,8 @@ static int emit_fallthrough_trampoline(
     const Arm64InsnInfo* info,
     uint32_t insn,
     uint64_t next_page,       /* orig_base + PAGE_SIZE */
-    uint64_t orig_base        /* 用于计算页内目标 */
+    uint64_t orig_base,       /* 用于计算页内目标 */
+    size_t page_size
 ) {
     if (!info->is_pc_relative) {
         /* 非 PC 相对：复制原始指令 + 绝对跳转到下一页
@@ -398,7 +399,7 @@ static int emit_fallthrough_trampoline(
     /* 页内条件分支：taken 跳回原始目标（内核会重定向），not-taken 跳下一页 */
     if (is_branch_type(info->type) &&
         info->target >= orig_base &&
-        info->target < orig_base + RECOMP_PAGE_SIZE) {
+        info->target < orig_base + page_size) {
 
         switch (info->type) {
         case ARM64_INSN_B_COND: {
@@ -605,6 +606,7 @@ int recompile_page(
     uint64_t orig_base,
     void* recomp_buf,
     uint64_t recomp_base,
+    size_t page_size,
     void* tramp_buf,
     uint64_t tramp_base,
     size_t tramp_cap,
@@ -614,22 +616,36 @@ int recompile_page(
     void* translate_user_data,
     RecompileStats* stats
 ) {
-    const uint32_t* orig_insns = (const uint32_t*)orig_code;
-    uint32_t* recomp_insns = (uint32_t*)recomp_buf;
-
     RecompileStats local_stats;
     memset(&local_stats, 0, sizeof(local_stats));
+
+    if (orig_code == NULL || recomp_buf == NULL || tramp_buf == NULL ||
+        page_size == 0 || (page_size & 3) != 0 ||
+        (page_size & (page_size - 1)) != 0 ||
+        (orig_base & (page_size - 1)) != 0 ||
+        (recomp_base & (page_size - 1)) != 0) {
+        local_stats.error = -1;
+        snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                 "invalid recomp page size or alignment (page_size=%zu)", page_size);
+        if (stats)
+            *stats = local_stats;
+        return -1;
+    }
+
+    const uint32_t* orig_insns = (const uint32_t*)orig_code;
+    uint32_t* recomp_insns = (uint32_t*)recomp_buf;
+    size_t insn_count = page_size / sizeof(uint32_t);
 
     /* 初始化跳板区 writer */
     Arm64Writer tw;
     arm64_writer_init(&tw, tramp_buf, tramp_base, tramp_cap);
 
     /* 逐条处理 */
-    for (int i = 0; i < RECOMP_INSN_COUNT; i++) {
+    for (size_t i = 0; i < insn_count; i++) {
         uint32_t insn = orig_insns[i];
         uint64_t orig_pc  = orig_base  + (uint64_t)(i * 4);
         uint64_t recomp_pc = recomp_base + (uint64_t)(i * 4);
-        int is_last = (i == RECOMP_INSN_COUNT - 1);
+        int is_last = (i == insn_count - 1);
 
         /* 分析指令 */
         Arm64InsnInfo info = arm64_relocator_analyze_insn(orig_pc, insn);
@@ -641,7 +657,7 @@ int recompile_page(
             if (info.target != 0) {
                 uint32_t branch_insn = 0;
                 uint64_t intra_target = 0;
-                if (info.target >= orig_base && info.target < orig_base + RECOMP_PAGE_SIZE) {
+                if (info.target >= orig_base && info.target < orig_base + page_size) {
                     intra_target = recomp_base + (info.target - orig_base);
                     if (encode_branch_like(insn, info.type, recomp_pc, intra_target, &branch_insn) == 0) {
                         recomp_insns[i] = branch_insn;
@@ -663,7 +679,7 @@ int recompile_page(
                 if (!arm64_writer_can_write(&tw, 32)) {
                     local_stats.error = -1;
                     snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                             "跳板区空间不足 (branch noscratch offset=0x%x)", i * 4);
+                             "跳板区空间不足 (branch noscratch offset=0x%zx)", i * 4);
                     goto done;
                 }
 
@@ -673,7 +689,7 @@ int recompile_page(
                         &tw, &info, translated_target, info.target, translated_fallthrough) != 0) {
                     local_stats.error = -1;
                     snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                             "无 scratch 分支跳板超出 B 范围 (offset=0x%x type=%s target=0x%llx branch_target=0x%llx)",
+                             "无 scratch 分支跳板超出 B 范围 (offset=0x%zx type=%s target=0x%llx branch_target=0x%llx)",
                              i * 4, branch_type_name(info.type),
                              (unsigned long long)info.target,
                              (unsigned long long)(translated_target != 0 ? translated_target : info.target));
@@ -684,7 +700,7 @@ int recompile_page(
                 if (encode_b(recomp_pc, tramp_pc, &tramp_branch_insn) != 0) {
                     local_stats.error = -1;
                     snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                             "无法编码到无 scratch 分支跳板 (offset=0x%x tramp=0x%llx)",
+                             "无法编码到无 scratch 分支跳板 (offset=0x%zx tramp=0x%llx)",
                              i * 4, (unsigned long long)tramp_pc);
                     goto done;
                 }
@@ -702,10 +718,10 @@ int recompile_page(
                 continue;
             }
 
-            if (info.target < orig_base || info.target >= orig_base + RECOMP_PAGE_SIZE) {
+            if (info.target < orig_base || info.target >= orig_base + page_size) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "页外非调用分支缺少目标 recomp 页 (offset=0x%x type=%s target=0x%llx)",
+                         "页外非调用分支缺少目标 recomp 页 (offset=0x%zx type=%s target=0x%llx)",
                          i * 4, branch_type_name(info.type),
                          (unsigned long long)info.target);
                 goto done;
@@ -725,14 +741,14 @@ int recompile_page(
             if (!arm64_writer_can_write(&tw, suspend_entrypoint != 0 ? 56 : 24)) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "跳板区空间不足 (suspend-poll guard offset=0x%x)", i * 4);
+                         "跳板区空间不足 (suspend-poll guard offset=0x%zx)", i * 4);
                 goto done;
             }
 
             uint64_t tramp_pc = arm64_writer_pc(&tw);
             uint64_t translated_fallthrough = recomp_pc + 4;
             if (is_last) {
-                uint64_t next_page = orig_base + RECOMP_PAGE_SIZE;
+                uint64_t next_page = orig_base + page_size;
                 translated_fallthrough = translate_existing
                     ? translate_existing(next_page, translate_user_data)
                     : 0;
@@ -742,7 +758,7 @@ int recompile_page(
                                                        suspend_entrypoint, translated_fallthrough) != 0) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "suspend-poll guard 跳板超出 B 范围 (offset=0x%x)", i * 4);
+                         "suspend-poll guard 跳板超出 B 范围 (offset=0x%zx)", i * 4);
                 goto done;
             }
 
@@ -750,7 +766,7 @@ int recompile_page(
             if (encode_b(recomp_pc, tramp_pc, &branch_insn) != 0) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "无法编码到 suspend-poll guard 跳板 (offset=0x%x)", i * 4);
+                         "无法编码到 suspend-poll guard 跳板 (offset=0x%zx)", i * 4);
                 goto done;
             }
 
@@ -780,7 +796,7 @@ int recompile_page(
             }
 
             uint64_t tramp_pc = arm64_writer_pc(&tw);
-            uint64_t next_page = orig_base + RECOMP_PAGE_SIZE;
+            uint64_t next_page = orig_base + page_size;
             uint64_t next_target = translate_existing
                 ? translate_existing(next_page, translate_user_data)
                 : 0;
@@ -788,7 +804,7 @@ int recompile_page(
             if (is_branch_type(info.type) &&
                 info.type != ARM64_INSN_BL &&
                 info.type != ARM64_INSN_BLR) {
-                if (info.target >= orig_base && info.target < orig_base + RECOMP_PAGE_SIZE) {
+                if (info.target >= orig_base && info.target < orig_base + page_size) {
                     translated_branch_target = recomp_base + (info.target - orig_base);
                 } else if (translate_existing) {
                     translated_branch_target = translate_existing(info.target, translate_user_data);
@@ -800,7 +816,7 @@ int recompile_page(
                     translated_branch_target) != 0) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "页末 fall-through 无 scratch 跳板失败 (offset=0x%x type=%d next=0x%llx)",
+                         "页末 fall-through 无 scratch 跳板失败 (offset=0x%zx type=%d next=0x%llx)",
                          i * 4, info.type,
                          (unsigned long long)next_page);
                 goto done;
@@ -812,7 +828,7 @@ int recompile_page(
             if (enc_err != 0) {
                 local_stats.error = -1;
                 snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                         "encode B failed (fall-through, offset=0x%x)", i * 4);
+                         "encode B failed (fall-through, offset=0x%zx)", i * 4);
                 goto done;
             }
             recomp_insns[i] = branch_insn;
@@ -837,7 +853,7 @@ int recompile_page(
             info.type != ARM64_INSN_BLR &&
             !(is_last && !is_unconditional_transfer(info.type)) &&
             info.target >= orig_base &&
-            info.target < orig_base + RECOMP_PAGE_SIZE) {
+            info.target < orig_base + page_size) {
             recomp_insns[i] = insn;
             local_stats.num_intra_page++;
             continue;
@@ -874,7 +890,7 @@ int recompile_page(
         if (!arm64_writer_can_write(&tw, 64)) {
             local_stats.error = -1;
             snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                     "跳板区空间不足 (offset=0x%x)", i * 4);
+                     "跳板区空间不足 (offset=0x%zx)", i * 4);
             goto done;
         }
 
@@ -891,7 +907,7 @@ int recompile_page(
         if (tramp_after == tramp_before) {
             local_stats.error = -1;
             snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                     "空跳板 (offset=0x%x, type=%d)", i * 4, info.type);
+                     "空跳板 (offset=0x%zx, type=%d)", i * 4, info.type);
             goto done;
         }
 
@@ -902,7 +918,7 @@ int recompile_page(
         if (enc_err != 0) {
             local_stats.error = -1;
             snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
-                     "无法编码到跳板的分支 (offset=0x%x, tramp=0x%llx)",
+                     "无法编码到跳板的分支 (offset=0x%zx, tramp=0x%llx)",
                      i * 4, (unsigned long long)tramp_pc);
             goto done;
         }
@@ -944,7 +960,7 @@ int recompile_page(
     /* DEBUG: dump 所有被修改的指令 + 未被修改但为 PC-relative 的（疑似遗漏） */
     if (local_stats.error == 0) {
         int miss_count = 0;
-        for (int d = 0; d < RECOMP_INSN_COUNT; d++) {
+        for (size_t d = 0; d < insn_count; d++) {
             uint32_t orig = orig_insns[d];
             uint32_t recomp = recomp_insns[d];
             if (orig != recomp) {
@@ -957,7 +973,7 @@ int recompile_page(
                     /* PC-relative 但没被改——如果是页内分支则正常，否则是 BUG */
                     if (is_branch_type(chk.type) &&
                         chk.target >= orig_base &&
-                        chk.target < orig_base + RECOMP_PAGE_SIZE) {
+                        chk.target < orig_base + page_size) {
                         /* 页内分支，正常保留 */
                     } else {
                         hook_log("[recomp-MISS] page=%llx offset=0x%03x: insn=%08x type=%d target=%llx NOT RELOCATED!",
@@ -1082,6 +1098,10 @@ int arm64_install_user_patch(
             arm64_writer_put_label(&w, r.region_labels[insn_idx].label_id);
         }
 
+        /* User patch input has an explicit length. Keep relocating bytes after
+         * B/BR/RET because a later instruction may be an internal branch
+         * target; the public write_all() path still stops at EOI. */
+        r.eoi = 0;
         int n = arm64_relocator_read_one(&r);
         if (n <= 0) break;
 
